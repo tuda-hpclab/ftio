@@ -13,6 +13,8 @@ For more information, see the LICENSE file in the project root:
 https://github.com/tuda-parallel/FTIO/blob/main/LICENSE
 """
 
+from __future__ import annotations
+
 import argparse
 import os
 import re

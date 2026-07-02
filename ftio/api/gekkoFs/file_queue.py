@@ -15,6 +15,8 @@ For more information, see the LICENSE file in the project root:
 https://github.com/tuda-parallel/FTIO/blob/main/LICENSE
 """
 
+from __future__ import annotations
+
 from multiprocessing import Manager
 
 from ftio.api.gekkoFs.gekko_helper import get_modification_time

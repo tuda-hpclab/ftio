@@ -9,6 +9,8 @@ For more information, see the LICENSE file in the project root:
 https://github.com/tuda-parallel/FTIO/blob/main/LICENSE
 """
 
+from __future__ import annotations
+
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
