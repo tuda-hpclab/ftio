@@ -83,6 +83,24 @@ be changed to `["-e", "no"]` to disable the plots.
 Furthermore, at the end of [`proxy.py`](/ftio/api/metric_proxy/proxy.py), postprocessing occurs to label the phases
 according to the function `label_phases` from [`post_processing.py`](/ftio/processing/post_processing.py).
 
+### Dewrapped bandwidth (`--dewrap`)
+
+The proxy's exporters account a call's bytes and duration only when the call **returns**, so in the sampled trace a
+long I/O burst appears as a spike at its completion sample. With `--dewrap` (available in
+[`parallel_proxy.py`](/ftio/api/metric_proxy/parallel_proxy.py) and understood by the ZMQ server
+[`proxy_zmq.py`](/ftio/api/metric_proxy/proxy_zmq.py) — the proxy forwards it via its FTIO *custom arguments*), FTIO
+reconstructs the wall-clock bandwidth from each cumulative `___size___<fn>` / `___time___<fn>` counter pair: every
+burst is spread backwards from its completion time over its estimated span (Δtime ÷ `proxy_mpi_ranks`), i.e. **the
+points are created in the past**, so the burst start point — and therefore the predicted phase — is correct. Each
+value is the rate of the interval starting at its timestamp (sample-and-hold); the integral equals the transferred
+bytes exactly (see `dewrap_bandwidth` in [`parse_proxy.py`](/ftio/api/metric_proxy/parse_proxy.py)).
+
+The reconstructed signals are analyzed **in addition to** the regular metrics and stored under the
+`___bandwidth_dewrap___<fn>` name — matching the virtual metric the proxy trace UI offers, so the FTIO overlay in the
+UI lines up with the plotted metric. Both the size and time counters (and ideally `proxy_mpi_ranks`) must be present
+in the payload; the proxy sends all of them by default. If the time counter is missing for a pair, that metric simply
+keeps its normal completion-attributed derivative.
+
 <p align="right"><a href="#api">⬆</a></p>
 
 ## GekkoFS with Msgpack/JSON support

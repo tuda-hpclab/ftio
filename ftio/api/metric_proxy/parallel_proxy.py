@@ -85,6 +85,14 @@ def parse_args():
 
     # Other settings
     parser.add_argument(
+        "--dewrap",
+        action="store_true",
+        default=False,
+        help="reconstruct wall-clock bandwidth from size/time counter pairs "
+        "(shifts each burst back over its estimated duration) instead of "
+        "derivating the cumulative size counter",
+    )
+    parser.add_argument(
         "--disable_parallel",
         action="store_true",
         default=False,
@@ -110,6 +118,9 @@ def main(args: argparse.Namespace = parse_args()) -> None:
     show = False  # shows the results from FTIO
     pools = False  # pools or future
     if args.metric:
+        exclude = ["time", "hits", "proxy"]
+    elif args.dewrap:
+        # size metrics carry the dewrapped signal, so keep them
         exclude = ["time", "hits", "proxy"]
     else:
         exclude = ["size", "hits", "proxy"]
@@ -137,6 +148,7 @@ def main(args: argparse.Namespace = parse_args()) -> None:
             filter_deriv=False,
             exclude=[],
             scale_t=1 / args.sample_freq_proxy,
+            dewrap=args.dewrap,
         )
 
     else:
@@ -145,6 +157,7 @@ def main(args: argparse.Namespace = parse_args()) -> None:
             filter_deriv=True,
             exclude=exclude,
             scale_t=1 / args.sample_freq_proxy,
+            dewrap=args.dewrap,
         )  # 'mpi'
         # metrics = parse_all(args.file , filter_deriv=True,exclude=['size','hits','proxy'], scale_t=1/args.sample_freq_proxy) # 'mpi'
 

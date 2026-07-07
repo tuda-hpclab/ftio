@@ -68,8 +68,14 @@ def handle_request(msg: bytes) -> bytes:
         argv = req.get("argv", [])
         raw_metrics = req.get("metrics", [])
 
-        metrics = filter_metrics(raw_metrics, filter_deriv=False)
-        print(f"Processing {len(metrics)} metrics")
+        # --dewrap is handled here, not by ftio core: reconstruct bandwidth
+        # from size/time counter pairs (see parse_proxy.dewrap_bandwidth)
+        dewrap = "--dewrap" in argv
+        if dewrap:
+            argv = [a for a in argv if a != "--dewrap"]
+
+        metrics = filter_metrics(raw_metrics, filter_deriv=False, dewrap=dewrap)
+        print(f"Processing {len(metrics)} metrics (dewrap={dewrap})")
 
         print(f"With Arguments: {argv}")
         argv.extend(["-e", "no"])

@@ -76,12 +76,110 @@ def extract(json_data, match, verbose=False):
     return b_out, t_out
 
 
+def dewrap_bandwidth(size_xy, time_xy, ranks_xy=None):
+    """Reconstruct the wall-clock bandwidth signal from cumulative
+    ___size___/___time___ counter pairs.
+
+    The proxy's MPI wrapper accounts a call's bytes and duration only when the
+    call *returns*, so a burst appears as a spike at the completion sample.
+    Here each burst is spread back over its estimated wall-clock span
+    (delta time / concurrent ranks), so the burst start point is right and the
+    amplitude is the aggregate bytes/s during the burst.
+
+    Args:
+        size_xy: cumulative size counter as [[ts, value], ...]
+        time_xy: cumulative in-call time counter as [[ts, value], ...]
+        ranks_xy: optional proxy_mpi_ranks series for the concurrency estimate
+
+    Returns:
+        (bandwidth, timestamps) as numpy arrays on the size counter's grid
+    """
+    s = np.nan_to_num(np.array(size_xy, dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+    t = np.nan_to_num(np.array(time_xy, dtype=float), nan=0.0, posinf=0.0, neginf=0.0)
+    ts = s[:, 0]
+    sv = s[:, 1]
+    if len(ts) < 2:
+        return np.zeros(len(ts)), ts
+
+    def value_at(arr, x):
+        """last value at or before x"""
+        idx = int(np.searchsorted(arr[:, 0], x, side="right")) - 1
+        return arr[idx, 1] if idx >= 0 else None
+
+    ranks = None
+    if ranks_xy is not None and len(ranks_xy) > 0:
+        ranks = np.nan_to_num(np.array(ranks_xy, dtype=float), nan=0.0)
+
+    ts0 = ts[0]
+    # bytes landing in bin k, which spans (ts[k-1] .. ts[k]]
+    bytes_bin = np.zeros(len(ts))
+    for k in range(1, len(ts)):
+        ds = sv[k] - sv[k - 1]
+        if ds <= 0:
+            continue
+        cur = value_at(t, ts[k])
+        prev = value_at(t, ts[k - 1])
+        dt = (cur - prev) if cur is not None and prev is not None else 0.0
+        n = 1.0
+        if ranks is not None:
+            r = value_at(ranks, ts[k])
+            if r:
+                n = max(1.0, round(r))
+        start = max(ts[k] - dt / n, ts0)
+        span = ts[k] - start
+        if dt <= 1e-9 or span <= 1e-9:
+            # no duration info: keep completion attribution
+            bytes_bin[k] += ds
+            continue
+        # spread ds over the bins overlapping [start, ts[k]]
+        j = max(int(np.searchsorted(ts, start, side="right")), 1)
+        while j <= k:
+            lo = max(ts[j - 1], start)
+            hi = min(ts[j], ts[k])
+            if hi > lo:
+                bytes_bin[j] += ds * (hi - lo) / span
+            j += 1
+
+    # each value is the rate of the interval STARTING at its timestamp
+    # (sample-and-hold until the next point); the last point closes at 0 so
+    # bursts sit at their reconstructed start instead of one bin late
+    bw = np.zeros(len(ts))
+    widths = np.diff(ts)
+    bw[:-1] = np.where(widths > 1e-9, bytes_bin[1:] / np.maximum(widths, 1e-9), 0.0)
+    return bw, ts
+
+
+def dewrap_metrics(json_data, out: dict, scale_t: float = 1) -> dict:
+    """For each ___size___ metric with a matching ___time___ counter, add the
+    dewrapped bandwidth reconstruction (see dewrap_bandwidth) on top of the
+    existing metrics, under the ___bandwidth_dewrap___ name. That name matches
+    the virtual metric the proxy trace UI offers, so the FTIO model lands on
+    the metric the user plots. All other metrics are analyzed unchanged."""
+    raw = json_data["metrics"]
+    # prefer the job's own rank count (exact, follows malleable jobs)
+    ranks_xy = raw.get("job_mpi_ranks") or raw.get("proxy_mpi_ranks")
+    n_dw = 0
+    for name in list(out.keys()):
+        if "___size___" in name and not name.startswith("deriv"):
+            tname = name.replace("___size___", "___time___")
+            if name in raw and tname in raw:
+                bw, ts = dewrap_bandwidth(raw[name], raw[tname], ranks_xy)
+                out[name.replace("___size___", "___bandwidth_dewrap___")] = [
+                    bw,
+                    ts * scale_t,
+                ]
+                n_dw += 1
+    CONSOLE.info(f"[blue]Dewrap: added {n_dw} reconstructed size/time metric pairs[/]")
+    return out
+
+
 def filter_metrics(
     json_data,
     filter_deriv: bool = True,
     exclude=None,
     scale_t: float = 1,
     rename: dict = None,
+    dewrap: bool = False,
 ):
     if rename is None:
         rename = {}
@@ -103,6 +201,9 @@ def filter_metrics(
     for metric in metrics:
         b_out, t_out = extract(json_data, metric, False)
         out[metric] = [b_out, t_out * scale_t]
+
+    if dewrap:
+        out = dewrap_metrics(json_data, out, scale_t)
 
     # rename keys if only one metric passed
     if exclude:
@@ -142,7 +243,11 @@ def filter_metrics(
 
 
 def parse_all(
-    file_path: str, filter_deriv: bool = True, exclude=None, scale_t: float = 1
+    file_path: str,
+    filter_deriv: bool = True,
+    exclude=None,
+    scale_t: float = 1,
+    dewrap: bool = False,
 ) -> dict:
     """parses all metrics from proxy
 
@@ -151,6 +256,7 @@ def parse_all(
         filter_deriv (bool, optional): Removes the metrics in case a similar metrics, which start with deriv is presented. Defaults to True.
         exclude (list,optional): list of metrics to exclude
         scale_t (float, optional): scale time unit (default 1). Default unit is "s"
+        dewrap (bool, optional): reconstruct wall-clock bandwidth from size/time counter pairs (see dewrap_bandwidth)
 
     Returns:
         dict: parsed metrics with 2D numpy array
@@ -170,7 +276,7 @@ def parse_all(
         )
         return {}
 
-    return filter_metrics(json_data, filter_deriv, exclude, scale_t)
+    return filter_metrics(json_data, filter_deriv, exclude, scale_t, dewrap=dewrap)
 
 
 def load_proxy_trace_stdin(deriv_and_not_deriv: bool = True, exclude=None):
