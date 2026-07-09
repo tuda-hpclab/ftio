@@ -27,7 +27,7 @@ Use `predictor` for continuous online analysis (re-runs on every new message); u
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--zmq` | off | Enable ZMQ input mode (suppresses opening the HTML output). |
-| `--zmq_source` | `direct` | Message source format: `direct` (generic) or `tmio`. |
+| `--zmq_format` | `direct` | Encoding of the ZMQ payload: `direct` (generic) or `tmio`. `--zmq_source` is a legacy alias of this flag. Not to be confused with `--source`, which selects the on-disk file format. |
 | `--zmq_address` | `*` | ZMQ bind address. `*` binds to all interfaces; use `127.0.0.1` for localhost only. |
 | `--zmq_port` | `5555` | ZMQ port for incoming data messages. |
 | `--zmq_port_reply` | `5556` | ZMQ port for outgoing frequency predictions (used with TMIO prefetcher). |

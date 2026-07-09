@@ -49,7 +49,7 @@ def main(args: list[str] = sys.argv) -> None:
             predictor_with_processes_zmq(
                 shared_resources,
                 args,
-                any("zmq_port_reply" in x for x in args),
+                any("zmq_port_reply" in x.replace("-", "_") for x in args),
             )
         else:
             # prediction with processes and a callback mechanism

@@ -17,13 +17,19 @@ Offline I/O pattern detection.  Reads a trace file and returns the dominant I/O 
 ftio [options] files [files ...]
 ```
 
+### Conventions
+
+- Every long option accepts both spellings: `--phase_automaton` and `--phase-automaton` are the same flag.
+- Invalid values are rejected when the arguments are parsed, not at runtime. So are impossible combinations, such as `--filter_type bandpass` with a single `--filter_cutoff`, or `-ts` greater than or equal to `-te`.
+- `--version` prints the installed FTIO version.
+
 ### Input / parsing
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `files` | path(s) | — | Trace file(s) or folder(s). Supported formats: JSON, JSONL, MessagePack, Darshan, Recorder, custom TXT. See [File Formats](file_formats.md). |
-| `-m`, `--mode` | str | `write_sync` | I/O mode to analyse: `write_sync`, `read_sync`, `write_async`, `read_async`. |
-| `-s`, `--source` | str | `unspecified` | Force file-source detection: `tmio` or `custom`. Auto-detected by default. |
+| `-m`, `--mode` | str | `write_sync` | I/O mode to analyse: `write_sync`, `read_sync`, `write_async`, `read_async`. The reversed spellings (`sync_write`, …) also work, as do the shorthands `w`/`write` and `r`/`read`, which map to `write_sync` and `read_sync` (a value without `async` in it means sync). |
+| `-s`, `--source` | str | `unspecified` | Force file-source detection: `tmio` or `custom`. Auto-detected by default. This is the *on-disk* format; it is unrelated to [`--zmq_format`](#online--zmq). |
 | `-ts` | float | — | Restrict analysis to times ≥ this value (seconds). |
 | `-te` | float | — | Restrict analysis to times ≤ this value (seconds). |
 | `-cf`, `--custom_file` | path | — | Python file defining `pattern` and `translate` dicts for custom TXT parsing. See [File Formats § Custom](file_formats.md#parsing-custom-file-formats). |
@@ -41,8 +47,8 @@ ftio [options] files [files ...]
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `-tr`, `--transformation` | str | `dft` | Frequency method: `dft`, `stft`, `astft`, `wave_disc`, `wave_cont`. Experimental (requires `pip install "ftio[amd-libs]"`): `efd`, `vmd`. See [Frequency Methods](frequency_methods.md). |
-| `-o`, `--outlier` | str | `z-score` | Outlier detection on the spectrum: `z-score`, `dbscan`, `forest`, `lof`, `peak`. |
+| `-tr`, `--transformation` | str | `dft` | Frequency method: `dft`, `stft`, `astft`, `wave_disc`, `wave_cont`. `dwt`/`wave_dwt` alias `wave_disc`, `cwt`/`wave_cwt` alias `wave_cont`. Experimental (requires `pip install "ftio[amd-libs]"`): `efd`, `vmd`. See [Frequency Methods](frequency_methods.md). |
+| `-o`, `--outlier` | str | `z-score` | Outlier detection on the spectrum: `z-score`, `dbscan`, `forest`, `lof`, `peak`. `Z-score`, `zscore`, `db-scan`, `db`, `isolation_forest` and `peaks` are accepted aliases. |
 | `-t`, `--tol` | float | `0.8` | Tolerance / confidence threshold used by the outlier detector. |
 | `-n`, `--n_freq` | int | `0` | Extract up to N dominant frequencies (0 = auto, finds the single dominant). |
 | `-np`, `--no-psd` | flag | off | Use amplitude spectrum instead of power-spectral density. |
@@ -52,7 +58,7 @@ ftio [options] files [files ...]
 | `-ce`, `--cepstrum` | flag | off | Enable cepstrum plot for DFT. |
 | `-au`, `--autocorrelation` | flag | off | Run autocorrelation in addition to the selected method; merge results. |
 | `-p`, `--periodicity_detection` | str | none | Extra periodicity check: `rpde`, `sf` (spectral flatness), `corr`, `ind`. |
-| `-le`, `--level` | int | `0` (auto) | Decomposition level for discrete wavelet transform. |
+| `-le`, `--level` | int | `0` (auto) | Decomposition level for the wavelet transforms. `0` or `auto` computes the maximum level automatically. |
 | `--wavelet` | str | `db1` / `morl` | Wavelet family (see `pywt` docs). Defaults depend on `wave_disc` vs `wave_cont`. |
 | `--stft_window` | str | `0` (auto) | Window length in samples or seconds (e.g. `20s`). For `stft`: auto uses 4× the detected period. For `astft`: auto uses the cm5 concentration measure; a non-zero value overrides it. |
 | `--tfpf` | int | `0` | Time-frequency peak-filtering iterations (ASTFT). |
@@ -88,16 +94,16 @@ ftio [options] files [files ...]
 |------|------|---------|-------------|
 | `--zmq` | flag | off | Input via ZeroMQ instead of a file (suppress HTML open). |
 | `--zmq_address` | str | `*` | ZMQ bind address. |
-| `--zmq_port` | str | `5555` | ZMQ input port. |
+| `--zmq_port` | str | `5555` | ZMQ input port. A bare port number, e.g. `5555` — not a full endpoint. |
 | `--zmq_port_reply` | str | `5556` | ZMQ reply port (dominant frequency). |
-| `--zmq_source` | str | `direct` | ZMQ message source format: `tmio`, `direct`, etc. |
+| `--zmq_format` | str | `direct` | Encoding of the ZMQ payload: `direct` (raw bandwidth / start / end triples) or `tmio` (msgpack-encoded TMIO buffer). `--zmq_source` is a legacy alias. Unrelated to `--source`. |
 | `--gui` | flag | off | Forward results to the `ftio-gui` dashboard (start separately). |
 
 ### Output & plotting
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `-e`, `--engine` | str | `plotly` | Plot engine: `plotly` (HTML), `matplotlib`, or `no` (disable plots). |
+| `-e`, `--engine` | str | `plotly` | Plot engine: `plotly` (HTML), `matplotlib`, or `no` (disable plots). `plot`/`mat` are accepted short spellings; `plotly_no_paper`/`mat_no_paper` disable the paper layout. |
 | `-rp`, `--runtime_plots` | flag | off | Show each figure immediately at runtime. |
 | `-r`, `--render` | str | `dynamic` | Rendering mode: `dynamic` or `static`. |
 | `-v`, `--verbose` | flag | off | Verbose console output. |
@@ -107,7 +113,7 @@ ftio [options] files [files ...]
 | `--debounce` | flag | off | Serialise predictions (prevents concurrent writes in online mode). |
 | `-ml`, `--machine_learning` | flag | off | Enable ML-based analysis (API use only). |
 | `-w`, `--window_adaptation` | str | none | Online window strategy (predictor mode): `frequency_hits`, `data`, `adwin`, `cusum`, `ph`. |
-| `-hi`, `--hits` | float | `3` | Frequency hits required before adapting the window. |
+| `-hi`, `--hits` | int | `3` | Frequency hits required before adapting the window. |
 
 ### Examples
 

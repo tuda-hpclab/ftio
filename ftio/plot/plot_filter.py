@@ -224,12 +224,13 @@ def plot_filter_results(args, b, filtered_signal) -> list:
     Returns:
         list of figures
     """
-    if "plot" in args.engine:
-        # Use Plotly function
-        fig = plot_filter_results_plotly(args, b, filtered_signal)
-    elif "mat" in args.engine:
+    # "mat" is tested first: "plot" is a substring of "matplotlib"
+    if "mat" in args.engine:
         # Use Matplotlib function
         fig = plot_filter_results_matplotlib(args, b, filtered_signal)
+    elif "plot" in args.engine:
+        # Use Plotly function
+        fig = plot_filter_results_plotly(args, b, filtered_signal)
     else:
         fig = []
 
