@@ -17,9 +17,18 @@ https://github.com/tuda-parallel/FTIO/blob/main/LICENSE
 
 from __future__ import annotations
 
+import multiprocessing as mp
 from multiprocessing import Manager
 
 from ftio.api.gekkoFs.gekko_helper import get_modification_time
+
+# Python 3.14 made "forkserver" the default start method on Linux. The GLASS
+# stack builds Manager()-backed shared state at import time and shares those
+# proxies with forked children, which only works under "fork" (the pre-3.14
+# default). Restore it here — the module that creates the Manager — so every
+# entry point (jit, predictor_jit, ftio_gekko) is covered. No-op if already set.
+if mp.get_start_method(allow_none=True) is None:
+    mp.set_start_method("fork")
 
 
 class FileQueue:

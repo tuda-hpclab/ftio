@@ -30,7 +30,11 @@ from ftio.api.gekkoFs.stage_data import (
     trigger_flush,
 )
 from ftio.freq.helper import MyConsole
-from ftio.multiprocessing.async_process import handle_in_process, join_procs
+from ftio.multiprocessing.async_process import (
+    enforce_limit,
+    handle_in_process,
+    join_procs,
+)
 from ftio.plot.plot_bandwidth import plot_bar_with_rich
 from ftio.prediction.helper import (
     get_dominant_and_conf,
@@ -42,7 +46,7 @@ from ftio.prediction.online_analysis import (
     window_adaptation,
 )
 from ftio.prediction.probability_analysis import find_probability
-from ftio.prediction.processes_zmq import bind_socket, receive_messages
+from ftio.prediction.processes_zmq import receive_messages, setup_socket
 from ftio.prediction.shared_resources import SharedResources
 
 # T_S = time.time()
@@ -61,6 +65,12 @@ def main(args: list[str] = sys.argv[1:]) -> None:
     ranks = 0
     procs = []
     debounce = "--debounce" in ftio_args
+    # ftio_args is a raw list here; read the bounded-pool cap from it
+    max_predictions = 0
+    if "--max-predictions" in ftio_args:
+        idx = ftio_args.index("--max-predictions")
+        if idx + 1 < len(ftio_args):
+            max_predictions = int(ftio_args[idx + 1])
 
     ftio_args.extend(["-e", "no"])
     if "-zmq" not in ftio_args:
@@ -71,7 +81,7 @@ def main(args: list[str] = sys.argv[1:]) -> None:
     setup_cargo(data_stager_args)
 
     # bind to socket
-    socket = bind_socket(data_stager_args.zmq_address, data_stager_args.zmq_port)
+    socket = setup_socket(data_stager_args.zmq_address, data_stager_args.zmq_port)
     # can be extended to listen to multiple sockets
     poller = zmq.Poller()
     poller.register(socket, zmq.POLLIN)
@@ -124,6 +134,8 @@ def main(args: list[str] = sys.argv[1:]) -> None:
                         )
                     )
                 else:
+                    # bounded pool: wait for the oldest if the cap is reached
+                    procs = enforce_limit(procs, max_predictions)
                     procs.append(
                         handle_in_process(
                             prediction_zmq_process,

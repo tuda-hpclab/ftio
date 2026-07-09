@@ -53,3 +53,27 @@ def join_procs(procs: list, blocking: bool = True) -> list:
             if blocking:
                 p.join()  # join if requested
     return alive_procs
+
+
+def enforce_limit(procs: list, max_concurrent: int) -> list:
+    """Cap the number of concurrent processes (bounded pool).
+
+    First reaps finished processes (non-blocking). Then, if ``max_concurrent``
+    is a positive number, blocks on the OLDEST process until fewer than
+    ``max_concurrent`` remain alive — so draining/listening continues right up
+    to the spawn point and only the oldest in-flight prediction is waited on.
+    ``max_concurrent <= 0`` means unlimited (original behaviour). ``= 1`` is the
+    debounce case (one prediction at a time).
+
+    Args:
+        procs (list): list of multiprocessing.Process objects (oldest first)
+        max_concurrent (int): concurrency cap; <= 0 disables the cap
+    Returns:
+        list: alive processes, with room for one more when a cap is set
+    """
+    procs = join_procs(procs, blocking=False)
+    if max_concurrent and max_concurrent > 0:
+        while len(procs) >= max_concurrent:
+            procs[0].join()  # wait for the oldest to finish, then re-reap
+            procs = join_procs(procs, blocking=False)
+    return procs

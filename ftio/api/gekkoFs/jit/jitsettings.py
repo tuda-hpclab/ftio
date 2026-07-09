@@ -122,7 +122,9 @@ class JitSettings:
 
         self.nodes = 1
         self.max_time = None
-        self.ftio_args = "-m write -v --freq 10 "  # -v  # 10 -w data -v "
+        # --ingest-workers>1 enables the process-resample fan-out (~2.4x) for
+        # the per-round parse+overlap; 1 keeps the single-process behaviour.
+        self.ftio_args = "-m write -v --freq 10 --ingest-workers 4 "
         self.gkfs_daemon_protocol = (
             "ofi+verbs"  # "ofi+verbs" #"ofi+sockets"  or "ofi+verbs"
         )
@@ -775,5 +777,52 @@ class JitSettings:
                 if not self.exclude_daemon:
                     self.app_flags = re.sub(r"/[^\s]+", self.gkfs_mntdir, self.app_flags)
             elif "ior" in self.app:
-                self.run_dir = "/d/github/IOR"
+                self.run_dir = "/d/github/ior/src"
                 self.app_flags = re.sub(r"/[^\s]+", self.gkfs_mntdir, self.app_flags)
+            elif "lammps" in self.app:
+                # Writes restart files straight to ${ckptdir} (no temp rename), so
+                # point that at the gkfs mountdir. Small locally (20³, tmpfs);
+                # build / size knobs / cluster paths in LAMMPS.md.
+                self.app_call = "/d/benchmark/lammps/build/lmp"
+                self.run_dir = "/d/benchmark/lammps/glass"
+                ckptdir = self.gkfs_mntdir if not self.exclude_daemon else self.run_dir
+                self.app_flags = (
+                    f"-in /d/benchmark/lammps/glass/in.ckpt -v ckptdir {ckptdir} "
+                    f"-v x 20 -v y 20 -v z 20 -v every 100 -v nsteps 400"
+                )
+            elif "wrf" in self.app:
+                # Idealized baroclinic wave (em_b_wave): self-contained, writes
+                # periodic wrfrst_d01_* restart checkpoints (period = namelist
+                # restart_interval). Build / size knobs / cluster setup in WRF.md.
+                self.app_call = "./wrf.exe"
+                self.run_dir = "/d/benchmark/WRF/test/em_b_wave"
+                self.app_flags = ""
+            elif "qmc" in self.app:
+                # QMCPACK VMC (self-contained heg case): checkpoints config.h5
+                # every block (checkpoint="1"); write-only, rolling file. Size =
+                # walkers/system, period = checkpoint blocks. Notes in Qmpack.md.
+                self.app_call = "/d/benchmark/qmcpack/build/bin/qmcpack"
+                self.run_dir = "/d/benchmark/qmcpack/glass"
+                self.app_flags = "glass.xml"
+            elif "castro" in self.app:
+                # Castro/AMReX Sedov: real hydro, writes periodic AMReX checkpoint
+                # DIRECTORIES (sedov_3d_sph_chk*) every amr.check_int steps;
+                # write-only. Size = amr.n_cell/max_level, period = check_int.
+                # Note: AMReX checkpoints are multi-file dirs. Build/knobs in Castro.md.
+                self.app_call = (
+                    "/d/benchmark/Castro/Exec/hydro_tests/Sedov/Castro3d.gnu.MPI.ex"
+                )
+                self.run_dir = "/d/benchmark/Castro/glass"
+                self.app_flags = (
+                    "inputs.3d.sph max_step=40 amr.check_int=10 amr.plot_int=-1"
+                )
+            elif "warpx" in self.app:
+                # WarpX (AMReX plasma PIC): real PIC compute, writes periodic
+                # AMReX checkpoint DIRECTORIES (diags/chk*) every chk.intervals
+                # steps; write-only. Size = amr.n_cell, period = chk.intervals.
+                # Build/knobs in WarpX.md (reuses the local AMReX).
+                self.app_call = "/d/benchmark/WarpX/build/bin/warpx.3d"
+                self.run_dir = "/d/benchmark/WarpX/glass"
+                self.app_flags = (
+                    "inputs max_step=30 chk.intervals=10 diag1.intervals=1000"
+                )

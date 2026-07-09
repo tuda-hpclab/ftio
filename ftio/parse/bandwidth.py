@@ -191,7 +191,7 @@ def overlap(b, t_s, t_e):
     return list(b_overlap), list(t_overlap)
 
 
-@jit(nopython=True, cache=True)
+@jit(nopython=True, cache=True, nogil=True)
 def overlap_core(b, t_s, t_e, id_s, id_e):
     agg_phases = len(t_s)
 
@@ -291,7 +291,7 @@ def overlap_two_series_safe(b1, t1, b2, t2):
     return np.array(b_out), np.array(t_out)
 
 
-@jit(nopython=True, cache=True)
+@jit(nopython=True, cache=True, nogil=True)
 def overlap_two_series_jit_impl(b1, t1, b2, t2):
     n1 = len(b1)
     n2 = len(b2)

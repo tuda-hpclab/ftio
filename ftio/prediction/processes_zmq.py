@@ -19,7 +19,11 @@ import subprocess
 import zmq
 
 from ftio.freq.helper import MyConsole
-from ftio.multiprocessing.async_process import handle_in_process, join_procs
+from ftio.multiprocessing.async_process import (
+    enforce_limit,
+    handle_in_process,
+    join_procs,
+)
 from ftio.parse.args import parse_args
 from ftio.prediction.helper import export_extrap, get_dominant_and_conf, print_data
 from ftio.prediction.processes import prediction_process
@@ -56,6 +60,7 @@ def predictor_with_processes_zmq(
     addr = tmp_args.zmq_address
     port_in = tmp_args.zmq_port
     debounce = getattr(tmp_args, "debounce", False)
+    max_predictions = getattr(tmp_args, "max_predictions", 0)
 
     # bind the socket
     socket_in = setup_socket(addr, port_in, zmq.PULL)
@@ -104,6 +109,8 @@ def predictor_with_processes_zmq(
                     )
                     proc.join()
                 else:
+                    # bounded pool: wait for the oldest if the cap is reached
+                    procs = enforce_limit(procs, max_predictions)
                     procs.append(
                         handle_in_process(
                             prediction_process, args=(shared_resources, args, msgs)

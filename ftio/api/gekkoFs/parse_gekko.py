@@ -97,54 +97,66 @@ def parse(file_path_or_msg, data, io_type="w", debug_level: int = 0) -> tuple[di
 
 
 def assign(data: dict, unpacker, io_type="w", debug_level: int = 0) -> dict:
-    data_fields = [
+    # Two wire layouts are supported. The 8-field one is what GekkoFS emits
+    # (io_type comes from the filename / -m mode, not the message); the
+    # 9-field one is the older format that carried io_type at index 3.
+    fields_8 = [
         "flush_t",
         "hostname",
         "pid",
-        "io_type",
         "start_t_micro",
         "end_t_micro",
         "req_size",
         "total_iops",
         "total_bytes",
     ]
-    t_flush = 0
-    skip = False
-    for index, item in enumerate(unpacker):
-        if isinstance(item, dict):
-            item = item[data_fields[index]]
+    fields_9 = fields_8[:3] + ["io_type"] + fields_8[3:]
 
-        if index == 0:  # find max flush time
-            t_flush = max(data["t_flush"], item * 1e-6)
-        elif index == 3:
-            if item != io_type:
-                skip = True
-                break
-            else:
-                data["t_flush"] = t_flush
-        elif index == 4:
-            data["t_start"].extend([v * 1e-6 for v in item])
-        elif index == 5:
-            data["t_end"].extend([v * 1e-6 for v in item])
-        elif index == 6:
-            data["req_size"].extend(item)
-        else:
-            data[data_fields[index]] = item
-            # exit if it is not the right mode
+    # materialize once so we can validate the layout before mapping fields
+    items = list(unpacker)
+    if len(items) == 9:
+        data_fields = fields_9
+    elif len(items) == 8:
+        data_fields = fields_8
+    else:
+        # malformed / truncated: skip with a log instead of misaligning fields
+        print(f"[parse_gekko] skipping message: expected 8 or 9 fields, got {len(items)}")
+        return data
 
-    # convert from µs to s
+    # a field may arrive dict-wrapped ({name: value}); unwrap by its known name
+    record = {
+        name: (item[name] if isinstance(item, dict) else item)
+        for name, item in zip(data_fields, items, strict=True)
+    }
+    t_flush = max(data["t_flush"], record["flush_t"] * 1e-6)
+
+    # message-carried io_type (9-field layout) is filtered against the request
+    skip = "io_type" in record and record["io_type"] != io_type
     if not skip:
-        duration = np.array(data["t_end"]) - np.array(data["t_start"])
+        data["t_flush"] = t_flush
+        data["hostname"] = record["hostname"]
+        data["pid"] = record["pid"]
+        # summed across servers (matches the JSON path and the fan-out reduce)
+        data["total_iops"] += record["total_iops"]
+        data["total_bytes"] += record["total_bytes"]
+
+        # bandwidth is computed per message (µs -> s) so avg_throughput stays
+        # aligned 1:1 with this message's events and is grouping-independent
+        t_start = np.array(record["start_t_micro"], dtype=float) * 1e-6
+        t_end = np.array(record["end_t_micro"], dtype=float) * 1e-6
+        req_size = np.array(record["req_size"], dtype=float)
+        duration = t_end - t_start
         duration[duration == 0] = 1e-6
-        b = np.array(data["req_size"]) / duration  # in B/s
+        b = req_size / duration  # in B/s
 
         if np.isnan(b).any():
-            print(
-                f'b_rank : {b} \nt_rank_s : {data["t_start"]} \nt_rank_e : {data["t_end"]} \n'
-            )
-            b[np.isnan(b)] = 0
-            b[np.isinf(b)] = 0
+            print(f"b_rank : {b} \nt_rank_s : {t_start} \nt_rank_e : {t_end} \n")
+        b[np.isnan(b)] = 0
+        b[np.isinf(b)] = 0
 
+        data["t_start"].extend(t_start)
+        data["t_end"].extend(t_end)
+        data["req_size"].extend(req_size)
         data["avg_throughput"].extend(b)
         if debug_level > 0:
             total_req = np.sum(data["req_size"])

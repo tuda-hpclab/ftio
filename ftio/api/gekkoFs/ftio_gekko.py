@@ -26,10 +26,140 @@ from ftio.parse.bandwidth import overlap
 from ftio.plot.helper import format_plot
 from ftio.plot.units import set_unit
 from ftio.prediction.helper import dump_json
+from ftio.prediction.parallel_ingest import (
+    partition,
+    reduce_partials,
+    resample_step,
+    resolve_workers,
+)
 from ftio.processing.print_output import display_prediction
 
 CONSOLE = MyConsole()
 CONSOLE.set(True)
+
+
+def _fresh_data_rank() -> dict:
+    return {
+        "avg_throughput": [],
+        "t_end": [],
+        "t_start": [],
+        "hostname": "",
+        "pid": 0,
+        "io_type": "",
+        "req_size": [],
+        "total_bytes": 0,
+        "total_iops": 0,
+        "t_flush": 0.0,
+    }
+
+
+def _parse_overlap_chunk(chunk_and_io: tuple) -> tuple:
+    """Worker body: parse a chunk of messages and overlap it into one partial.
+
+    Returns (b, t, total_bytes, t_flush, ext). Module-level so it is picklable
+    for the process pool.
+    """
+    chunk, io_type = chunk_and_io
+    data = _fresh_data_rank()
+    ext = ""
+    for msg in chunk:
+        data, ext = parse(msg, data, io_type=io_type, debug_level=0)
+    if data["avg_throughput"]:
+        b, t = overlap(data["avg_throughput"], data["t_start"], data["t_end"])
+    else:
+        b, t = [], []
+    return b, t, data["total_bytes"], data["t_flush"], ext
+
+
+def _parse_overlap_resample_chunk(args: tuple) -> tuple:
+    """Like _parse_overlap_chunk but resamples the partial onto a shared grid.
+
+    Returns (resampled_b, total_bytes, t_flush, ext). The resampled vector is
+    fixed-length, so it is cheap to ship out of a worker process — this is what
+    makes the process backend viable (no big-array IPC).
+    """
+    chunk, io_type, grid = args
+    data = _fresh_data_rank()
+    ext = ""
+    for msg in chunk:
+        data, ext = parse(msg, data, io_type=io_type, debug_level=0)
+    if data["avg_throughput"]:
+        b, t = overlap(data["avg_throughput"], data["t_start"], data["t_end"])
+        rb = resample_step(b, t, grid)
+    else:
+        rb = np.zeros(len(grid))
+    return rb, data["total_bytes"], data["t_flush"], ext
+
+
+def _peek_horizon(msgs: list) -> float:
+    """Cheap upper bound on the time window from each message's flush_t (field 0)."""
+    import msgpack
+
+    hi = 0.0
+    for m in msgs:
+        if isinstance(m, bytes):
+            up = msgpack.Unpacker()
+            up.feed(m)
+            hi = max(hi, float(next(iter(up))) * 1e-6)  # first object = flush_t (us)
+    return hi
+
+
+def ingest_app_bandwidth(
+    files_or_msgs: list,
+    io_type: str,
+    n_workers: int = 1,
+    backend: str = "thread",
+    resample_hz: float = 100.0,
+) -> tuple:
+    """Parse messages and overlap them into the application-level bandwidth.
+
+    n_workers == 1 is the original serial path. n_workers > 1 fans the messages
+    out and folds the per-worker partials with the same (associative) overlap,
+    so the (b, t) result is identical. ``backend`` chooses how: ``thread``
+    (default) shares memory — no IPC — and the numba overlap is compiled
+    ``nogil`` so it runs truly parallel; ``process`` avoids the GIL but is
+    IPC-bound for this workload. total_bytes is summed across servers and
+    t_flush is the max. Returns (b, t, total_bytes, t_flush, ext).
+    """
+    n = resolve_workers(n_workers) if n_workers > 1 else 1
+    if n == 1 or len(files_or_msgs) <= 1:
+        return _parse_overlap_chunk((files_or_msgs, io_type))
+
+    chunks = partition(files_or_msgs, n)
+
+    # process-resample: each worker returns a small fixed-length resampled
+    # vector on a shared grid, so nothing large crosses the process boundary.
+    if backend == "process-resample":
+        from multiprocessing import Pool
+
+        grid = np.arange(
+            0.0, _peek_horizon(files_or_msgs) + 1.0 / resample_hz, 1.0 / resample_hz
+        )
+        tasks = [(c, io_type, grid) for c in chunks]
+        with Pool(processes=len(chunks)) as pool:
+            results = pool.map(_parse_overlap_resample_chunk, tasks)
+        rb = np.sum([r[0] for r in results], axis=0)
+        total_bytes = sum(r[1] for r in results)
+        t_flush = max((r[2] for r in results), default=0.0)
+        ext = next((r[3] for r in results if r[3]), "")
+        return list(rb), list(grid), total_bytes, t_flush, ext
+
+    tasks = [(c, io_type) for c in chunks]
+    if backend == "process":
+        from multiprocessing import Pool
+
+        with Pool(processes=len(chunks)) as pool:
+            results = pool.map(_parse_overlap_chunk, tasks)
+    else:
+        from multiprocessing.pool import ThreadPool
+
+        with ThreadPool(len(chunks)) as pool:
+            results = pool.map(_parse_overlap_chunk, tasks)
+    b, t = reduce_partials([(r[0], r[1]) for r in results])
+    total_bytes = sum(r[2] for r in results)
+    t_flush = max((r[3] for r in results), default=0.0)
+    ext = next((r[4] for r in results if r[4]), "")
+    return b, t, total_bytes, t_flush, ext
 
 
 def run(
@@ -55,44 +185,29 @@ def run(
     ranks = len(files_or_msgs)
 
     # Set up data
-    data_rank = {
-        "avg_throughput": [],
-        "t_end": [],
-        "t_start": [],
-        "hostname": "",
-        "pid": 0,
-        "io_type": "",
-        "req_size": [],
-        "total_bytes": 0,
-        "total_iops": 0,
-        "t_flush": 0.0,
-    }
+    data_rank = _fresh_data_rank()
 
-    # 1) overlap for rank level metrics
-    for file_or_msg in files_or_msgs:
-        # print(files_or_msgs.index(file_or_msg))
-        data_rank, ext = parse(
-            file_or_msg, data_rank, io_type=args.mode[0], debug_level=0
-        )
-        # print(data_rank)
+    # 1) parse the messages and overlap them into the app-level bandwidth. With
+    #    --ingest-workers > 1 this is fanned out across processes and the
+    #    per-worker partials are folded back (identical result).
+    n_workers = getattr(args, "ingest_workers", 1)
+    backend = getattr(args, "ingest_backend", "process-resample")
+    resample_hz = getattr(args, "freq", 100.0) or 100.0
+    b, t, total_bytes, t_flush, ext = ingest_app_bandwidth(
+        files_or_msgs, args.mode[0], n_workers, backend, resample_hz
+    )
+    data_rank["total_bytes"] = total_bytes
+    data_rank["t_flush"] = t_flush
 
-    # 2) exit if no new data
-    if not data_rank["avg_throughput"]:
-        data_rank, ext = parse(file_or_msg, data_rank, io_type="read")
-        # print(data_rank)
-        if not data_rank["avg_throughput"]:
-            CONSOLE.print("[red]Terminating prediction (no data passed) [/]")
-        else:
+    # 2) exit if no new data (retry as read to flag "read data ignored").
+    #    "r" matches GekkoFS's io_type; args.mode[0] is likewise "w"/"r".
+    if not b:
+        rb, *_ = ingest_app_bandwidth(files_or_msgs, "r", 1)
+        if rb:
             CONSOLE.print("[red]Read data passed -- ignoring [/]")
+        else:
+            CONSOLE.print("[red]Terminating prediction (no data passed) [/]")
         exit(0)
-
-    # 3) Scale if JSON or MsgPack
-    b_rank = np.array(data_rank["avg_throughput"])
-    t_rank_s = np.array(data_rank["t_start"])
-    t_rank_e = np.array(data_rank["t_end"])
-
-    # 4) app level bandwidth
-    b, t = overlap(b_rank, t_rank_s, t_rank_e)
 
     # Debug
     dt = np.diff(t)  # time intervals
