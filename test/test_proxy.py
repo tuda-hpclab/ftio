@@ -64,6 +64,24 @@ def test_proxy():
         assert required_top_freq_fields.issubset(top_freqs.keys())
 
 
+def test_handle_request_ping():
+    """handle_request answers a ping with pong (documented control message)."""
+    assert handle_request(b"ping") == b"pong"
+
+
+def test_handle_request_address_update():
+    """handle_request acknowledges a 'New Address:' rebind request."""
+    assert handle_request(b"New Address: tcp://127.0.0.1:5555") == b"Address updated"
+
+
+def test_handle_request_invalid_payload():
+    """A non-control, non-msgpack payload returns a msgpack error, not a crash."""
+    reply = handle_request(b"\xff\xff not msgpack \x00")
+    response = msgpack.unpackb(reply, raw=False)
+    assert isinstance(response, dict)
+    assert "error" in response
+
+
 def test_sanitize_prediction():
     """sanitize() must convert Prediction objects to msgpack-serializable dicts."""
     p = Prediction(transformation="dft", t_start=0.1, t_end=1.0, freq=100.0, ranks=4)

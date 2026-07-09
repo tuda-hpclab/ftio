@@ -106,7 +106,28 @@ def handle_request(msg: bytes) -> bytes:
 
 
 def main(address: str = "tcp://*:0"):
-    """FTIO ZMQ Server entrypoint for Metric Proxy."""
+    """FTIO ZMQ server entrypoint for the Metric Proxy.
+
+    What it does:
+        A stateless request/reply server. It binds a ZMQ REP socket and loops:
+        poll (1 s timeout), recv one request, dispatch via handle_request, send
+        the reply. Requests are ping/pong, a "New Address: " rebind, or a
+        msgpack-packed {argv, metrics, disable_parallel} job that runs FTIO
+        (execute / execute_parallel) and returns the prediction. If no request
+        arrives within IDLE_TIMEOUT seconds, the server shuts down.
+
+    How it differs from predictor_with_processes_zmq (the streaming predictor):
+        * Pattern: REP request/reply here vs PULL streaming there. The proxy
+          sends a job and blocks for the answer; GekkoFS servers instead push
+          bandwidth telemetry that the predictor pulls.
+        * State: stateless here — each request carries the full metrics array
+          and is answered in isolation. The predictor is stateful: it grows an
+          application-level bandwidth (b_app/t_app) across many messages.
+        * Concurrency: handled inline here (recv -> handle -> send). The
+          predictor spawns a prediction process per drained batch.
+        * Fan-out: not applicable here — there is no multi-server reduction to
+          an application-level bandwidth, so parallel ingestion does not apply.
+    """
     global CURRENT_ADDRESS, last_request, POOL
     context = zmq.Context()
     socket = context.socket(zmq.REP)
