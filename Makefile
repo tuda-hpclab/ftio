@@ -113,7 +113,7 @@ test_all:
 	@rm -rf ./quicktest/*
 
 test:
-	cd test && python3 -m pytest && make clean
+	cd test && python3 -m pytest -v && make clean
 
 test_parallel:
 	@python3 -m pip show pytest-xdist > /dev/null 2>&1 || python3 -m pip install pytest-xdist

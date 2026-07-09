@@ -9,13 +9,9 @@ For more information, see the LICENSE file in the project root:
 https://github.com/tuda-parallel/FTIO/blob/main/LICENSE
 """
 
-import multiprocessing as mp
-
 import pytest
 
 from ftio.prediction.shared_resources import SharedResources
-
-mp.set_start_method("spawn", force=True)
 
 """
 Tests for class ftio/prediction/shared_resources.py
