@@ -16,6 +16,7 @@ FTIO (Frequency Techniques for I/O) detects and predicts periodic I/O patterns i
 | [Tools](tools.md) | `ioplot`, `ioparse`, `convert_trace`, `parallel_trace_analysis` |
 | [API](api.md) | Python API — calling FTIO from code, GekkoFS integration, Metric Proxy |
 | [ZMQ](zmq.md) | ZeroMQ-based online input: avoiding intermediate files |
+| [Predictor](predictor.md) | Online prediction; GLASS/GekkoFS ingestion, keep-up vs the flush interval, parallel fan-out backends |
 | [Change Point Detection](change_point_detection.md) | ADWIN, CUSUM, Page-Hinkley change-point algorithms for `predictor` |
 | [Machine Learning Models](ml_models.md) | ML-based I/O classification (`-ml` flag) |
 | [FTIO Server](ftio_server.md) | HTTP server wrapper around the FTIO CLI |

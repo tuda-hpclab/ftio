@@ -155,6 +155,34 @@ def test_run_grid_smoke():
         assert row["thread"] is None  # include_thread=False
 
 
+def test_run_grid_flags_keep_up_against_flush_interval():
+    """The grid reports keep-up, not just speed-up: a round longer than the
+    flush interval that triggered it means predictions pile up."""
+    from ftio.api.gekkoFs.jit.experiments.exp_a_scaling import run_grid
+
+    # A generous interval: these tiny cells take milliseconds, so both keep up.
+    rows = run_grid(
+        servers=[2],
+        events=[16],
+        repeat=1,
+        n_workers=2,
+        include_thread=False,
+        flush_interval=60.0,
+    )
+    assert rows[0]["single_keeps_up"] and rows[0]["resample_keeps_up"]
+
+    # An impossible interval: nothing ingests a round in a microsecond.
+    rows = run_grid(
+        servers=[2],
+        events=[16],
+        repeat=1,
+        n_workers=2,
+        include_thread=False,
+        flush_interval=1e-6,
+    )
+    assert not rows[0]["single_keeps_up"] and not rows[0]["resample_keeps_up"]
+
+
 def test_stress_sweep_smoke():
     """The stress sweep reports keep-up / backlog per offered rate."""
     from ftio.api.gekkoFs.jit.experiments.exp_d_stress import stress

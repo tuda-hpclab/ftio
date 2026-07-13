@@ -202,16 +202,21 @@ def run_grid(
     repeat: int = 2,
     n_workers: int = 4,
     include_thread: bool = True,
+    flush_interval: float = 1.0,
 ) -> list[dict]:
     """Full 2D grid: for every (events/server, server count) report the latency
-    of each backend — single process, thread fan-out, and process-resample —
-    plus the resample speed-up.
+    of each backend — single process, thread fan-out, and process-resample.
+
+    The headline is not the speed-up but whether a round still fits inside the
+    flush interval: once ingest outlives the interval that triggered it, rounds
+    pile up. Latency is therefore also reported as a fraction of
+    *flush_interval*, and `*_keeps_up` says whether that backend is still viable.
     """
     rows = []
-    hdr = f"{'events/srv':>10} {'servers':>8} {'single':>10}"
+    hdr = f"{'events/srv':>10} {'servers':>8} {'single':>16}"
     if include_thread:
-        hdr += f" {'thread'+str(n_workers):>10}"
-    hdr += f" {'resample'+str(n_workers):>12} {'speedup':>8}"
+        hdr += f" {'thread' + str(n_workers):>10}"
+    hdr += f" {'resample' + str(n_workers):>17} {'speedup':>8}"
     print(hdr)
     for ev in events:
         for n in servers:
@@ -229,12 +234,19 @@ def run_grid(
                 "single": single,
                 "thread": thread,
                 "resample": resamp,
+                "single_keeps_up": single <= flush_interval,
+                "resample_keeps_up": resamp <= flush_interval,
             }
             rows.append(row)
-            line = f"{ev:>10} {n:>8} {single*1e3:>8.1f}ms"
+            # "!" marks a backend that can no longer keep up at this size.
+            s_pct = f"{single / flush_interval * 100:.0f}%"
+            r_pct = f"{resamp / flush_interval * 100:.0f}%"
+            s_flag = " " if row["single_keeps_up"] else "!"
+            r_flag = " " if row["resample_keeps_up"] else "!"
+            line = f"{ev:>10} {n:>8} {single * 1e3:>8.1f}ms {s_pct:>5}{s_flag}"
             if include_thread:
-                line += f" {thread*1e3:>8.1f}ms"
-            line += f" {resamp*1e3:>10.1f}ms {single/resamp:>7.1f}x"
+                line += f" {thread * 1e3:>8.1f}ms"
+            line += f" {resamp * 1e3:>9.1f}ms {r_pct:>5}{r_flag} {single / resamp:>7.1f}x"
             print(line)
     return rows
 
@@ -252,8 +264,16 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
 
     if args.grid or len(args.events) > 1:
-        print(f"Ingest scaling grid (best of {args.repeat})")
-        run_grid(args.servers, args.events, args.repeat)
+        print(
+            f"Ingest scaling grid (flush_interval={args.flush_interval}s, "
+            f"best of {args.repeat}; '!' = cannot keep up)"
+        )
+        run_grid(
+            args.servers,
+            args.events,
+            args.repeat,
+            flush_interval=args.flush_interval,
+        )
     else:
         print(
             f"Ingest scaling (events/server={args.events[0]}, "

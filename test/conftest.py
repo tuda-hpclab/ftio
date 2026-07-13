@@ -3,14 +3,16 @@ Shared pytest configuration.
 
 Two process-related settings, both applied before any test module is imported.
 
-1. Native thread pools are pinned to one thread. scikit-learn (via
-   ftio.prediction.group) starts an OpenMP pool on first use, leaving ~38 OS
-   threads alive for the rest of the session. Those threads are invisible to
-   threading.enumerate() but not to os.fork(), and forking a process with a
-   live OpenMP runtime is a known deadlock source: the child inherits locked
-   OpenMP mutexes with no threads to release them. Python 3.14 rightly warns
-   about it. Pinning the pools removes the hazard instead of hiding the
-   warning, and makes the suite faster.
+1. Native thread pools are pinned to one thread. Importing numpy brings up an
+   OpenBLAS pool of one thread per core, and scipy adds a second one, so a bare
+   `import scipy.fft` already leaves ~31 OS threads alive. They are invisible to
+   threading.enumerate() but not to os.fork(), so every forking test trips
+   Python 3.14's "process is multi-threaded" DeprecationWarning. This is noise,
+   not a hazard -- the OpenBLAS numpy ships registers an atfork handler that
+   resets the pool in the child -- but 31 idle threads and 31 warnings buy the
+   suite nothing, and pinning them makes it marginally faster. The variables
+   must be set before the first numpy import; the native libraries read them
+   when they are loaded, not when they are first used.
 
 2. The "fork" start method is restored. Python 3.14 defaults to "forkserver",
    where every pool worker re-imports numpy and a single Pool() costs ~4.4 s
