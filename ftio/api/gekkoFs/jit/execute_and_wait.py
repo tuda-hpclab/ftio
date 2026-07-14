@@ -203,6 +203,12 @@ def execute_background(
     #     pass
     # print(call)
     # process = subprocess.Popen(call, shell=True, preexec_fn=os.setpgrp,stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    # start_new_session=True puts each background component in its own session,
+    # so process.pid is a process-group leader. This lets the teardown path
+    # (kill_process_tree/shut_down) reap the whole subtree in one call -- notably
+    # the predictor_jit worker pool and the bash -c wrapper's child daemon --
+    # and it keeps working even after the parent has died (group membership
+    # survives reparenting to init).
     if log_file and log_err_file:
         with open(log_file, "a") as log_out, open(log_err_file, "w") as log_err:
             process = subprocess.Popen(
@@ -212,6 +218,7 @@ def execute_background(
                 stdout=log_out,
                 stderr=log_err,
                 env=os.environ,
+                start_new_session=True,
             )
     elif log_file:
         with open(log_file, "a") as log_out:
@@ -222,6 +229,7 @@ def execute_background(
                 env=os.environ,
                 stdout=log_out,
                 stderr=log_out,
+                start_new_session=True,
             )
     else:
         process = subprocess.Popen(
@@ -232,6 +240,7 @@ def execute_background(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            start_new_session=True,
         )
     return process
 

@@ -39,6 +39,34 @@ def trigger_print(text: str, src: str = "") -> None:
         TRIGGER_LOGGER.info(f"{prefix}{line}")
 
 
+def should_flush(latest_prediction: dict) -> bool:
+    """Decide whether a prediction warrants staging the data out.
+
+    `predictor_gekko_zmq` sets probability to -1 as a sentinel: it means "this
+    dominant frequency matched no probability bin", not "this is not periodic".
+    Comparing that sentinel against a threshold silently declined every flush.
+    WarpX drifts (gaps 10 s -> 25 s), so its frequency kept landing outside the
+    bins built from history; predictions #3 and #7 arrived as -100% and nothing
+    was staged after the first trigger. LAMMPS, being flat, always scored 100%
+    and so never hit this.
+
+    A prediction only reaches this point once its frequency is non-NaN, i.e. a
+    dominant frequency *was* found. With no probability estimate to contradict
+    that, staging is the safe choice: flushing slightly off-phase merely costs
+    time, whereas not flushing leaves the burst buffer to fill up.
+
+    Args:
+        latest_prediction (dict): Result from FTIO containing prediction details.
+
+    Returns:
+        bool: True when the data should be staged out.
+    """
+    probability = latest_prediction["probability"]
+    if probability < 0:
+        return True
+    return probability > 0.5
+
+
 def _stage_files_safe(args: argparse.Namespace, latest_prediction: dict) -> None:
     """Wrapper that logs exceptions so they are not silently swallowed by the executor."""
     try:
@@ -209,8 +237,10 @@ def strategy_avoid_interference(sync_trigger: Queue, args: argparse.Namespace) -
                             latest_prediction["t_flush"] + t
                         )  # t is the waiting time in this function. t_flush contains the overhead of ftio + when the data was flushed from gekko
                         remaining_time = target_time - gkfs_elapsed_time
+                        prob = latest_prediction["probability"]
+                        prob_str = "n/a (no bin)" if prob < 0 else f"{prob * 100:.0f}%"
                         trigger_print(
-                            f"Probability   : {latest_prediction['probability'] * 100:.0f}%\n"
+                            f"Probability   : {prob_str}\n"
                             f"Elapsed time  : {gkfs_elapsed_time:.3f} s\n"
                             f"Target time   : {target_time:.3f} s\n"
                             f"--> trigger in {remaining_time:.3f} s",
@@ -220,27 +250,34 @@ def strategy_avoid_interference(sync_trigger: Queue, args: argparse.Namespace) -
                             countdown = time.time() + remaining_time
                             # wait till the time elapses:
                             while time.time() < countdown:
-                                # ? 3) While waiting, cancel new latest_prediction is available
+                                # ? 3) While waiting, handle a newly arrived prediction
                                 condition = True
-                                if handle_new_prediction:
-                                    if not sync_trigger.empty():
-                                        if "skip" in handle_new_prediction:
-                                            skipped += 1
-                                            condition = False
-                                            # if skipped more than 2, force flushing
-                                            if skipped >= 2:
-                                                if not condition:
-                                                    condition = True  # continue waiting until the time ends
-                                                    TRIGGER_LOGGER.warning(
-                                                        f"Too many skips, staging data out in {time.time() < countdown} s"
-                                                    )
-                                            else:
+                                # Only act when a new prediction is actually queued.
+                                # The `else` of this test used to hold the cancel
+                                # branch, so cancel ran on an *empty* queue and its
+                                # blocking get() stalled the countdown until the next
+                                # prediction showed up -- delaying every flush by up
+                                # to a full prediction interval and eating the
+                                # prediction it woke on.
+                                if handle_new_prediction and not sync_trigger.empty():
+                                    if "skip" in handle_new_prediction:
+                                        skipped += 1
+                                        condition = False
+                                        # if skipped more than 2, force flushing
+                                        if skipped >= 2:
+                                            if not condition:
+                                                condition = True  # continue waiting until the time ends
                                                 TRIGGER_LOGGER.warning(
-                                                    f"Skipping, new prediction ready (skipped: {skipped})"
+                                                    f"Too many skips, staging data out in {time.time() < countdown} s"
                                                 )
-                                                break  # no need to wait
-                                    else:
-                                        # remove the new latest_prediction from the queue
+                                        else:
+                                            TRIGGER_LOGGER.warning(
+                                                f"Skipping, new prediction ready (skipped: {skipped})"
+                                            )
+                                            break  # no need to wait
+                                    elif "cancel" in handle_new_prediction:
+                                        # Drop the incoming prediction and stay
+                                        # committed to the countdown already running.
                                         _ = sync_trigger.get()
                                         # used only for counting
                                         cancel_counter += 1
@@ -249,7 +286,7 @@ def strategy_avoid_interference(sync_trigger: Queue, args: argparse.Namespace) -
                                         )
                                 time.sleep(0.01)
 
-                            if condition and latest_prediction["probability"] > 0.5:
+                            if condition and should_flush(latest_prediction):
                                 _ = executor.submit(
                                     _stage_files_safe, args, latest_prediction
                                 )

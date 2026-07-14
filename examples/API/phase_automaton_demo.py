@@ -435,6 +435,109 @@ def _show_all():
         pass
 
 
+def demo_warmup_artifact():
+    """Why the FIRST prediction of a run must not be modelled.
+
+    A DFT cannot resolve a period longer than the window it ran on, and FTIO trims
+    that window to the data seen so far. Early in a run the window therefore holds
+    a single I/O phase, and the transform reports that one burst's *width* as the
+    "period" -- the k=1 bin, one cycle across the whole window. That is not
+    evidence of periodicity.
+
+    Measured on a real LAMMPS GLASS run (8 x 1 GB restarts, true period 41.8 s),
+    replaying the trace the way the online predictor sees it:
+
+        window   period   conf   cycles in window
+          5.0 s    5.0 s   1.00     1.01   <- one burst; "period" = its width
+         44.5 s   44.4 s   0.67     1.00   <- right answer, still only one cycle
+         84.8 s   42.4 s   0.59     2.00   <- two cycles: now it is measurable
+
+    Note confidence is 1.00 on the WRONG answer and 0.67 on the right one, and the
+    wrong answer is stable for four rounds -- so neither a confidence gate nor a
+    stability gate can filter it. Only the cycle count can. That is what
+    `min_cycles` does: it refuses to model a period the window has not held twice.
+    """
+    print("\n" + "=" * 70)
+    print("DEMO: a period needs two periods before it can be believed")
+    print("=" * 70)
+
+    # LAMMPS as measured: four warm-up rounds (a 5 s burst in a 5 s window),
+    # then the steady state once a second checkpoint is in the window.
+    warmup = [mock_prediction(1 / 5.0, 0.0, 5.0, ranks=2) for _ in range(4)]
+    steady = [mock_prediction(1 / 42.0, 0.0, 85.0 + 10 * i, ranks=2) for i in range(8)]
+
+    for label, min_cycles in (("min_cycles=1  (off)", 1.0), ("min_cycles=2  (on)", 2.0)):
+        aut = PhaseAutomaton(method="cusum", min_cycles=min_cycles)
+        for pred in warmup + steady:
+            aut.step(pred)
+        states = ", ".join(f"{s.period:.0f}s" for s in aut.states)
+        print(
+            f"\n  {label}:  {len(aut.states)} state(s), "
+            f"{len(aut.transitions)} transition(s)  ->  [{states}]"
+        )
+
+    print(
+        "\n  Off: the run 'learns' a 5 s phase and then a false transition to 42 s."
+        "\n  On : only the real 42 s phase is modelled; no transition ever happened."
+        "\n"
+        "\n  Cost: one extra period before modelling starts."
+        "\n  Note: min_cycles only makes sense when a Prediction's t_start/t_end span"
+        "\n  the whole run so far, as they do online. It is off by default for callers"
+        "\n  that hand in a Prediction per short slice."
+    )
+
+
+def demo_build_a_model_from_a_real_run():
+    """How to create a phase model from an actual JIT run.
+
+    A JIT run writes `bandwidth.json` ({"t": [...], "b": [...]}) into its log dir,
+    e.g. logs_nodes1_Jobid0_DF_26/bandwidth.json. Replay it the way the online
+    predictor sees it -- a growing window -- and step the automaton:
+
+        import json
+        import numpy as np
+        from ftio.cli.ftio_core import core
+        from ftio.modeling import PhaseAutomaton
+        from ftio.parse.args import parse_args
+
+        d = json.load(open("logs_nodes1_Jobid0_DF_26/bandwidth.json"))
+        t, b = np.asarray(d["t"]), np.asarray(d["b"])
+        args = parse_args(["-m", "write", "-e", "no", "--freq", "10"], "ftio")
+
+        aut = PhaseAutomaton(method="cusum")
+        now = t[0] + 10.0                      # one prediction round every 10 s
+        while now <= t[-1]:
+            m = t <= now                       # everything observed so far
+            sim = {
+                "time": t[m],
+                "bandwidth": b[m],
+                "total_bytes": int(np.trapezoid(b[m], t[m])),
+                "ranks": 2,
+            }
+            prediction, _ = core(sim, args)
+            aut.step(prediction)
+            now += 10.0
+
+        aut.drop_warmup_states()               # the first state is a DFT artifact
+        for s in aut.states:
+            print(f"phase: period={s.period:.1f}s  conf={s.confidence:.2f}")
+
+    To persist it for the NEXT run of the same application, hand it to the
+    library -- ModelManager.save_run() calls drop_warmup_states() for you:
+
+        from ftio.modeling.model_manager import ModelManager
+        ModelManager("./ftio_models", "lammps", "greedy").save_run(aut)
+
+    The next run loads `./ftio_models/lammps/ranks_<key>.json` and starts from the
+    known period instead of rediscovering it -- which on the measured traces takes
+    40 s for LAMMPS (3 checkpoints) and 140 s for WRF (4 checkpoints).
+    """
+    print("\n" + "=" * 70)
+    print("DEMO: building a phase model from a real JIT run")
+    print("=" * 70)
+    print(demo_build_a_model_from_a_real_run.__doc__)
+
+
 if __name__ == "__main__":
     demo_step_by_step()
     demo_small_variations()
@@ -443,4 +546,6 @@ if __name__ == "__main__":
     demo_period_ratio()
     demo_real_files()
     demo_multi_rank()
+    demo_warmup_artifact()
+    demo_build_a_model_from_a_real_run()
     _show_all()

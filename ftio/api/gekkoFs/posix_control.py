@@ -120,6 +120,13 @@ def move_files_os(
         f"Staging {len(items_to_submit)} item(s) ({size_str})"
         f" from {args.gkfs_mntdir} → {args.stage_out_path}"
     )
+    if files and not items_to_submit:
+        # Silently staging nothing looks like a fast flush; it is not. Most often
+        # the regex for this mode is empty, which matches no file at all.
+        TRIGGER_LOGGER.warning(
+            f"{len(files)} file(s) present but the {triggered_by} regex "
+            f"({args.regex!r}) selected none — nothing will be staged out"
+        )
 
     if "cp" in args.flush_call:
         flush_using_cp(args, items_to_submit, period, triggered_by)
@@ -215,11 +222,13 @@ def get_items_to_submit(files: list, args: argparse.Namespace, mode: str = "file
     Determine which items (files or folders) should be submitted based on
     regex filtering and the submission mode.
 
-    If `mode` includes "folder", files are grouped by their parent directory.
-    Matching files (according to `args.regex`) are checked against all files
-    in the folder:
-      - If all files in a folder match, the entire folder is submitted.
-      - Otherwise, only the matching files from that folder are submitted.
+    If `mode` includes "folder", each file is matched against `args.regex`:
+      - If the regex matches only a proper path prefix that names a directory
+        containing the file (an AMReX checkpoint such as Castro/WarpX), that
+        top-level checkpoint directory is submitted as a single flush unit.
+      - Otherwise the file is a flush unit and the folder-collapse optimisation
+        applies: if all files in its immediate parent match, the parent folder
+        is submitted; else only the matching files are submitted.
 
     If `mode` does not include "folder", all provided files are returned.
 
@@ -241,26 +250,48 @@ def get_items_to_submit(files: list, args: argparse.Namespace, mode: str = "file
         regex = re.compile(args.regex)
 
     if "folder" in mode:
-        # check if we can move the entire folder:
-        #  Step 0: Group all files by their parent folder
+        TRIGGER_LOGGER.info(f"Using regex: {regex}")
+
+        # Step 1: Match each file and split into two kinds of flush units.
+        #   - directory unit: the regex matched a proper path prefix that names a
+        #     directory *containing* the file (the char after the match is "/").
+        #     This is how AMReX checkpoints (Castro/WarpX) are handled: many
+        #     dot-free files under <mnt>/sedov_3d_sph_chk00010/... collapse to the
+        #     single top-level checkpoint directory, not to their Level_0 parent.
+        #   - file unit: the regex matched the whole path, so the file itself is
+        #     the flush unit (nek, lammps, dlio, s3d, wrf, qmc, ...).
+        dir_units: list[str] = []
+        file_matches: list[str] = []
+        if regex:
+            for file_path in files:
+                match = regex.match(file_path)
+                if not match:
+                    continue
+                unit = match.group(0)
+                if len(unit) < len(file_path) and file_path[len(unit)] == "/":
+                    if unit not in dir_units:
+                        dir_units.append(unit)
+                        if args.debug:
+                            TRIGGER_LOGGER.debug(f"Will move checkpoint dir: {unit}")
+                else:
+                    file_matches.append(file_path)
+
+        # Step 2: Apply the folder-collapse optimisation to the file units: if
+        # every file in an immediate parent folder matches, submit the folder;
+        # otherwise submit the matching files individually. Files that belong to
+        # a directory unit are never in `matching_set`, so their descendant
+        # folders (e.g. .../chk00010/Level_0) are skipped here.
+        matching_set = set(file_matches)
         folder_to_all_files: dict[str, list[str]] = {}
         for file_path in files:
             folder = file_path.rsplit("/", 1)[0] if "/" in file_path else "."
-            # CONSOLE.print(f" Processing file: {file_path} -> folder: {folder}")
             folder_to_all_files.setdefault(folder, []).append(file_path)
 
-        # CONSOLE.print(f"Final folder mapping: {folder_to_all_files}")
-        TRIGGER_LOGGER.info(f"Using regex: {regex}")
-
-        # Step 1: Filter files by regex (only candidates to move)
-        matching_files: list[str] = [f for f in files if regex and regex.match(f)]
-
-        # Step 2: Decide whether to submit folder or individual files
-        items_to_submit: list[str] = []
+        items_to_submit: list[str] = list(dir_units)
 
         for folder, all_files_in_folder in folder_to_all_files.items():
             matching_files_in_folder = [
-                f for f in all_files_in_folder if f in matching_files
+                f for f in all_files_in_folder if f in matching_set
             ]
             # If all files in the folder match, submit the folder
             if matching_files_in_folder:
@@ -278,6 +309,55 @@ def get_items_to_submit(files: list, args: argparse.Namespace, mode: str = "file
         items_to_submit = files
 
     return items_to_submit
+
+
+def newest_mtime(args: argparse.Namespace, item: str) -> float:
+    """
+    Return the newest modification time (epoch seconds) among an item's files.
+
+    A plain stat on a directory reports the directory's own mtime, which only
+    advances when entries are added or removed — not while a descendant file is
+    being written. For an AMReX checkpoint that is still being filled, that would
+    look "old" and be flushed mid-write. So for directories we take the newest
+    mtime over all descendant files instead. For regular files this is just the
+    file's own mtime.
+
+    Args:
+        args (argparse.Namespace): Parsed command line arguments.
+        item (str): Path of the file or directory to inspect.
+
+    Returns:
+        float: Newest modification time in epoch seconds.
+    """
+    # `test -d` cannot be used to tell a directory apart here: GekkoFS has no
+    # real directory inodes, so it reports false for every path inside the mount.
+    # `find <item> -type f` covers both cases -- for a regular file it simply
+    # prints that file's own timestamps.
+    #
+    # Ask for mtime *and* ctime and take the newest of the two. GekkoFS does not
+    # maintain mtime: it answers 0 (epoch) for every file in the mount, which made
+    # `time.time() - mtime` evaluate to the current epoch (~1.78e9 s) and sail past
+    # any threshold -- the "too new to flush" guard never fired and WarpX had a
+    # checkpoint staged out from under it while it was still being written. gkfs
+    # does keep ctime, and it advances on write. On a normal filesystem mtime is
+    # the meaningful one and ctime tracks it, so the max is correct on both.
+    try:
+        out = preloaded_call(args, f"find {item} -type f -printf '%T@ %C@\\n'")
+        times = [float(x) for x in out.split() if x.strip()]
+        if times:
+            return max(times)
+    except Exception:
+        pass
+    # No files under the item. Either it is genuinely empty or a flush already
+    # emptied it and gekko is still handing back stale directory metadata -- that
+    # is what made an already-staged WarpX checkpoint get copied a second time.
+    # Report it as brand new so the caller's freshness check skips it: there is
+    # nothing left to stage either way.
+    try:
+        stamp = get_modification_time(args, item)
+    except Exception:
+        return time.time()
+    return stamp if stamp > 0 else time.time()
 
 
 def move_item(
@@ -301,8 +381,18 @@ def move_item(
     threshold = 0  # already considered in calculation of flush time
     threshold = max(threshold, 5)
 
-    item_time = get_modification_time(args, item)
+    item_time = newest_mtime(args, item)
     modification_time = time.time() - item_time
+
+    # Unlinking an item does not immediately retire its metadata in GekkoFS, so a
+    # later listing can still report its files and stage the very same checkpoint
+    # a second time (WarpX copied one twice every run). Re-copying it is wasted
+    # stage-out bandwidth; skip unless the item actually got newer since.
+    if files_in_progress.already_flushed(item, item_time):
+        TRIGGER_LOGGER.info(f"Skipping {item}: already staged and unchanged since")
+        files_in_progress.mark_done(item)
+        return
+
     if args.ignore_mtime or modification_time >= threshold:
         dst = item.replace(args.gkfs_mntdir, args.stage_out_path)
         TRIGGER_LOGGER.info(
@@ -315,6 +405,7 @@ def move_item(
             fast_chunk_copy_file(args, item, threads=4)
         else:
             copy_file_and_unlink(args, item, triggered_by)
+        files_in_progress.mark_flushed(item, item_time)
     else:
         TRIGGER_LOGGER.warning(
             f"Skipping {item}: too new (last modified {modification_time:.3f} s ago < threshold {threshold} s)"
@@ -339,19 +430,37 @@ def copy_file_and_unlink(
     # stage_out_path/checkpoints/epoch10, not stage_out_path/epoch10.
     dst = item.replace(args.gkfs_mntdir, args.stage_out_path)
     dst_parent = os.path.dirname(dst)
-    try:
-        preloaded_call(args, f"test -d {item}")
-        is_dir = True
-    except Exception:
-        is_dir = False
-    if is_dir:
-        # -L: dereference symlinks so the destination holds real data, not
-        # dangling links after the source is unlinked.
-        cp_cmd = f"cp -rL {item} {dst_parent}"
-        remove_cmd = f"find {item} -type f -exec unlink {{}} \\;"
+
+    # When every file in the mount matches the regex, the flush unit collapses to
+    # the mount itself. Then dst *is* stage_out_path and dst_parent is its parent,
+    # so `cp -rL <mnt> <dst_parent>` recreated the mount under the stage dir:
+    # LAMMPS' last checkpoint landed in <stage>/tarraf_gkfs_mountdir/ while the
+    # flush log claimed <stage>/output/. Copy the mount's *contents* instead.
+    whole_mount = os.path.normpath(item) == os.path.normpath(args.gkfs_mntdir)
+    if whole_mount:
+        dst = args.stage_out_path
+        src = f"{item}/."
     else:
-        cp_cmd = f"cp -L {item} {dst_parent}"
-        remove_cmd = f"unlink {item}"
+        src = item
+    # One command pair covers files and directories alike. Do not branch on
+    # `test -d`: GekkoFS has no real directory inodes, so it answers "not a
+    # directory" for every path inside the mount, and an AMReX checkpoint
+    # directory would then be copied with `cp -L` -> "omitting directory".
+    # `cp -rL` copies a regular file just as well (-L dereferences symlinks so
+    # the destination holds real data once the source is unlinked), and
+    # `find <item> -type f` matches a regular file by itself.
+    #
+    # `-delete` unlinks from find itself, so there is no `rm` and no fork per
+    # file. Forking is the whole cost here: every fork re-initialises the GekkoFS
+    # client. Measured on a 54-file AMReX checkpoint, single-node gkfs:
+    #   -exec unlink {} \;   34.15 s  (one fork per file)
+    #   -exec rm -f {} +      1.22 s  (one fork in total)
+    #   -delete               0.72 s  (no fork at all)
+    # `rm -f {} +` remains the fallback: -f tolerates a path a concurrent flush
+    # has already removed, and it covers a find without -delete.
+    cp_cmd = f"cp -rL {src} {dst if whole_mount else dst_parent}"
+    remove_cmd = f"find {item} -type f -delete"
+    fallback_remove_cmd = f"find {item} -type f -exec rm -f {{}} +"
 
     TRIGGER_LOGGER.info(f"Copying {item} to {dst}")
     start = time.time()
@@ -365,14 +474,14 @@ def copy_file_and_unlink(
         preloaded_call(args, remove_cmd)
     except Exception as e:
         TRIGGER_LOGGER.error(f"Exception during {remove_cmd}: {e}")
-        if "-r" in remove_cmd:
-            try:
-                remove_cmd = f"find {item} -type f -exec unlink {{}} \\;"
-                preloaded_call(args, remove_cmd)
-            except Exception as e:
-                TRIGGER_LOGGER.error(f"Fallback also failed for {remove_cmd}: {e}")
-        files_in_progress.put_ignore(args, item)
-        TRIGGER_LOGGER.warning(f"Added {item} to ignore queue")
+        try:
+            preloaded_call(args, fallback_remove_cmd)
+        except Exception as e:
+            TRIGGER_LOGGER.error(f"Fallback also failed for {fallback_remove_cmd}: {e}")
+            # Only now is the item genuinely stuck in the mount. If the fallback
+            # cleared it there is nothing left to ignore.
+            files_in_progress.put_ignore(args, item)
+            TRIGGER_LOGGER.warning(f"Added {item} to ignore queue")
 
     delete_time = time.time() - start
     TRIGGER_LOGGER.info(
@@ -416,6 +525,42 @@ def delete_items(args: argparse.Namespace, items: list[str]) -> None:
                 TRIGGER_LOGGER.warning(f"Added {item} to ignore queue")
 
 
+def _list_with_retry(
+    args: argparse.Namespace, call: str, attempts: int = 10, delay: float = 3.0
+) -> str:
+    """Run a listing command, retrying while GekkoFS reports the mount busy.
+
+    A flush in flight makes the daemon answer EBUSY to a concurrent listing. The
+    condition clears on its own once the other client is done, so back off and
+    retry rather than letting the caller abort.
+
+    Args:
+        args (argparse.Namespace): Parsed command line arguments.
+        call (str): The listing command to run under the GekkoFS preload.
+        attempts (int): How many times to try before giving up.
+        delay (float): Seconds to wait between attempts.
+
+    Returns:
+        str: Output of the listing command.
+
+    Raises:
+        Exception: The last error, if every attempt failed.
+    """
+    last: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return preloaded_call(args, call)
+        except Exception as e:
+            last = e
+            if attempt < attempts:
+                TRIGGER_LOGGER.warning(
+                    f"Listing the mount failed (attempt {attempt}/{attempts}),"
+                    f" retrying in {delay:.0f} s: {e}"
+                )
+                time.sleep(delay)
+    raise last  # type: ignore[misc]
+
+
 def get_files(args: argparse.Namespace) -> list[str]:
     """
     Retrieves a list of files from the GekkoFS mount directory.
@@ -427,27 +572,38 @@ def get_files(args: argparse.Namespace) -> list[str]:
         list[str]: List of file paths.
     """
     try:
-        files = preloaded_call(args, f"find {args.gkfs_mntdir}")
+        # Ask find for regular files only. The old `"." in item` heuristic
+        # dropped every dot-free path, which silently discarded AMReX
+        # checkpoints (Castro/WarpX) whose files live under dot-free directory
+        # names (e.g. <mnt>/sedov_3d_sph_chk00010/Header, .../Level_0/Cell_D_*).
+        #
+        # Retry: while another client is mid-flush the daemon can answer EBUSY
+        # ("Device or resource busy"). That is transient, but an unhandled raise
+        # here aborts the whole post-app stage-out and any checkpoint still in the
+        # mount is lost with it -- exactly how WarpX's chk000085 disappeared.
+        files = _list_with_retry(args, f"find {args.gkfs_mntdir} -type f")
         if isinstance(files, str):
             files = files.strip().splitlines()
+        files = [item for item in files if item.strip()]
         if args.debug:
-            TRIGGER_LOGGER.debug(f"Found files (pre-filter): {files}")
-        files = [f"{item}" for item in files if "." in item]
-        if args.debug:
-            TRIGGER_LOGGER.debug(f"Found files (post-filter): {files}")
+            TRIGGER_LOGGER.debug(f"Found files: {files}")
 
     except Exception as e:
         if args.debug:
             TRIGGER_LOGGER.error(f"Error listing files: {e}")
 
-        files = preloaded_call(args, f"ls -R {args.gkfs_mntdir}")
+        files = _list_with_retry(args, f"ls -R {args.gkfs_mntdir}")
 
         if files:
             files = files.splitlines()
-            # if args.debug:
-            #     CONSOLE.print(f"[bold green][Trigger][/][green]: Found files are{files}[/]\n")
             files = [f for f in files if "LIBGKFS" not in f]
-            files = [f"{args.gkfs_mntdir}/{item}" for item in files if "." in item]
+            # Drop blank separators and the "directory:" header lines that
+            # `ls -R` emits, keeping the file entries (dot-free names included).
+            files = [
+                f"{args.gkfs_mntdir}/{item}"
+                for item in files
+                if item.strip() and not item.rstrip().endswith(":")
+            ]
 
     if files:
         return files

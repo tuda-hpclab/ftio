@@ -690,6 +690,22 @@ Full documentation:
             ),
         )
         group.add_argument(
+            "--pa-min-cycles",
+            "--pa_min_cycles",
+            dest="pa_min_cycles",
+            type=float,
+            default=2.0,
+            metavar="N",
+            help=(
+                "Warm-up guard: ignore a prediction whose analysis window holds "
+                "fewer than N full periods (default: 2). A period cannot be "
+                "measured from a single I/O phase -- before a second phase arrives "
+                "the DFT reports that one burst's width as the period, at full "
+                "confidence, and the automaton would learn a phase that does not "
+                "exist. Set to 1 to disable."
+            ),
+        )
+        group.add_argument(
             "--pa-no-rank-trigger",
             "--pa_no_rank_trigger",
             dest="pa_rank_trigger",

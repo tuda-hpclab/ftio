@@ -16,6 +16,7 @@ https://github.com/tuda-parallel/FTIO/blob/main/LICENSE
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 import re
 import shutil
@@ -1100,15 +1101,43 @@ def get_pid(settings: JitSettings, name: str, pid: int) -> None:
 
 def handle_sigint(settings: JitSettings) -> None:
     """
-    Handle SIGINT signal for graceful shutdown.
+    Handle a termination signal (SIGINT/SIGTERM/SIGHUP) for graceful shutdown.
+
+    Runs the exit routine exactly once (guarded by ``trap_exit``) so that a
+    process killed by Ctrl-C, ``timeout``, or a job scheduler still tears down
+    the daemon, predictor pool, and other processes it started.
 
     Args:
         settings (JitSettings): The JIT settings object.
     """
     if settings.trap_exit:
         settings.trap_exit = False
-        jit_print("[bold blue]Keyboard interrupt detected. Exiting script.[/]")
+        jit_print("[bold blue]Termination signal detected. Exiting script.[/]")
         exit_routine(settings)
+
+
+def install_signal_handlers(settings: JitSettings) -> None:
+    """
+    Register the shutdown handler for every signal that must trigger cleanup.
+
+    SIGINT (Ctrl-C), SIGTERM (sent by ``timeout`` and most job schedulers), and
+    SIGHUP all route to :func:`handle_sigint`. Without a SIGTERM handler Python's
+    default disposition kills the interpreter before the ``finally`` cleanup
+    runs, orphaning the gkfs daemon (which holds a tmpfs rootdir) and the whole
+    ``predictor_jit`` process pool.
+
+    Args:
+        settings (JitSettings): The JIT settings object.
+    """
+
+    def handler(signum, frame):
+        handle_sigint(settings)
+
+    signals = [signal.SIGINT, signal.SIGTERM]
+    if hasattr(signal, "SIGHUP"):
+        signals.append(signal.SIGHUP)
+    for sig in signals:
+        signal.signal(sig, handler)
 
 
 def exit_routine(settings: JitSettings) -> None:
@@ -1125,6 +1154,100 @@ def exit_routine(settings: JitSettings) -> None:
     hard_kill(settings)
     jit_print(" Exciting\n")
     sys.exit(0)
+
+
+def _list_child_pids(pid: int) -> list[int]:
+    """Return the direct child PIDs of ``pid`` via ``ps`` (empty on any error)."""
+    try:
+        out = subprocess.run(
+            ["ps", "-o", "pid=", "--ppid", str(pid)],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except Exception:
+        return []
+
+    children = []
+    for token in out.stdout.split():
+        try:
+            children.append(int(token))
+        except ValueError:
+            continue
+    return children
+
+
+def _descendant_pids(pid: int) -> list[int]:
+    """Return all descendants of ``pid``, deepest first (children before parents)."""
+    result: list[int] = []
+    for child in _list_child_pids(pid):
+        result.extend(_descendant_pids(child))
+        result.append(child)
+    return result
+
+
+def _safe_kill(pid: int, sig: int) -> None:
+    """Send ``sig`` to ``pid``, ignoring processes that are already gone."""
+    try:
+        os.kill(pid, sig)
+    except (ProcessLookupError, PermissionError):
+        pass
+    except Exception as e:
+        jit_logger.debug(f"Unable to signal PID {pid}: {e}")
+
+
+def kill_process_tree(pid: int | str, sig: int = signal.SIGTERM) -> None:
+    """
+    Terminate ``pid`` and its whole subtree without touching unrelated processes.
+
+    Background components are launched in their own session (see
+    ``execute_background``), so when ``pid`` leads a process group the entire
+    group is signalled in a single call -- this reaps the ``predictor_jit``
+    worker pool and any ``bash -c`` wrapper. Group membership survives
+    reparenting to init, so this still works after the parent has died. If
+    ``pid`` is not a group leader, its descendants are walked via ``ps`` and
+    signalled individually. Only PIDs derived from ``pid`` are touched (no
+    blanket, name-based matching), the JIT's own group is never signalled, and
+    the call is idempotent -- an already-dead PID never raises.
+
+    Args:
+        pid (int | str): PID of the group leader / process to terminate.
+        sig (int): Signal to send (default ``signal.SIGTERM``).
+    """
+    if not pid:
+        return
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return
+    if pid <= 1:
+        # Never signal init (pid 1) or an invalid/negative PID.
+        return
+
+    try:
+        pgid = os.getpgid(pid)
+    except ProcessLookupError:
+        return  # already gone
+    except Exception:
+        pgid = None
+
+    # Prefer a single process-group kill, but only when pid actually leads its
+    # own group and that group is not the JIT's own (guards against self-kill).
+    if pgid is not None and pgid == pid and pgid != os.getpgrp():
+        try:
+            os.killpg(pgid, sig)
+            return
+        except ProcessLookupError:
+            return
+        except PermissionError:
+            pass
+        except Exception as e:
+            jit_logger.debug(f"killpg failed for PID {pid}: {e}")
+
+    # Fallback: signal descendants (deepest first), then the process itself.
+    for child in _descendant_pids(pid):
+        _safe_kill(child, sig)
+    _safe_kill(pid, sig)
 
 
 def soft_kill(settings: JitSettings) -> None:
@@ -1228,53 +1351,39 @@ def hard_kill(settings: JitSettings) -> None:
                 executable="/bin/bash",
             )
         else:
-            # Non-cluster environment: use `kill` to terminate processes
-            processes = [
-                settings.gkfs_daemon,
-                settings.gkfs_proxy,
-                f"{settings.ftio_bin_location}/predictor_jit",
-                settings.app_call,
+            # Non-cluster environment: SIGKILL only the process trees this jit
+            # instance started. We use the tracked PIDs (never a blanket, name
+            # based `ps | grep <binary>`), so another user's or another run's
+            # daemon using the same binary is left untouched.
+            tracked_pids = [
+                settings.gkfs_daemon_pid,
+                settings.gkfs_proxy_pid,
+                settings.gkfs_fuse_pid,
+                settings.ftio_pid,
+                settings.cargo_pid,
+                settings.app_pid,
             ]
-
-            for process in processes:
-                try:
-                    # Find process IDs and kill them
-                    kill_command = f"ps -aux | grep {process} | grep -v grep | awk '{{print $2}}' | xargs kill"
-                    while kill_command:
-                        _ = subprocess.run(
-                            kill_command,
-                            shell=True,
-                            capture_output=True,
-                            text=True,
-                            check=True,
-                        )
-                        kill_command = f"ps -aux | grep {process} | grep -v grep | awk '{{print $2}}' | xargs kill"
-                except Exception:
-                    jit_print(f"[yellow]{process} already dead[/]")
+            for pid in tracked_pids:
+                kill_process_tree(pid, signal.SIGKILL)
 
         jit_print("Hard kill finished")
 
 
 def shut_down(settings: JitSettings, name: str, pid: int) -> None:
     """
-    Shut down a specific component by its process ID.
+    Shut down a component and its entire process subtree by PID.
+
+    The recorded PID is the group leader started by ``execute_background``, so
+    killing the whole group also reaps children such as the ``predictor_jit``
+    worker pool. Already-dead PIDs are ignored (idempotent).
 
     Args:
-        settings (JitSettings): The JIT settings object.
+        settings (JitSettings): The JIT settings object (kept for API symmetry).
         name (str): Name of the component.
-        pid (int): Process ID.
+        pid (int): Process ID of the group leader to terminate.
     """
     jit_logger.debug(f"Shutting down {name} with PID {pid}")
-    if pid:
-        try:
-            # Terminate the process
-            os.kill(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            print(f"Process with PID {pid} does not exist.")
-        except PermissionError:
-            print(f"Permission denied to kill process with PID {pid}.")
-        except Exception as e:
-            print(f"An error occurred: {e}")
+    kill_process_tree(pid, signal.SIGTERM)
 
 
 def log_dir(settings: JitSettings) -> None:
@@ -2443,6 +2552,29 @@ def get_env(settings: JitSettings, mode: str = "srun") -> str:
     return env
 
 
+def bandwidth_path(settings: JitSettings) -> str:
+    """Path FTIO's dump_json writes to (the predictor's cwd)."""
+    return os.path.join(os.path.dirname(settings.log_dir), "bandwidth.json")
+
+
+def clear_bandwidth(settings: JitSettings) -> None:
+    """
+    Drop a bandwidth.json left behind by an earlier run.
+
+    save_bandwidth() copies that file into this run's log dir. If FTIO sees no
+    I/O at all (e.g. the app never wrote into the gkfs mount) no new file is
+    produced, and without this the log dir silently inherits the previous run's
+    trace -- which then looks like a valid result.
+
+    Args:
+        settings (JitSettings): The JIT settings object.
+    """
+    if settings.exclude_ftio:
+        return
+    with contextlib.suppress(OSError):
+        os.remove(bandwidth_path(settings))
+
+
 def save_bandwidth(settings: JitSettings) -> None:
     """
     Save bandwidth data to a file.
@@ -2450,14 +2582,19 @@ def save_bandwidth(settings: JitSettings) -> None:
     Args:
         settings (JitSettings): The JIT settings object.
     """
-    if not settings.exclude_ftio:
-        try:
-            command = f"cp {os.path.dirname(settings.log_dir)}/bandwidth.json {settings.log_dir}/bandwidth.json || true"
-            _ = subprocess.run(
-                command, shell=True, capture_output=True, text=True, check=True
-            )
-        except Exception as e:
-            jit_print(f"[red]Error saving bandwidth:\n{e}")
+    if settings.exclude_ftio:
+        return
+    src = bandwidth_path(settings)
+    if not os.path.exists(src):
+        jit_print(
+            "[yellow]No bandwidth.json was produced: FTIO captured no I/O. "
+            "Does the application write into the gkfs mountdir?"
+        )
+        return
+    try:
+        shutil.copy(src, os.path.join(settings.log_dir, "bandwidth.json"))
+    except Exception as e:
+        jit_print(f"[red]Error saving bandwidth:\n{e}")
 
 
 def parse_time(line: str) -> float | None:

@@ -46,7 +46,40 @@ class FileQueue:
         m = Manager()
         self._queue = m.list()  # Files/folders to process
         self._ignore = m.list()  # List of (timestamp, filename) tuples
+        self._flushed = m.dict()  # item -> newest timestamp seen when it was staged
         self._lock = m.Lock()
+
+    def mark_flushed(self, item: str, stamp: float) -> None:
+        """
+        Record that an item was staged out, together with how new it was then.
+
+        Args:
+            item: The path that was staged out.
+            stamp: Newest timestamp among the item's files at the time of staging.
+        """
+        with self._lock:
+            self._flushed[item] = stamp
+
+    def already_flushed(self, item: str, stamp: float) -> bool:
+        """
+        Report whether an item was staged out already and has not changed since.
+
+        Deleting an item from the mount does not immediately retire its metadata
+        in GekkoFS, so a later listing can still report its files and a second
+        flush copies them again. Comparing the newest timestamp against the one
+        recorded at staging time distinguishes that stale reappearance (same or
+        older) from an application genuinely rewriting the path (newer).
+
+        Args:
+            item: The path to check.
+            stamp: The item's current newest timestamp.
+
+        Returns:
+            True if the item was staged before and is no newer than it was then.
+        """
+        with self._lock:
+            previous = self._flushed.get(item)
+        return previous is not None and stamp <= previous
 
     def put(self, item: str) -> None:
         """

@@ -448,3 +448,78 @@ def test_shim_all_exports():
     assert hasattr(shim, "PhaseAutomaton")
     assert hasattr(shim, "PhaseState")
     assert hasattr(shim, "Transition")
+
+
+# ---------------------------------------------------------------------------
+# min_cycles — do not model a period the window has not held twice
+# ---------------------------------------------------------------------------
+def _windowed_pred(freq: float, t_start: float, t_end: float) -> Prediction:
+    """A Prediction whose window is the whole run observed so far (as online)."""
+    p = Prediction(transformation="dft")
+    p.dominant_freq = np.array([freq])
+    p.conf = np.array([1.0])  # the warm-up artifact comes with FULL confidence
+    p.amp = np.array([1.0])
+    p.phi = np.array([0.0])
+    p.t_start = t_start
+    p.t_end = t_end
+    p.ranks = 2
+    return p
+
+
+def test_min_cycles_ignores_a_window_holding_a_single_period():
+    """The measured LAMMPS warm-up: one 5 s burst in a 5 s window.
+
+    The DFT reports "period = 5.0 s" -- that is the burst's *width*, one cycle
+    across the whole window (the k=1 bin), not evidence of periodicity. It comes
+    with confidence 1.00 and stays stable for several rounds, so only the cycle
+    count can reject it.
+    """
+    aut = PhaseAutomaton(method="cusum", min_cycles=2.0)
+    for _ in range(4):
+        aut.step(_windowed_pred(1 / 5.0, 0.0, 5.0))  # 1.0 cycle in the window
+    assert aut.states == [], "a single-cycle window must not open a state"
+
+
+def test_min_cycles_admits_the_window_once_it_holds_two_periods():
+    aut = PhaseAutomaton(method="cusum", min_cycles=2.0)
+    aut.step(_windowed_pred(1 / 5.0, 0.0, 5.0))  # 1.0 cycle -> ignored
+    assert not aut.states
+    aut.step(_windowed_pred(1 / 42.0, 0.0, 85.0))  # 2.02 cycles -> modelled
+    assert len(aut.states) == 1
+    assert aut.states[0].period == pytest.approx(42.0, rel=1e-3)
+
+
+def test_min_cycles_prevents_the_false_transition_entirely():
+    """Without the guard the run learns 5 s, then 'transitions' to the real 42 s."""
+    warmup = [_windowed_pred(1 / 5.0, 0.0, 5.0) for _ in range(4)]
+    steady = [_windowed_pred(1 / 42.0, 0.0, 85.0 + 10 * i) for i in range(8)]
+
+    off = PhaseAutomaton(method="cusum", min_cycles=1.0)
+    for p in warmup + steady:
+        off.step(p)
+    assert len(off.states) == 2
+    assert len(off.transitions) == 1, "the artifact fakes a phase change"
+
+    on = PhaseAutomaton(method="cusum", min_cycles=2.0)
+    for p in warmup + steady:
+        on.step(p)
+    assert len(on.states) == 1
+    assert not on.transitions, "no phase change ever happened"
+    assert on.states[0].period == pytest.approx(42.0, rel=1e-3)
+
+
+def test_min_cycles_off_by_default_so_short_window_callers_are_unaffected():
+    # A caller may hand in Predictions whose window is one slice, not the whole
+    # run; the guard must not silently discard those.
+    aut = PhaseAutomaton(method="cusum")
+    assert aut.min_cycles == 1.0
+    aut.step(_windowed_pred(0.5, 0.0, 2.0))  # 1.0 cycle
+    assert len(aut.states) == 1
+
+
+def test_min_cycles_keeps_genuinely_fast_periodic_io():
+    # A real 2 s period observed over a 60 s window is 30 cycles: never a warm-up.
+    aut = PhaseAutomaton(method="cusum", min_cycles=2.0)
+    aut.step(_windowed_pred(0.5, 0.0, 60.0))
+    assert len(aut.states) == 1
+    assert aut.states[0].period == pytest.approx(2.0, rel=1e-3)

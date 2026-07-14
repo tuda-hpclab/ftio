@@ -122,8 +122,6 @@ class JitSettings:
 
         self.nodes = 1
         self.max_time = None
-        # --ingest-workers>1 enables the process-resample fan-out (~2.4x) for
-        # the per-round parse+overlap; 1 keeps the single-process behaviour.
         self.ftio_args = "-m write -v --freq 10 --ingest-workers 4 "
         self.gkfs_daemon_protocol = (
             "ofi+verbs"  # "ofi+verbs" #"ofi+sockets"  or "ofi+verbs"
@@ -440,9 +438,21 @@ class JitSettings:
                 self.app_flags = ""
         #  ├─ LAMMPS
         elif "lammps" in self.app:
-            self.app_call = "/lustre/project/nhr-gekko/shared/mylammps/build/lmp"
-            self.run_dir = f"{self.gkfs_mntdir}"
-            self.app_flags = "-in in.spce.hex"
+            # The GLASS driver deck: 142^3 -> 11.45 M atoms -> 1.008 GB per
+            # restart (88 B/atom), 8 phases ~27 s apart, tail keeps the app alive
+            # past the last checkpoint so FTIO can still predict it.
+            # The old cluster setting pointed at /lustre/project/nhr-gekko (Mogon)
+            # and ran in.spce.hex, which is a different experiment and cannot
+            # resolve on BSC.
+            self.app_call = f"{self.home}/mylammps/build/lmp"
+            self.run_dir = f"{self.home}/mylammps/glass"
+            ckptdir = self.gkfs_mntdir if not self.exclude_daemon else self.run_dir
+            self.app_flags = self.resolve_app_flags(
+                f"-in {self.run_dir}/in.ckpt -v ckptdir {ckptdir} "
+                f"-v x 142 -v y 142 -v z 142 "
+                f"-v every 10 -v nb 10 -v phases 8 -v tail 5",
+                ckptdir,
+            )
         #  ├─ DLIO
         elif "dlio" in self.app:
             self.app_call = "dlio_benchmark"
@@ -472,12 +482,59 @@ class JitSettings:
             self.run_dir = "."
             if not self.app_flags:  # default value if app_flags is not set
                 self.app_flags = "200 200 200 2 2 2 0 F ."
-        #  └─ WRF
+        #  ├─ WRF
         elif "wrf" in self.app:
-            self.app_call = "./wrf.exe"
-            self.run_dir = f"{self.home}/WRF/test/em_real"
+            # em_b_wave_glass is our copy of the idealized baroclinic-wave case
+            # (run_hours=8, restart_interval=60, history off -> 8 restarts of
+            # ~18 MB, ~65 s apart). WRF must NOT run inside the mount: it reads
+            # each namelist group with a REWIND and that fails through GekkoFS.
+            # So the inputs stay on the parallel FS and only rst_outname points
+            # into the mount.
+            self.app_call = f"{self.home}/WRF/main/wrf.exe"
+            self.run_dir = f"{self.home}/WRF/test/em_b_wave_glass"
             self.app_flags = ""
-
+            self.point_wrf_restarts_at(
+                self.gkfs_mntdir if not self.exclude_daemon else self.run_dir
+            )
+        #  ├─ Castro (AMReX)
+        elif "castro" in self.app:
+            # Sedov blast. fixed_dt + init_shrink=1 + max_level=0 keep the
+            # checkpoints wall-clock periodic; without them dt grows ~35x and the
+            # gaps run 5 s -> 46 s.
+            self.app_call = (
+                f"{self.home}/Castro/Exec/hydro_tests/Sedov/Castro3d.gnu.MPI.ex"
+            )
+            self.run_dir = f"{self.home}/Castro/Exec/hydro_tests/Sedov"
+            ckptdir = self.gkfs_mntdir if not self.exclude_daemon else self.run_dir
+            self.app_flags = self.resolve_app_flags(
+                f"inputs.3d.sph max_step=18 amr.check_int=2 amr.plot_int=-1 "
+                f"amr.max_level=0 castro.fixed_dt=4e-6 castro.init_shrink=1.0 "
+                f"amr.check_file={ckptdir}/sedov_3d_sph_chk amr.n_cell = 160 160 160",
+                ckptdir,
+            )
+        #  ├─ WarpX (AMReX)
+        elif "warpx" in self.app:
+            # 10 checkpoint directories of ~484 MB, one every 10 steps.
+            self.app_call = f"{self.home}/WarpX/build/bin/warpx.3d"
+            self.run_dir = f"{self.home}/WarpX/glass"
+            ckptdir = self.gkfs_mntdir if not self.exclude_daemon else self.run_dir
+            self.app_flags = self.resolve_app_flags(
+                f"inputs max_step=85 chk.intervals=10 diag1.intervals=1000 "
+                f"chk.file_prefix={ckptdir}/chk amr.n_cell = 128 128 128",
+                ckptdir,
+            )
+        #  └─ QMCPACK
+        elif "qmc" in self.app:
+            # The irregular-workload case: the block time drifts, FTIO finds no
+            # dominant frequency and correctly suppresses the flush trigger.
+            # <project id> takes an absolute path, so the inputs stay on the
+            # parallel FS and only the output goes into the mount.
+            self.app_call = f"{self.home}/qmcpack/build/bin/qmcpack"
+            self.run_dir = f"{self.home}/qmcpack/glass_stagein"
+            self.app_flags = "glass.xml"
+            self.point_qmcpack_output_at(
+                self.gkfs_mntdir if not self.exclude_daemon else self.run_dir
+            )
         else:
             self.app_call = ""
             self.run_dir = ""
@@ -588,14 +645,16 @@ class JitSettings:
                 self.app_flags = self.app_flags.replace("test_run", f"{self.gkfs_mntdir}")
         # ├─ wrf
         elif "wrf" in self.app:
-            if self.exclude_daemon:
-                self.pre_app_call = "cdf {self.home}/WRF/test/em_real; du -sh wrfout_d0* ; rm -rf wrfout_d0* rsl.*.*"
-                self.post_app_call = ""
-            else:
-                self.run_dir = f"{self.gkfs_mntdir}"
-                self.pre_app_call = f"cdf {self.home}/WRF/test/em_real_stagein; du -sh wrfout_d0* ; rm -rf wrfout_d0* rsl.*.*; mkdir -p {self.run_dir}; cpf {self.home}/WRF/test/em_real_stagein/wrf.exe {self.run_dir}"
-                self.post_app_call = ""
-                self.app_call = f"{self.run_dir}/wrf.exe"
+            # Deliberately empty. The old body ran WRF *inside* the mount, which
+            # cannot work (the namelist REWINDs fail through GekkoFS), and it did
+            # so from a pre_app_call -- and any pre_app_call at all makes the
+            # stage-in that follows it die with
+            #   forward_stat() ... path '/' failed: HG_NOENTRY
+            #   cp: target '<mnt>': Device or resource busy
+            # Restarts are redirected into the mount by point_wrf_restarts_at()
+            # instead, which needs no pre-call.
+            self.pre_app_call = ""
+            self.post_app_call = ""
         else:
             self.pre_app_call = ""
             self.post_app_call = ""
@@ -616,12 +675,15 @@ class JitSettings:
             self.stage_out_path = f"{self.tmp_dir}/stage-out"
         # ├─ LAMMPS
         elif "lammps" in self.app:
-            self.stage_in_path = "/lustre/project/nhr-gekko/shared/mylammps/examples/HEAT"
+            # Nothing to stage in: the glass deck (in.ckpt) is read from run_dir
+            # on the parallel FS and writes its restarts straight to ckptdir.
+            self.stage_in_path = f"{self.tmp_dir}/stage-in"
             self.stage_out_path = f"{self.tmp_dir}/stage-out"
         # ├─ WRF
         elif "wrf" in self.app:
-            self.stage_in_path = f"{self.tmp_dir}/WRF/test/em_real_stagein"
-            # self.stage_in_path = ff"{self.tmp_dir}/WRF/test/em_real"
+            # Nothing to stage in: WRF reads namelist.input / wrfinput_d01 from
+            # run_dir on the parallel FS (it cannot read them through GekkoFS).
+            self.stage_in_path = f"{self.tmp_dir}/stage-in"
             self.stage_out_path = f"{self.tmp_dir}/stage-out"
         # └─ Other
         else:
@@ -631,46 +693,6 @@ class JitSettings:
         # ? Regex relevant files (move matches out and in)
         # ?##########################
         self.regex_file = f"{self.tmp_dir}/nek_regex4cargo.txt"
-        # ├─ Nek5000
-        if "nek" in self.app_call:
-            self.regex_flush_match = ".*/[a-zA-Z0-9]*turbPipe0\\.f\\d+"
-            self.regex_stage_out_match = ".*/[a-zA-Z0-9]*turbPipe0\\.f\\d+"  # ".*"
-            self.regex_stage_in_match = ".*"
-        # ├─ Wacom++
-        elif "wacom" in self.app_call:
-            self.regex_flush_match = ".*/(history|restart|output)/.*\\.(nc|json)$"
-            # self.regex_flush_match = ".*/output/.*\\.nc$"
-            # self.regex_stage_out_match = ".*"
-            self.regex_stage_out_match = ".*/(history|restart|output)/.*\\.(nc|json)$"
-            self.regex_stage_in_match = ".*"
-        # ├─ DLIO
-        elif "dlio" in self.app_call:
-            # self.regex_flush_match = ".*/(checkpoints)/.*\\.pt$"
-            # self.regex_stage_out_match = ".*/(checkpoints)/.*\\.pt$"
-            self.regex_flush_match = ".*/(checkpoints)/.*"
-            self.regex_stage_out_match = ".*/(checkpoints)/.*"
-            self.regex_stage_in_match = ".*"
-        # ├─ LAMMPS
-        elif "lmp" in self.app_call:
-            self.regex_flush_match = ""
-            self.regex_stage_out_match = ".*"
-            self.regex_stage_in_match = ".*"
-        # ├─ S3D-IO
-        elif "s3d" in self.app_call:
-            self.regex_flush_match = ".*/pressure_wave_test\\..*\\.field\\.nc$"
-            self.regex_stage_out_match = ".*"
-            self.regex_stage_in_match = ".*"
-        elif "wrf" in self.app_call:
-            self.regex_flush_match = ".*/(rsl\\..*|wrfout_.*)/?.*$"
-            self.regex_stage_out_match = ".*/(rsl\\..*|wrfout_.*)/?.*$"
-            self.regex_stage_in_match = ".*"
-        # └─ Other
-        else:
-            self.regex_flush_match = ""
-            self.regex_stage_out_match = ".*"
-            self.regex_stage_in_match = ".*"
-
-        self.regex_match = self.regex_flush_match
         self.env_var = {"CARGO_REGEX": self.regex_file}
 
         # With GENERATOR (app): At open/create we create an extra .lockgekko file with size = number of opens to that file (it is distributed). We decrease and delete the file on close
@@ -715,8 +737,12 @@ class JitSettings:
             self.regex_file = "/tmp/jit/nek_regex4cargo.txt"
             self.env_var = {"CARGO_REGEX": self.regex_file}
 
-            self.stage_in_path = "/tmp/input"
-            self.stage_out_path = "/tmp/output"
+            # Stage-out copies land next to stage_out_path. Keep it off the tmpfs
+            # backing the rootdir above, or a GB-scale checkpoint set has to fit
+            # in there twice (source + copy) and the flush dies with EDQUOT.
+            local_stage = self.tmp_dir or "/tmp"
+            self.stage_in_path = f"{local_stage}/input"
+            self.stage_out_path = f"{local_stage}/output"
 
             # Create the folder if it doesn't exist
             os.makedirs(self.stage_in_path, exist_ok=True)
@@ -781,29 +807,69 @@ class JitSettings:
                 self.app_flags = re.sub(r"/[^\s]+", self.gkfs_mntdir, self.app_flags)
             elif "lammps" in self.app:
                 # Writes restart files straight to ${ckptdir} (no temp rename), so
-                # point that at the gkfs mountdir. Small locally (20³, tmpfs);
-                # build / size knobs / cluster paths in LAMMPS.md.
+                # point that at the gkfs mountdir.
+                # 142³ -> 11.45 M atoms -> 1.008 GB per checkpoint (88 B/atom).
+                # every=10 steps ~ 21 s of compute between the ~2.4 s writes, so
+                # the 8 phases are well separated; tail=5 keeps the app alive
+                # past the last checkpoint long enough for FTIO to predict it.
+                # Size / period knobs and cluster paths in LAMMPS.md.
                 self.app_call = "/d/benchmark/lammps/build/lmp"
                 self.run_dir = "/d/benchmark/lammps/glass"
                 ckptdir = self.gkfs_mntdir if not self.exclude_daemon else self.run_dir
-                self.app_flags = (
+                self.app_flags = self.resolve_app_flags(
                     f"-in /d/benchmark/lammps/glass/in.ckpt -v ckptdir {ckptdir} "
-                    f"-v x 20 -v y 20 -v z 20 -v every 100 -v nsteps 400"
+                    f"-v x 142 -v y 142 -v z 142 "
+                    f"-v every 10 -v nb 10 -v phases 8 -v tail 5",
+                    ckptdir,
                 )
             elif "wrf" in self.app:
                 # Idealized baroclinic wave (em_b_wave): self-contained, writes
                 # periodic wrfrst_d01_* restart checkpoints (period = namelist
                 # restart_interval). Build / size knobs / cluster setup in WRF.md.
-                self.app_call = "./wrf.exe"
-                self.run_dir = "/d/benchmark/WRF/test/em_b_wave"
+                #
+                # wrf.exe has no CLI: it reads namelist.input from the cwd. Running
+                # *in* the mount does not work -- WRF reads each namelist group with
+                # a REWIND, and that fails through GekkoFS, so it aborts with
+                # "ERROR while reading namelist diags". So keep the inputs on the
+                # real filesystem and redirect only the restarts into the mount with
+                # the namelist's own rst_outname key.
+                #
+                # em_b_wave_glass is our own copy of the case (stock em_b_wave is
+                # left alone): run_hours=8, restart_interval=60, history off, which
+                # yields 8 restarts of ~18 MB about 55 s apart.
+                self.app_call = "/d/benchmark/WRF/main/wrf.exe"
+                self.run_dir = "/d/benchmark/WRF/test/em_b_wave_glass"
                 self.app_flags = ""
+                ckptdir = self.gkfs_mntdir if not self.exclude_daemon else self.run_dir
+                self.point_wrf_restarts_at(ckptdir)
+                # The wrf branch above (not cluster-gated) leaves a pre_app_call
+                # built from the `cdf`/`cpf` cluster aliases and $HOME paths, which
+                # do not exist here. It must be cleared rather than replaced: any
+                # pre_app_call at all makes the stage-in that follows it fail with
+                # "Error stating existing file '/'" (HG_NOENTRY) and the run aborts.
+                # The namelist rewrite above does the same job without a pre-call.
+                self.pre_app_call = ""
+                self.post_app_call = ""
             elif "qmc" in self.app:
                 # QMCPACK VMC (self-contained heg case): checkpoints config.h5
                 # every block (checkpoint="1"); write-only, rolling file. Size =
                 # walkers/system, period = checkpoint blocks. Notes in Qmpack.md.
+                #
+                # Same story as WRF: the output prefix comes from <project id> in
+                # the input, not from a flag, so the files land in the cwd. Unlike
+                # WRF though, <project id> accepts an absolute path, so point it at
+                # the mount and leave the xml inputs on the real filesystem.
+                # glass_stagein is our own input set (the glass/ dir also carries
+                # previous outputs).
                 self.app_call = "/d/benchmark/qmcpack/build/bin/qmcpack"
-                self.run_dir = "/d/benchmark/qmcpack/glass"
+                self.run_dir = "/d/benchmark/qmcpack/glass_stagein"
                 self.app_flags = "glass.xml"
+                ckptdir = self.gkfs_mntdir if not self.exclude_daemon else self.run_dir
+                self.point_qmcpack_output_at(ckptdir)
+                # Never set a pre_app_call here -- it breaks the stage-in that
+                # follows it (see point_wrf_restarts_at).
+                self.pre_app_call = ""
+                self.post_app_call = ""
             elif "castro" in self.app:
                 # Castro/AMReX Sedov: real hydro, writes periodic AMReX checkpoint
                 # DIRECTORIES (sedov_3d_sph_chk*) every amr.check_int steps;
@@ -813,8 +879,25 @@ class JitSettings:
                     "/d/benchmark/Castro/Exec/hydro_tests/Sedov/Castro3d.gnu.MPI.ex"
                 )
                 self.run_dir = "/d/benchmark/Castro/glass"
+                # inputs.3d.sph is the stock upstream deck; everything below is a
+                # command-line override (AMReX reads "name = v1 v2 v3" from argv).
+                #
+                # fixed_dt + init_shrink=1 + max_level=0 are what make the I/O
+                # *wall-clock* periodic. Stock Castro shrinks the initial dt 100x
+                # and grows it back while AMR refines, so a constant check_int
+                # yields phases 5 s apart at the start and 46 s apart at the end,
+                # and FTIO correctly reports no dominant frequency.
+                #
+                # 160^3 -> 4.10 M cells -> 617 MB per checkpoint, 4.55 s per step.
+                # check_int=2 -> ~9 s of compute per phase; max_step=18 -> 10
+                # checkpoints (step 0,2..18). check_file must point into the mount,
+                # else Castro writes to run_dir and gkfs never sees the I/O.
+                ckptdir = self.gkfs_mntdir if not self.exclude_daemon else self.run_dir
                 self.app_flags = (
-                    "inputs.3d.sph max_step=40 amr.check_int=10 amr.plot_int=-1"
+                    f"inputs.3d.sph max_step=18 amr.check_int=2 amr.plot_int=-1 "
+                    f"amr.max_level=0 castro.fixed_dt=4e-6 castro.init_shrink=1.0 "
+                    f"amr.check_file={ckptdir}/sedov_3d_sph_chk "
+                    f"amr.n_cell = 160 160 160"
                 )
             elif "warpx" in self.app:
                 # WarpX (AMReX plasma PIC): real PIC compute, writes periodic
@@ -823,6 +906,196 @@ class JitSettings:
                 # Build/knobs in WarpX.md (reuses the local AMReX).
                 self.app_call = "/d/benchmark/WarpX/build/bin/warpx.3d"
                 self.run_dir = "/d/benchmark/WarpX/glass"
+                # Stock `inputs`; everything below is a command-line override.
+                # 9 checkpoints (steps 0,10..80) + a 5-step tail. diag1 is pushed
+                # out of range so only chk* lands in the trace, and the prefix must
+                # point into the mount or gkfs never sees the writes.
+                # Stock 64x32x32 gives 17 MB checkpoints and sub-second steps -- the
+                # phases collapse into each other. 128^3 -> 484 MB per checkpoint and
+                # ~1 s per step, so the 9 phases sit ~10 s apart.
+                ckptdir = self.gkfs_mntdir if not self.exclude_daemon else self.run_dir
                 self.app_flags = (
-                    "inputs max_step=30 chk.intervals=10 diag1.intervals=1000"
+                    f"inputs max_step=85 chk.intervals=10 diag1.intervals=1000 "
+                    f"chk.file_prefix={ckptdir}/chk "
+                    f"amr.n_cell = 128 128 128"
                 )
+
+        # app_call is final only here -- pick the regexes now.
+        self.select_regexes()
+
+    def resolve_app_flags(self, default: str, ckptdir: str) -> str:
+        """Return the user's --app-flags if given, otherwise the tuned default.
+
+        The driver apps used to overwrite app_flags unconditionally, so --app-flags
+        was silently ignored for exactly the apps whose phases you want to retune
+        (LAMMPS, Castro, WarpX, ...) and the only way to change a phase was to edit
+        this file. Overriding matters on a cluster: more ranks shrink the compute
+        gap, so the size and period knobs have to be scaled per machine.
+
+        The checkpoint directory is only known at runtime, so a user-supplied
+        string can refer to it as `{ckptdir}` (and to the run directory as
+        `{run_dir}`); both are substituted here.
+
+        Args:
+            default (str): The flags to use when the user gave none.
+            ckptdir (str): Directory the app should write its checkpoints to.
+
+        Returns:
+            str: The flags to launch the application with.
+        """
+        if not self.app_flags:
+            return default
+        flags = self.app_flags.replace("{ckptdir}", ckptdir).replace(
+            "{run_dir}", self.run_dir
+        )
+        if ckptdir not in flags:
+            # The checkpoints would land outside the mount, GekkoFS would see no
+            # I/O at all, and FTIO would make zero predictions -- with nothing in
+            # the log to say why. Say it here instead.
+            console.print(
+                f"[bold yellow]--app-flags does not mention the checkpoint dir "
+                f"({ckptdir}). Use the {{ckptdir}} placeholder, or the app will "
+                f"write outside the mount and FTIO will see nothing.[/]"
+            )
+        return flags
+
+    def point_wrf_restarts_at(self, ckptdir: str) -> None:
+        """Rewrite rst_outname in the WRF namelist so restarts land in `ckptdir`.
+
+        wrf.exe takes no command line arguments: the only knob for where the
+        restart files go is the namelist's rst_outname. The namelist lives in
+        em_b_wave_glass, our own copy of the case, so rewriting it leaves the
+        stock em_b_wave deck untouched.
+
+        Done here rather than in pre_app_call because *any* pre_app_call makes
+        the stage-in that follows it fail against GekkoFS.
+
+        Args:
+            ckptdir (str): Directory the restart files should be written to.
+        """
+        namelist = os.path.join(self.run_dir, "namelist.input")
+        target = (
+            f" rst_outname                         = '{ckptdir}/wrfrst_d<domain>_<date>',"
+        )
+        try:
+            with open(namelist) as f:
+                lines = f.read().splitlines()
+            rewritten = [
+                target if line.lstrip().startswith("rst_outname") else line
+                for line in lines
+            ]
+            if rewritten != lines:
+                with open(namelist, "w") as f:
+                    f.write("\n".join(rewritten) + "\n")
+        except OSError as e:
+            console.print(f"[yellow]Could not set rst_outname in {namelist}: {e}[/]")
+
+    def point_qmcpack_output_at(self, ckptdir: str) -> None:
+        """Rewrite <project id> in the QMCPACK input so output lands in `ckptdir`.
+
+        qmcpack has no flag for the output prefix -- it comes from the project id,
+        which is why the files otherwise appear in the cwd. The id does accept an
+        absolute path, so the inputs can stay on the real filesystem while the
+        rolling config.h5 checkpoint is written into the mount.
+
+        Args:
+            ckptdir (str): Directory the QMCPACK output should be written to.
+        """
+        xml = os.path.join(self.run_dir, "glass.xml")
+        try:
+            with open(xml) as f:
+                text = f.read()
+            rewritten = re.sub(
+                r'<project id="[^"]*glass_heg"',
+                f'<project id="{ckptdir}/glass_heg"',
+                text,
+            )
+            if rewritten != text:
+                with open(xml, "w") as f:
+                    f.write(rewritten)
+        except OSError as e:
+            console.print(f"[yellow]Could not set the project id in {xml}: {e}[/]")
+
+    def select_regexes(self) -> None:
+        """Pick the flush / stage-out / stage-in patterns for the current app.
+
+        Keyed off ``app_call``, so this must run *after* the cluster and local
+        blocks have finalized it. Running it earlier picks the pattern of
+        whatever app_call happened to hold at the time, which silently left
+        castro/warpx/qmc with an empty flush regex -- a flush that stages
+        nothing at all.
+        """
+        # ├─ Nek5000
+        if "nek" in self.app_call:
+            self.regex_flush_match = ".*/[a-zA-Z0-9]*turbPipe0\\.f\\d+"
+            self.regex_stage_out_match = ".*/[a-zA-Z0-9]*turbPipe0\\.f\\d+"  # ".*"
+            self.regex_stage_in_match = ".*"
+        # ├─ Wacom++
+        elif "wacom" in self.app_call:
+            self.regex_flush_match = ".*/(history|restart|output)/.*\\.(nc|json)$"
+            # self.regex_flush_match = ".*/output/.*\\.nc$"
+            # self.regex_stage_out_match = ".*"
+            self.regex_stage_out_match = ".*/(history|restart|output)/.*\\.(nc|json)$"
+            self.regex_stage_in_match = ".*"
+        # ├─ DLIO
+        elif "dlio" in self.app_call:
+            # self.regex_flush_match = ".*/(checkpoints)/.*\\.pt$"
+            # self.regex_stage_out_match = ".*/(checkpoints)/.*\\.pt$"
+            self.regex_flush_match = ".*/(checkpoints)/.*"
+            self.regex_stage_out_match = ".*/(checkpoints)/.*"
+            self.regex_stage_in_match = ".*"
+        # ├─ LAMMPS
+        elif "lmp" in self.app_call:
+            # An empty flush pattern matches nothing, so FTIO would trigger on
+            # time but stage 0 items and the checkpoints would pile up in the
+            # rootdir until the post-app copy hits EDQUOT. The mountdir only
+            # ever holds ckpt.restart.<step>, so match them explicitly.
+            self.regex_flush_match = ".*/ckpt\\.restart\\.\\d+$"
+            self.regex_stage_out_match = ".*"
+            self.regex_stage_in_match = ".*"
+        # ├─ S3D-IO
+        elif "s3d" in self.app_call:
+            self.regex_flush_match = ".*/pressure_wave_test\\..*\\.field\\.nc$"
+            self.regex_stage_out_match = ".*"
+            self.regex_stage_in_match = ".*"
+        elif "wrf" in self.app_call:
+            # The checkpoints are the restart files wrfrst_d<domain>_<date>. The
+            # old pattern matched wrfout_* (history) and rsl.* (per-rank logs)
+            # instead, so it would have flushed the logs and never a checkpoint.
+            # Running in the mount also puts namelist.input / wrfinput_d01 / rsl.*
+            # there, and none of those may be staged out mid-run: wrf keeps the
+            # rsl logs open, and removing an input under a running app is fatal.
+            self.regex_flush_match = ".*/wrfrst_d\\d+_.*$"
+            self.regex_stage_out_match = ".*/wrfrst_d\\d+_.*$"
+            self.regex_stage_in_match = ".*"
+        # ├─ Castro (AMReX)
+        elif "Castro" in self.app_call or "castro" in self.app_call:
+            # AMReX writes each checkpoint as a directory tree with a dot-free
+            # name (<mnt>/sedov_3d_sph_chk<step>/Header, .../Level_0/Cell_D_*).
+            # Match the top-level checkpoint directory (no end anchor) so the
+            # whole tree is flushed as a single unit. The (?=/) keeps AMReX's
+            # "<chk>.old.<pid>" rename artifacts from matching as a bare file
+            # unit whose path no longer exists.
+            self.regex_flush_match = ".*/sedov_3d_sph_chk\\d+(?=/)"
+            self.regex_stage_out_match = ".*/sedov_3d_sph_chk\\d+(?=/)"
+            self.regex_stage_in_match = ".*"
+        # ├─ WarpX (AMReX)
+        elif "warpx" in self.app_call:
+            # WarpX (AMReX) writes checkpoint directories <mnt>/chk<step>/...
+            # Match the top-level checkpoint directory so the tree flushes as one.
+            self.regex_flush_match = ".*/chk\\d+(?=/)"
+            self.regex_stage_out_match = ".*/chk\\d+(?=/)"
+            self.regex_stage_in_match = ".*"
+        # ├─ QMCPACK
+        elif "qmcpack" in self.app_call:
+            # QMCPACK rolls a single config file <mnt>/glass_heg.s000.config.h5.
+            self.regex_flush_match = ".*/glass_heg\\.s\\d+\\.config\\.h5$"
+            self.regex_stage_out_match = ".*/glass_heg\\.s\\d+\\.config\\.h5$"
+            self.regex_stage_in_match = ".*"
+        # └─ Other
+        else:
+            self.regex_flush_match = ""
+            self.regex_stage_out_match = ".*"
+            self.regex_stage_in_match = ".*"
+
+        self.regex_match = self.regex_flush_match

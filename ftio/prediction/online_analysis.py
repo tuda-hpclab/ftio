@@ -67,6 +67,12 @@ def _automaton_step(
             method=method,
             rank_changes_trigger=getattr(args, "pa_rank_trigger", True),
             period_ratio_threshold=getattr(args, "pa_period_ratio", None),
+            # Online, a Prediction's t_start/t_end span the whole run observed so
+            # far, so the warm-up guard applies: do not model a period the window
+            # has not held twice. Without it the automaton learns the very first
+            # prediction, which is a single I/O phase and therefore reports that
+            # burst's width, not a period.
+            min_cycles=getattr(args, "pa_min_cycles", 2.0),
         )
         # Store config and export path once (for later retrieval at exit)
         det["pa_export"] = getattr(args, "pa_export", "./phase_automaton.json")

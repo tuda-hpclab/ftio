@@ -13,7 +13,6 @@ For more information, see the LICENSE file in the project root:
 https://github.com/tuda-parallel/FTIO/blob/main/LICENSE
 """
 
-import signal
 import sys
 import traceback
 
@@ -36,10 +35,11 @@ from ftio.api.gekkoFs.jit.setup_core import (
 from ftio.api.gekkoFs.jit.setup_helper import (  # set_env,
     allocate,
     cancel_jit_jobs,
+    clear_bandwidth,
     get_address_cargo,
     get_address_ftio,
-    handle_sigint,
     hard_kill,
+    install_signal_handlers,
     log_dir,
     log_execution,
     parse_options,
@@ -81,7 +81,10 @@ def main() -> None:
                 "Either define it in the environment or specify it in this file (jitsettings)."
             )
 
-        signal.signal(signal.SIGINT, lambda signal, frame: handle_sigint(settings))
+        # Register cleanup for SIGINT/SIGTERM/SIGHUP. timeout(1) and schedulers
+        # send SIGTERM; without a handler the interpreter dies before the
+        # finally-block cleanup runs, orphaning the daemon and predictor pool.
+        install_signal_handlers(settings)
 
         cancel_jit_jobs(settings)
         allocate(settings)
@@ -98,6 +101,7 @@ def main() -> None:
         # ------------------------------------------------------------------
         # Start services
         # ------------------------------------------------------------------
+        clear_bandwidth(settings)
         start_gekko_daemon(settings)
         start_gekko_proxy(settings)
         start_cargo(settings)

@@ -91,6 +91,27 @@ def _parse_overlap_resample_chunk(args: tuple) -> tuple:
     return rb, data["total_bytes"], data["t_flush"], ext
 
 
+def _trim_grid_padding(b: np.ndarray, grid: np.ndarray) -> tuple[list, list]:
+    """Drop the all-zero samples the shared grid pads a round's I/O with.
+
+    The resample grid always spans [0, horizon], but a round only carries the
+    I/O that happened inside it, so everything before the first burst is zero.
+    Returning the whole grid makes every round start at t=0. The caller
+    accumulates rounds by concatenation (``b_app.extend``), so the trace would
+    jump backwards in time and the DFT would run on non-monotonic timestamps.
+    The serial path returns only the breakpoints it saw; match that.
+
+    One zero sample is kept on each side so the step function still rises from
+    and falls back to zero.
+    """
+    nonzero = np.flatnonzero(b)
+    if nonzero.size == 0:
+        return [], []
+    lo = max(int(nonzero[0]) - 1, 0)
+    hi = min(int(nonzero[-1]) + 2, len(b))
+    return list(b[lo:hi]), list(grid[lo:hi])
+
+
 def _peek_horizon(msgs: list) -> float:
     """Cheap upper bound on the time window from each message's flush_t (field 0)."""
     import msgpack
@@ -129,12 +150,14 @@ def ingest_app_bandwidth(
 
     # process-resample: each worker returns a small fixed-length resampled
     # vector on a shared grid, so nothing large crosses the process boundary.
-    if backend == "process-resample":
+    # _peek_horizon only reads the flush_t header of *packed* messages; for file
+    # inputs it yields 0 and the grid would collapse to a single point, silently
+    # returning an empty series. Fall back to the exact path in that case.
+    horizon = _peek_horizon(files_or_msgs) if backend == "process-resample" else 0.0
+    if backend == "process-resample" and horizon > 0.0:
         from multiprocessing import Pool
 
-        grid = np.arange(
-            0.0, _peek_horizon(files_or_msgs) + 1.0 / resample_hz, 1.0 / resample_hz
-        )
+        grid = np.arange(0.0, horizon + 1.0 / resample_hz, 1.0 / resample_hz)
         tasks = [(c, io_type, grid) for c in chunks]
         with Pool(processes=len(chunks)) as pool:
             results = pool.map(_parse_overlap_resample_chunk, tasks)
@@ -142,7 +165,8 @@ def ingest_app_bandwidth(
         total_bytes = sum(r[1] for r in results)
         t_flush = max((r[2] for r in results), default=0.0)
         ext = next((r[3] for r in results if r[3]), "")
-        return list(rb), list(grid), total_bytes, t_flush, ext
+        b, t = _trim_grid_padding(rb, grid)
+        return b, t, total_bytes, t_flush, ext
 
     tasks = [(c, io_type) for c in chunks]
     if backend == "process":

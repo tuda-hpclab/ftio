@@ -710,6 +710,69 @@ def stage_in(settings: JitSettings, runtime: JitTime) -> None:
 
 #! Stage out
 #!##############################
+def flushable_bytes(settings: JitSettings) -> int:
+    """Bytes still sitting in the GekkoFS mount, or -1 if the mount cannot be read.
+
+    Args:
+        settings (JitSettings): The JIT settings.
+
+    Returns:
+        int: Total size of the files left in the mount, -1 when the listing failed.
+    """
+    try:
+        call = flaged_call(
+            settings,
+            f"find {settings.gkfs_mntdir} -type f -printf '%s\\n'",
+            exclude=["ftio"],
+        )
+        raw = subprocess.check_output(call, shell=True, stderr=subprocess.DEVNULL)
+        return sum(int(line) for line in raw.decode().split() if line.strip().isdigit())
+    except Exception:
+        # A flush in flight makes the daemon answer EBUSY; that is not "empty".
+        return -1
+
+
+def wait_for_flush_to_settle(
+    settings: JitSettings, timeout: float = 120.0, poll: float = 2.0
+) -> None:
+    """Wait for FTIO's in-flight stage-out to finish before FTIO is shut down.
+
+    The application has ended, so nothing new enters the mount; the only thing
+    still draining it is a flush FTIO started before the app exited. Killing FTIO
+    now tears that flush down mid-copy and leaves the daemon answering EBUSY to
+    the post-app sweep, which then aborts and loses whatever was still in the
+    mount (this is how WarpX's chk000085 was lost).
+
+    Poll until the mount stops shrinking: either it empties, or two consecutive
+    polls report the same number of bytes, meaning no flush is making progress.
+
+    Args:
+        settings (JitSettings): The JIT settings.
+        timeout (float): Give up waiting after this many seconds.
+        poll (float): Seconds between polls.
+    """
+    deadline = time.time() + timeout
+    previous = -1
+    while time.time() < deadline:
+        current = flushable_bytes(settings)
+        if current == 0:
+            jit_print("[cyan]FTIO drained the mount, nothing left to stage out")
+            return
+        if current > 0 and current == previous:
+            jit_print(
+                f"[cyan]FTIO flush settled with {format_size(current)} left;"
+                " staging the remainder"
+            )
+            return
+        previous = current
+        time.sleep(poll)
+
+    jit_print(
+        "[yellow]Timed out waiting for FTIO to finish flushing;"
+        " staging out what is left"
+    )
+
+
 def stage_out(settings: JitSettings, runtime: JitTime) -> None:
     """Stages data out to the specified path.
 
@@ -739,6 +802,7 @@ def stage_out(settings: JitSettings, runtime: JitTime) -> None:
 
             #  give ftio slightly more time to finish moving
             if not settings.exclude_ftio:
+                wait_for_flush_to_settle(settings)
                 jit_print("[cyan]Shutting down FTIO as application finished")
                 shut_down(settings, "FTIO", settings.ftio_pid)
 

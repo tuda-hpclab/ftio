@@ -24,8 +24,14 @@ def get_modification_time(args: argparse.Namespace, file_name: str) -> float:
     Returns:
         float: Last modification time of the file.
     """
-    output = preloaded_call(args, f"stat --format=%Y {file_name}")
-    return float(output.strip())
+    # Ask for mtime (%Y) and ctime (%Z) and keep the newer. GekkoFS does not
+    # maintain mtime and answers 0 for everything in the mount, which turned
+    # `time.time() - mtime` into the current epoch and defeated every "is this
+    # file still being written?" check. It does keep ctime. On a normal
+    # filesystem mtime leads and ctime tracks it, so the max is right in both.
+    output = preloaded_call(args, f"stat --format='%Y %Z' {file_name}")
+    stamps = [float(x) for x in output.split() if x.strip()]
+    return max(stamps) if stamps else 0.0
 
 
 def preloaded_call(args: argparse.Namespace, call: str) -> str:

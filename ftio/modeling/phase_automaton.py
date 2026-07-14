@@ -137,6 +137,15 @@ class PhaseAutomaton:
           Set to None to disable statistical detection entirely and rely
           only on rank changes and/or the period-ratio trigger.
 
+      min_cycles : float  (default 1.0 = off)
+          Warm-up guard: ignore a prediction whose analysis window holds fewer
+          than this many full periods.  A period cannot be measured from a
+          single phase, and early in a run the DFT reports one burst's *width*
+          as the "period" (see step()).  Set to 2.0 when the Prediction's
+          t_start/t_end span the whole observed run, as they do in the online
+          predictor.  Left off by default because a caller may hand in
+          Predictions whose window is a short slice rather than the full span.
+
     Usage (online):
         aut = PhaseAutomaton(method="cusum", rank_changes_trigger=True)
         for pred in stream:
@@ -154,6 +163,7 @@ class PhaseAutomaton:
         method: str | None = "cusum",
         rank_changes_trigger: bool = True,
         period_ratio_threshold: float | None = None,
+        min_cycles: float = 1.0,
     ):
         if method is not None and method not in ("cusum", "ph", "adwin", "ksigma"):
             raise ValueError(
@@ -162,6 +172,7 @@ class PhaseAutomaton:
         self.method = method
         self.rank_changes_trigger = rank_changes_trigger
         self.period_ratio_threshold = period_ratio_threshold
+        self.min_cycles = min_cycles
         self.states: list[PhaseState] = []
         self.transitions: list[Transition] = []
         self._detector_state: dict[str, Any] = {}
@@ -181,6 +192,29 @@ class PhaseAutomaton:
         freq, conf = prediction.get_dominant_freq_and_conf()
         if freq <= 0 or np.isnan(freq):
             return False
+
+        # --- Warm-up guard: a period needs at least two periods to be seen ----
+        # A DFT cannot resolve a period longer than the window it ran on, and its
+        # analysis window is trimmed to the data seen so far. Early in a run the
+        # window therefore holds a single I/O phase, and the transform reports that
+        # one burst's *width* as the "period" -- the k=1 bin, one cycle across the
+        # whole window. It is not evidence of periodicity, and it is reported with
+        # full confidence and stays stable for several rounds, so neither a
+        # confidence nor a stability gate can filter it out.
+        #
+        # Measured on a real LAMMPS run (true period 41.8 s):
+        #     window  period  cycles
+        #       5.0 s   5.0 s   1.01   <- one burst; the "period" is its width
+        #      44.5 s  44.4 s   1.00   <- right answer, still only one cycle
+        #      84.8 s  42.4 s   2.00   <- two cycles: now it is measurable
+        #
+        # Requiring two full cycles in the window costs one extra period before
+        # modelling starts, and in exchange the automaton never learns a phase that
+        # does not exist. Set min_cycles <= 1 to disable.
+        if self.min_cycles > 1:
+            window = prediction.t_end - prediction.t_start
+            if window > 0 and window * freq < self.min_cycles:
+                return False
 
         ranks = max(0, int(prediction.ranks))
         cause: str | None = None
