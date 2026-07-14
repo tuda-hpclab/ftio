@@ -185,6 +185,7 @@ def _hard_kill_settings(**over):
         "ftio_pid": 104,
         "cargo_pid": 105,
         "app_pid": 106,
+        "gkfs_hostfile": "",
     }
     base.update(over)
     return SimpleNamespace(**base)

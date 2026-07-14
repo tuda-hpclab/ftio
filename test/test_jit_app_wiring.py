@@ -10,8 +10,9 @@ Three rules are pinned here, each of which cost a debugging session:
    nothing and the async flush silently stages zero files.
 2. WRF has no CLI: the restart path only moves via the namelist's rst_outname.
    QMCPACK likewise takes its output prefix from <project id>.
-3. Neither may be wired with a pre_app_call -- any pre_app_call makes the
-   stage-in that follows it fail with HG_NOENTRY on the mount root.
+3. Neither may be wired with a `cdf`/`cpf` pre_app_call: those are cluster shell
+   aliases and do not exist elsewhere, so the pre-call dies before the app runs.
+   (A pre_app_call as such is fine -- DLIO uses one.)
 
 Author: Ahmad Tarraf
 Copyright (c) 2024-2026 TU Darmstadt, Germany
@@ -162,25 +163,29 @@ def test_run_dir_placeholder_is_substituted():
     assert out == f"-in /deck/in.ckpt -v ckptdir {MNT}"
 
 
-# ── no app may be wired with a pre_app_call ──────────────────────────────────
+# ── the cluster-only shell aliases must not leak into a pre_app_call ─────────
 
 
-def test_wrf_and_qmcpack_are_never_given_a_pre_app_call():
-    """Any pre_app_call makes the following stage-in die on the mount root.
+def test_no_app_is_wired_with_the_cdf_cpf_cluster_aliases():
+    """`cdf` / `cpf` are cluster shell aliases; they do not exist elsewhere.
 
-    Reproduced 4/4 with a pre-call and 0/1 without:
-        forward_stat() ... path '/' failed: HG_NOENTRY
-        cp: target '<mnt>': Device or resource busy
-    The output redirect is therefore done in Python, not a pre-call. Guard the
-    source so nobody reintroduces one.
+    The old WRF branch built its pre_app_call from them (and from $HOME paths),
+    so the pre-call died with "cdf: command not found" before the app ever ran.
+    It also pointed WRF at the mount as its cwd, which cannot work: WRF reads
+    each namelist group with a REWIND and that fails through GekkoFS.
+
+    A pre_app_call is fine in general -- DLIO uses one -- so this guards the
+    aliases, not the mechanism.
     """
     src = inspect.getsource(JitSettings.set_variables)
     for app in ('elif "wrf" in self.app:', 'elif "qmc" in self.app:'):
         assert app in src, f"{app} branch vanished from set_variables"
-    # every pre_app_call assigned anywhere near wrf/qmc must be the empty string
     for line in src.splitlines():
         stripped = line.strip()
-        if stripped.startswith("self.pre_app_call") and "cdf " in stripped:
+        if stripped.startswith("self.pre_app_call") and (
+            "cdf " in stripped or "cpf " in stripped
+        ):
             raise AssertionError(
-                "a cdf/cpf pre_app_call is back -- it breaks stage-in: " + stripped
+                "a cdf/cpf pre_app_call is back -- those aliases do not exist "
+                "off the cluster: " + stripped
             )

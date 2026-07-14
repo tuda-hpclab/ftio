@@ -1366,6 +1366,14 @@ def hard_kill(settings: JitSettings) -> None:
             for pid in tracked_pids:
                 kill_process_tree(pid, signal.SIGKILL)
 
+        # A SIGKILLed daemon never reaches destroy_hosts_file, so its line stays
+        # in the hostfile -- and the daemon *appends*, so the next run's daemon
+        # lands underneath the corpse. Clients then hash some paths onto the dead
+        # entry and get HG_NOENTRY, which GekkoFS reports as the misleading
+        # "Device or resource busy". One failed run would poison every run after
+        # it. Since we killed the daemon, we clean up on its behalf.
+        remove_hostfile(settings)
+
         jit_print("Hard kill finished")
 
 
@@ -1807,6 +1815,27 @@ def jit_print(s: str, new_line: bool = False) -> None:
     getattr(jit_logger, level_name)(clean_msg)
 
 
+def remove_hostfile(settings: JitSettings) -> None:
+    """Delete the GekkoFS hostfile.
+
+    The daemon appends to this file and only removes its own line on a clean
+    shutdown, so any line left by a killed daemon must be cleared by us -- see
+    setup_core.hostfile_is_sane for what a stale line does to the next run.
+
+    Args:
+        settings (JitSettings): The JIT settings object.
+    """
+    if not settings.gkfs_hostfile:
+        return
+    try:
+        os.remove(settings.gkfs_hostfile)
+        jit_print("[yellow]Hostfile removed[/]")
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        jit_print(f"[bold red]Error removing hostfile:[/bold red]{e}", True)
+
+
 def create_hostfile(settings: JitSettings) -> None:
     """
     Create a hostfile for the JIT environment.
@@ -1815,16 +1844,7 @@ def create_hostfile(settings: JitSettings) -> None:
         settings (JitSettings): The JIT settings object.
     """
     jit_print(f"[cyan]Cleaning Hostfile: {settings.gkfs_hostfile}")
-
-    try:
-        if os.path.exists(settings.gkfs_hostfile):
-            os.remove(settings.gkfs_hostfile)
-            jit_print("[yellow]Hostfile removed[/]")
-        else:
-            jit_print("[green]No hostfile found to remove[/]")
-
-    except Exception as e:
-        jit_print(f"[bold red]Error removing hostfile:[/bold red]{e}", True)
+    remove_hostfile(settings)
 
     # # Optionally, recreate the hostfile and populate it if needed
     # try:

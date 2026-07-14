@@ -646,13 +646,12 @@ class JitSettings:
         # ├─ wrf
         elif "wrf" in self.app:
             # Deliberately empty. The old body ran WRF *inside* the mount, which
-            # cannot work (the namelist REWINDs fail through GekkoFS), and it did
-            # so from a pre_app_call -- and any pre_app_call at all makes the
-            # stage-in that follows it die with
-            #   forward_stat() ... path '/' failed: HG_NOENTRY
-            #   cp: target '<mnt>': Device or resource busy
-            # Restarts are redirected into the mount by point_wrf_restarts_at()
-            # instead, which needs no pre-call.
+            # cannot work: WRF reads each namelist group with a REWIND and that
+            # fails through GekkoFS ("ERROR while reading namelist diags" -> FATAL
+            # -> MPI_ABORT), while the identical file parses fine on a real FS.
+            # It also built the call from the `cdf`/`cpf` cluster aliases and
+            # $HOME paths, neither of which exists locally.
+            # Restarts go into the mount via point_wrf_restarts_at() instead.
             self.pre_app_call = ""
             self.post_app_call = ""
         else:
@@ -844,10 +843,8 @@ class JitSettings:
                 self.point_wrf_restarts_at(ckptdir)
                 # The wrf branch above (not cluster-gated) leaves a pre_app_call
                 # built from the `cdf`/`cpf` cluster aliases and $HOME paths, which
-                # do not exist here. It must be cleared rather than replaced: any
-                # pre_app_call at all makes the stage-in that follows it fail with
-                # "Error stating existing file '/'" (HG_NOENTRY) and the run aborts.
-                # The namelist rewrite above does the same job without a pre-call.
+                # do not exist here. Clear it; the namelist rewrite above does the
+                # job on its own.
                 self.pre_app_call = ""
                 self.post_app_call = ""
             elif "qmc" in self.app:
@@ -866,8 +863,6 @@ class JitSettings:
                 self.app_flags = "glass.xml"
                 ckptdir = self.gkfs_mntdir if not self.exclude_daemon else self.run_dir
                 self.point_qmcpack_output_at(ckptdir)
-                # Never set a pre_app_call here -- it breaks the stage-in that
-                # follows it (see point_wrf_restarts_at).
                 self.pre_app_call = ""
                 self.post_app_call = ""
             elif "castro" in self.app:
@@ -967,8 +962,8 @@ class JitSettings:
         em_b_wave_glass, our own copy of the case, so rewriting it leaves the
         stock em_b_wave deck untouched.
 
-        Done here rather than in pre_app_call because *any* pre_app_call makes
-        the stage-in that follows it fail against GekkoFS.
+        Done in Python rather than as a pre_app_call so the rewrite works the same
+        locally and on the cluster, without depending on shell aliases.
 
         Args:
             ckptdir (str): Directory the restart files should be written to.

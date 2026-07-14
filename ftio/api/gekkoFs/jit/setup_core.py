@@ -50,6 +50,7 @@ from ftio.api.gekkoFs.jit.setup_helper import (
     jit_print,
     mpiexec_call,
     relevant_files,
+    remove_hostfile,
     shut_down,
 )
 from ftio.api.gekkoFs.jit.setup_init import init_gekko
@@ -114,10 +115,7 @@ def _cleanup_stale_gekko(settings: JitSettings) -> None:
         exclude=["ftio", "demon", "proxy", "cargo"],
     )
     execute_block(unmount_call, raise_exception=False, dry_run=settings.dry_run)
-    try:
-        os.remove(settings.gkfs_hostfile)
-    except Exception as e:
-        jit_print(f"[yellow]Unable to remove hostfile: {e}[/]")
+    remove_hostfile(settings)
     time.sleep(5)
 
 
@@ -207,11 +205,11 @@ def start_gekko_daemon(settings: JitSettings) -> None:
                 settings.gkfs_hostfile,
                 dry_run=settings.dry_run,
                 error_file=settings.gkfs_daemon_err,
-            ):
+            ) and hostfile_is_sane(settings):
                 break
 
             jit_print(
-                f"[bold yellow]Gekko daemon did not create hostfile "
+                f"[bold yellow]Gekko daemon did not create a usable hostfile "
                 f"(attempt {attempt + 1}/{_MAX_RETRIES})[/]"
             )
             if attempt == _MAX_RETRIES - 1:
@@ -710,6 +708,54 @@ def stage_in(settings: JitSettings, runtime: JitTime) -> None:
 
 #! Stage out
 #!##############################
+def hostfile_is_sane(settings: JitSettings) -> bool:
+    """Check the GekkoFS hostfile lists exactly the daemons we just started.
+
+    The daemon **appends** to the hostfile (`ios::out | ios::app`) and only
+    removes its own line on a *clean* shutdown. A daemon that is SIGKILLed --
+    a job timeout, a crash, an OOM, Ctrl-C -- therefore leaves its line behind,
+    and the next daemon appends below it.
+
+    The client loads every line as a host and hashes each path onto one of them,
+    so a path that lands on the dead entry gets HG_NOENTRY back from Mercury.
+    GekkoFS then reports that as EBUSY, i.e. the thoroughly misleading
+
+        cp: target '<mnt>': Device or resource busy
+
+    which is really "the daemon for this path never answered". It is a hash
+    coin-flip per path, so it looks random: measured 4 of 6 operations failing
+    with one stale line next to one live one.
+
+    Args:
+        settings (JitSettings): The JIT settings.
+
+    Returns:
+        bool: True when the hostfile holds exactly one entry per daemon node.
+    """
+    if settings.dry_run:
+        return True
+    try:
+        with open(settings.gkfs_hostfile) as f:
+            lines = [ln.strip() for ln in f if ln.strip()]
+    except OSError as e:
+        jit_print(f"[bold red]Cannot read the hostfile: {e}[/]")
+        return False
+
+    expected = max(1, settings.app_nodes) if settings.cluster else 1
+    if len(lines) <= expected:
+        return True
+
+    jit_print(
+        f"[bold red]Stale GekkoFS hostfile: {len(lines)} entries for {expected} "
+        f"daemon(s). A previous daemon was killed before it could remove its "
+        f"line, and the new one appended below it. Clients would hash some paths "
+        f"onto the dead daemon and get 'Device or resource busy'. Cleaning up.[/]"
+    )
+    for line in lines:
+        jit_print(f"[yellow]  {' '.join(line.split()[:2])}[/]")
+    return False
+
+
 def flushable_bytes(settings: JitSettings) -> int:
     """Bytes still sitting in the GekkoFS mount, or -1 if the mount cannot be read.
 
