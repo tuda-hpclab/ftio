@@ -14,6 +14,7 @@ https://github.com/tuda-parallel/FTIO/blob/main/LICENSE
 """
 
 import argparse
+import glob
 import json
 import os
 
@@ -59,21 +60,52 @@ def totals_by_node(json_path: str) -> dict:
     return rows
 
 
+def started_runs(app_dir: str) -> set:
+    """(compute_nodes, mode) pairs that have a log dir under app_dir.
+
+    A run whose dir exists but which has no result.json entry started but did
+    not finish (e.g. the stage-out hung) -- the table flags those as FAIL.
+    """
+    out = set()
+    for d in glob.glob(os.path.join(app_dir, "nodes_*", "rep_*", "*")):
+        mode = os.path.basename(d)
+        if mode not in ("glass", "gekko", "pfs") or not os.path.isdir(d):
+            continue
+        try:
+            n = int(os.path.basename(os.path.dirname(os.path.dirname(d))).split("_")[1])
+        except (IndexError, ValueError):
+            continue
+        out.add((n - 1, mode))  # compute nodes = nodes - 1 (FTIO node)
+    return out
+
+
 def print_totals_table(json_path: str) -> None:
-    """Print a per-node app/total table (glass | gekko | pfs) to the console."""
+    """Print a per-node app/total table (glass | gekko | pfs) to the console.
+
+    Cells: numbers when the run finished, red FAIL when it started but never
+    recorded a result (stage-out hang / crash), "-" when never attempted.
+    """
     rows = totals_by_node(json_path)
+    started = started_runs(os.path.dirname(os.path.abspath(json_path)))
     app = os.path.basename(os.path.dirname(os.path.abspath(json_path)))
     table = Table(title=f"{app}  —  time in s (app | total = app+in+out)")
     table.add_column("nodes", justify="right")
     for label in ("glass", "gekko", "pfs"):
         table.add_column(f"{label} app", justify="right")
         table.add_column(f"{label} total", justify="right", style="bold")
-    for n in sorted(rows):
+    for n in sorted(set(rows) | {node for node, _ in started}):
         cells = [str(n)]
         for label in ("glass", "gekko", "pfs"):
-            a, t = rows[n].get(label, (None, None))
-            cells.append("-" if a is None else f"{a:.1f}")
-            cells.append("-" if t is None else f"{t:.1f}")
+            if label in rows.get(n, {}):
+                a, t = rows[n][label]
+                cells.append(f"{a:.1f}")
+                cells.append(f"{t:.1f}")
+            elif (n, label) in started:
+                cells.append("[red]FAIL[/red]")
+                cells.append("[red]FAIL[/red]")
+            else:
+                cells.append("-")
+                cells.append("-")
         table.add_row(*cells)
     CONSOLE.print(table)
 

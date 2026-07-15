@@ -25,7 +25,12 @@ https://github.com/tuda-parallel/FTIO/blob/main/LICENSE
 import json
 import os
 
-from ftio.api.gekkoFs.jit.jit_plot import _mode_label, resolve_result_json, totals_by_node
+from ftio.api.gekkoFs.jit.jit_plot import (
+    _mode_label,
+    resolve_result_json,
+    started_runs,
+    totals_by_node,
+)
 from ftio.api.gekkoFs.jit.jitsettings import JitSettings
 from ftio.api.gekkoFs.jit.setup_helper import compose_log_dir
 
@@ -183,3 +188,23 @@ def test_totals_by_node_latest_timestamp_wins(tmp_path):
         ],
     )
     assert totals_by_node(j)[2]["glass"][0] == 9.0
+
+
+def test_started_runs_finds_attempted_modes(tmp_path):
+    for n, modes in [(9, ["glass", "pfs"]), (17, ["glass", "gekko", "pfs"])]:
+        for m in modes:
+            (tmp_path / f"nodes_{n}" / "rep_1" / m).mkdir(parents=True)
+    got = started_runs(str(tmp_path))
+    assert got == {
+        (8, "glass"),
+        (8, "pfs"),
+        (16, "glass"),
+        (16, "gekko"),
+        (16, "pfs"),
+    }
+
+
+def test_started_runs_ignores_non_mode_dirs(tmp_path):
+    (tmp_path / "nodes_9" / "rep_1" / "glass").mkdir(parents=True)
+    (tmp_path / "nodes_9" / "rep_1" / "logs_nodes9_Jobid0").mkdir(parents=True)
+    assert started_runs(str(tmp_path)) == {(8, "glass")}

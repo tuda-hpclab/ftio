@@ -460,9 +460,13 @@ class JitSettings:
                 self.app_flags = ""
         #  ├─ LAMMPS
         elif "lammps" in self.app:
-            # The GLASS driver deck: 142^3 -> 11.45 M atoms -> 1.008 GB per
-            # restart (88 B/atom), 8 phases ~27 s apart, tail keeps the app alive
-            # past the last checkpoint so FTIO can still predict it.
+            # The GLASS driver deck: 168^3 -> 18.97 M atoms -> 1.67 GB per
+            # restart (88 B/atom), 12 phases. Sized up from 142^3/8-phases so the
+            # app still runs long enough at 32 nodes (~40-60 s) for FTIO to see
+            # several checkpoint periods and flush during compute -- at the old
+            # size the 32-node run collapsed to 11 s and FTIO found no period.
+            # tail keeps the app alive past the last checkpoint. Scale x/y/z and
+            # phases/every together to retune (see Cluster Install BSC, section 4).
             # The old cluster setting pointed at /lustre/project/nhr-gekko (Mogon)
             # and ran in.spce.hex, which is a different experiment and cannot
             # resolve on BSC.
@@ -472,8 +476,8 @@ class JitSettings:
             ckptdir = self.gkfs_mntdir if not self.exclude_daemon else self.run_dir
             self.app_flags = self.resolve_app_flags(
                 f"-in {self.run_dir}/in.ckpt -v ckptdir {ckptdir} "
-                f"-v x 142 -v y 142 -v z 142 "
-                f"-v every 10 -v nb 10 -v phases 8 -v tail 5",
+                f"-v x 168 -v y 168 -v z 168 "
+                f"-v every 15 -v nb 15 -v phases 12 -v tail 8",
                 ckptdir,
             )
         #  ├─ DLIO
@@ -535,8 +539,11 @@ class JitSettings:
                 f"{self.home}/Castro/Exec/hydro_tests/Sedov", ["inputs.3d.sph"]
             )
             ckptdir = self.gkfs_mntdir if not self.exclude_daemon else self.run_dir
+            # max_step/check_int sized up (was 18/2 -> 9 phases) so the run lasts
+            # long enough at 32 nodes for FTIO; n_cell held at 160 so the many-file
+            # checkpoint stage-out does not grow (that path is the fragile one).
             self.app_flags = self.resolve_app_flags(
-                f"inputs.3d.sph max_step=18 amr.check_int=2 amr.plot_int=-1 "
+                f"inputs.3d.sph max_step=90 amr.check_int=6 amr.plot_int=-1 "
                 f"amr.max_level=0 castro.fixed_dt=4e-6 castro.init_shrink=1.0 "
                 f"amr.check_file={ckptdir}/sedov_3d_sph_chk amr.n_cell = 160 160 160",
                 ckptdir,
