@@ -16,9 +16,42 @@ https://github.com/tuda-parallel/FTIO/blob/main/LICENSE
 import argparse
 import json
 import os
-from pathlib import Path
 
 from ftio.api.gekkoFs.jit.jit_result import JitResult
+
+
+def resolve_result_json(arg: str, cwd: str | None = None) -> str:
+    """Turn a jit_plot argument into a path to a result.json.
+
+    Accepts, in order: a result.json file, a directory holding one, or a bare
+    app name (looked up under ./<app> then ./logs/<app>, the per-app layout jit
+    now writes). "" or "." means the current directory -- so `cd logs/lammps &&
+    jit_plot` just works.
+
+    Args:
+        arg: The user-supplied argument.
+        cwd: Base directory, injectable for testing (defaults to os.getcwd()).
+
+    Returns:
+        The resolved path to a result.json (may not exist, so the caller's open
+        error names a sensible path).
+    """
+    cwd = cwd or os.getcwd()
+    if not arg or arg == ".":
+        return os.path.join(cwd, "result.json")
+    p = arg if os.path.isabs(arg) else os.path.join(cwd, arg)
+    if os.path.isdir(p):
+        return os.path.join(p, "result.json")
+    if p.endswith(".json"):
+        return p
+    # bare app name: try ./<app>/result.json then ./logs/<app>/result.json
+    for cand in (
+        os.path.join(cwd, arg, "result.json"),
+        os.path.join(cwd, "logs", arg, "result.json"),
+    ):
+        if os.path.exists(cand):
+            return cand
+    return os.path.join(cwd, "logs", arg, "result.json")
 
 
 def plot_results(args):
@@ -29,6 +62,14 @@ def plot_results(args):
     Args:
         filenames (list): List of JSON file paths.
     """
+    # No argument: plot ./result.json if we are sitting inside a per-app folder.
+    if args and not args.filenames:
+        here = os.path.join(os.getcwd(), "result.json")
+        if os.path.exists(here):
+            results = JitResult()
+            extract_and_plot(results, here, here, no_diff=args.no_diff)
+            return
+
     if not args:
         results = JitResult()
         # # run with x nodes  128 procs [jit | jit_no_ftio | pure] (now in old folder)
@@ -91,13 +132,12 @@ def plot_results(args):
         extract_and_plot(results, json_file_path, title)
     else:
         for filename in args.filenames:
-            filename = str(Path(filename).resolve())
-            print(f"Processing file: {filename}")
+            # Resolve an app name / folder / result.json into the actual file.
+            json_file_path = resolve_result_json(filename)
+            print(f"Processing file: {json_file_path}")
             results = JitResult()
-            title = filename
+            title = json_file_path
             # title = ""
-            current_directory = os.getcwd()
-            json_file_path = os.path.join(current_directory, filename)
             extract_and_plot(results, json_file_path, title, no_diff=args.no_diff)
 
 
@@ -120,15 +160,18 @@ def extract_and_plot(
     # Sort the data by 'nodes'
     data = sorted(data, key=lambda x: x["nodes"])
 
+    # Drop the plot next to the result.json (the per-app logs/<app> folder).
+    save_dir = os.path.dirname(os.path.abspath(json_file_path))
+
     # Depending on the 'all' flag, process the data differently
     if no_diff:
         for d in data:
             results.add_dict(d)
-        results.plot(title)
+        results.plot(title, save_dir=save_dir)
     else:
         for d in data:
             results.add_all(d)
-        results.plot_all(title)
+        results.plot_all(title, save_dir=save_dir)
 
 
 def main():

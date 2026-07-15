@@ -192,7 +192,9 @@ class JitTime:
         else:
             data = {**self.to_dict(), **settings.to_dict()}
 
-        parent = os.path.dirname(settings.log_dir)
+        # result.json lives at the per-app level (logs/<app>), one file per app so
+        # a multi-app sweep does not overwrite entries that share nodes+mode.
+        parent = getattr(settings, "result_dir", "") or os.path.dirname(settings.log_dir)
         json_path = os.path.join(parent, "result.json")
 
         try:

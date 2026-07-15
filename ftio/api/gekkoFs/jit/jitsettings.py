@@ -54,6 +54,7 @@ class JitSettings:
         ################
         self.dry_run = False
         self.log_suffix = "DPCF"
+        self.mode_name = ""  # glass | gekko | pfs -- the run mode as a folder name
         self.run_dir = ""
         self.dir = ""
         self.cluster = False
@@ -83,6 +84,7 @@ class JitSettings:
         self.fuse = False
 
         self.log_dir = ""
+        self.result_dir = ""  # logs/<app> -- holds result.json + the plot
         self.gkfs_daemon_log = ""
         self.gkfs_daemon_err = ""
         self.gkfs_proxy_log = ""
@@ -286,12 +288,31 @@ class JitSettings:
             self.procs_ftio = 0
             self.log_suffix = self.log_suffix.replace("F", "")
 
+        self.mode_name = JitSettings.mode_label(self.exclude_daemon, self.exclude_ftio)
+
         if self.set_tasks_affinity:
             self.task_set_0 = f"taskset -c 0-{np.floor(self.procs / 2) - 1:.0f}"
             if self.procs - np.floor(self.procs / 2) >= self.procs_app:
                 self.task_set_1 = (
                     f"taskset -c {np.ceil(self.procs / 2):.0f}-{self.procs - 1:.0f}"
                 )
+
+    @staticmethod
+    def mode_label(exclude_daemon: bool, exclude_ftio: bool) -> str:
+        """Name the run mode from the exclude flags, for the log-dir layout.
+
+        The paper compares three: GLASS (GekkoFS + FTIO), GekkoFS-only (no FTIO),
+        and the plain parallel FS (`-x`). The exclude flags pin exactly these:
+
+        - no daemon (``-x`` sets exclude_all -> exclude_daemon)  -> ``pfs``
+        - daemon on, FTIO off (``-e cargo,ftio``)                -> ``gekko``
+        - daemon + FTIO on (``-e cargo``)                        -> ``glass``
+        """
+        if exclude_daemon:
+            return "pfs"
+        if exclude_ftio:
+            return "gekko"
+        return "glass"
 
     def set_log_dirs(self):
         self.gkfs_daemon_log = os.path.join(self.log_dir, "gekko_daemon.log")

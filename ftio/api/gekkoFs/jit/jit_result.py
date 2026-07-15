@@ -14,6 +14,8 @@ For more information, see the LICENSE file in the project root:
 https://github.com/tuda-parallel/FTIO/blob/main/LICENSE
 """
 
+import os
+
 import numpy as np
 import plotly.graph_objects as go
 from rich.console import Console
@@ -121,12 +123,14 @@ class JitResult:
         # self.add_experiment(tmp_app, tmp_stage_out, tmp_stage_in, f"# {nodes}")
         self.add_experiment(tmp_app, tmp_stage_out, tmp_stage_in, f"{nodes}")
 
-    def plot(self, title=""):
+    def plot(self, title="", save_dir=None):
         """
         Plot the experimental data stored in the JitResult object.
 
         Args:
             title (str): Title for the plot.
+            save_dir (str | None): If given, also write the figure there as
+                plot.html (used to drop the plot into the per-app logs/<app> folder).
         """
         # Sample data for the stacked plot
         categories = ["GLASS", "GekkoFs & Lustre", "Lustre"]
@@ -175,7 +179,7 @@ class JitResult:
         )
 
         stat(self.app, self.stage_out, self.stage_in, self.node)
-        self.format_and_show(fig, title, False)
+        self.format_and_show(fig, title, False, save_dir=save_dir)
 
     def format_and_show(
         self,
@@ -183,6 +187,7 @@ class JitResult:
         title: str = "",
         text: bool = True,
         barmode: str = "relative",
+        save_dir: str | None = None,
     ):
 
         if text:
@@ -275,6 +280,11 @@ class JitResult:
         #     )
         # )
 
+        if save_dir:
+            os.makedirs(save_dir, exist_ok=True)
+            out = os.path.join(save_dir, "plot.html")
+            fig.write_html(out)
+            CONSOLE.print(f"[green]Plot written to {out}[/]")
         fig.show()
 
     ######################
@@ -359,12 +369,13 @@ class JitResult:
             stats["stage_in"],
         )
 
-    def plot_all(self, title: str = ""):
+    def plot_all(self, title: str = "", save_dir: str | None = None):
         """
         Generate and plot all experimental data in a bar diagram with deviations (error bars).
 
         Args:
             title (str): Title for the plot.
+            save_dir (str | None): If given, also write the figure there as plot.html.
         """
         categories = ["GLASS", "Lustre & Gekko", "Lustre"]
         repeated_strings = [s for s in categories for _ in self.node]
@@ -466,7 +477,7 @@ class JitResult:
             stage_out_error_diff,
             stage_in_error_diff,
         )
-        self.format_and_show(fig, barmode="group", title=title)
+        self.format_and_show(fig, barmode="group", title=title, save_dir=save_dir)
 
 
 def add_mode(list1, list2):

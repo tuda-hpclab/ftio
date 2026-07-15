@@ -1394,6 +1394,37 @@ def shut_down(settings: JitSettings, name: str, pid: int) -> None:
     kill_process_tree(pid, signal.SIGTERM)
 
 
+def compose_log_dir(
+    app: str, nodes: int, mode: str, exists=os.path.exists
+) -> tuple[str, str]:
+    """Build the per-app log layout: ``logs/<app>/nodes_<n>/rep_<rep>/<mode>``.
+
+    Grouping the logs by app (then node count, repetition, and run mode) keeps
+    a multi-app sweep from clobbering itself: the old name held only nodes and
+    the job id, so two apps at the same size landed in the same directory. The
+    repetition is derived, not passed in -- ``rep`` is one past however many
+    times this exact (app, nodes, mode) has already run, so the three modes of
+    one sweep pass line up under the same ``rep_<n>``.
+
+    Args:
+        app: The application name (``-a``); falls back to ``app`` if empty.
+        nodes: The node count for the run.
+        mode: The run mode folder (``glass``/``gekko``/``pfs``).
+        exists: Existence probe, injectable for testing.
+
+    Returns:
+        (log_dir, result_dir): the leaf to run in, and ``logs/<app>`` where the
+        per-app ``result.json`` and plot live.
+    """
+    app = app or "app"
+    mode = mode or "run"
+    base = os.path.join("logs", app, f"nodes_{nodes}")
+    rep = 1
+    while exists(os.path.join(base, f"rep_{rep}", mode)):
+        rep += 1
+    return os.path.join(base, f"rep_{rep}", mode), os.path.join("logs", app)
+
+
 def log_dir(settings: JitSettings) -> None:
     """
     Create and set up the log directory.
@@ -1402,13 +1433,9 @@ def log_dir(settings: JitSettings) -> None:
         settings (JitSettings): The JIT settings object.
     """
     if not settings.log_dir:
-        # Define default LOG_DIR if not set
-        settings.log_dir = f"logs_nodes{settings.nodes}_Jobid{settings.job_id}"
-        # settings.gkfs_mntdir = f"{settings.gkfs_mntdir}_Jobid{settings.job_id}"
-        # settings.gkfs_rootdir = f"{settings.gkfs_rootdir}_Jobid{settings.job_id}"
-
-        if settings.log_suffix:
-            settings.log_dir += f"_{settings.log_suffix}"
+        settings.log_dir, settings.result_dir = compose_log_dir(
+            settings.app, settings.nodes, settings.mode_name
+        )
 
     counter = 0
     name = settings.log_dir
@@ -1418,6 +1445,8 @@ def log_dir(settings: JitSettings) -> None:
 
     # Resolve and return the absolute path of LOG_DIR
     settings.log_dir = os.path.abspath(settings.log_dir)
+    if settings.result_dir:
+        settings.result_dir = os.path.abspath(settings.result_dir)
 
     # Create directory if it does not exist
     os.makedirs(settings.log_dir, exist_ok=True)
