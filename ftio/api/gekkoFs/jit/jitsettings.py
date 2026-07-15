@@ -13,6 +13,7 @@ https://github.com/tuda-parallel/FTIO/blob/main/LICENSE
 
 import os
 import re
+import shutil
 import socket
 
 import numpy as np
@@ -445,7 +446,8 @@ class JitSettings:
             # and ran in.spce.hex, which is a different experiment and cannot
             # resolve on BSC.
             self.app_call = f"{self.home}/mylammps/build/lmp"
-            self.run_dir = f"{self.home}/mylammps/glass"
+            # installed in $HOME, but run from scratch -- see prepare_run_dir
+            self.run_dir = self.prepare_run_dir(f"{self.home}/mylammps/glass")
             ckptdir = self.gkfs_mntdir if not self.exclude_daemon else self.run_dir
             self.app_flags = self.resolve_app_flags(
                 f"-in {self.run_dir}/in.ckpt -v ckptdir {ckptdir} "
@@ -491,7 +493,11 @@ class JitSettings:
             # So the inputs stay on the parallel FS and only rst_outname points
             # into the mount.
             self.app_call = f"{self.home}/WRF/main/wrf.exe"
-            self.run_dir = f"{self.home}/WRF/test/em_b_wave_glass"
+            # WRF drops rsl.out.<rank> + rsl.error.<rank> in its cwd: never $HOME.
+            self.run_dir = self.prepare_run_dir(
+                f"{self.home}/WRF/test/em_b_wave_glass",
+                ["namelist.input", "wrfinput_d01"],
+            )
             self.app_flags = ""
             self.point_wrf_restarts_at(
                 self.gkfs_mntdir if not self.exclude_daemon else self.run_dir
@@ -504,7 +510,9 @@ class JitSettings:
             self.app_call = (
                 f"{self.home}/Castro/Exec/hydro_tests/Sedov/Castro3d.gnu.MPI.ex"
             )
-            self.run_dir = f"{self.home}/Castro/Exec/hydro_tests/Sedov"
+            self.run_dir = self.prepare_run_dir(
+                f"{self.home}/Castro/Exec/hydro_tests/Sedov", ["inputs.3d.sph"]
+            )
             ckptdir = self.gkfs_mntdir if not self.exclude_daemon else self.run_dir
             self.app_flags = self.resolve_app_flags(
                 f"inputs.3d.sph max_step=18 amr.check_int=2 amr.plot_int=-1 "
@@ -516,7 +524,7 @@ class JitSettings:
         elif "warpx" in self.app:
             # 10 checkpoint directories of ~484 MB, one every 10 steps.
             self.app_call = f"{self.home}/WarpX/build/bin/warpx.3d"
-            self.run_dir = f"{self.home}/WarpX/glass"
+            self.run_dir = self.prepare_run_dir(f"{self.home}/WarpX/glass", ["inputs"])
             ckptdir = self.gkfs_mntdir if not self.exclude_daemon else self.run_dir
             self.app_flags = self.resolve_app_flags(
                 f"inputs max_step=85 chk.intervals=10 diag1.intervals=1000 "
@@ -530,7 +538,7 @@ class JitSettings:
             # <project id> takes an absolute path, so the inputs stay on the
             # parallel FS and only the output goes into the mount.
             self.app_call = f"{self.home}/qmcpack/build/bin/qmcpack"
-            self.run_dir = f"{self.home}/qmcpack/glass_stagein"
+            self.run_dir = self.prepare_run_dir(f"{self.home}/qmcpack/glass_stagein")
             self.app_flags = "glass.xml"
             self.point_qmcpack_output_at(
                 self.gkfs_mntdir if not self.exclude_daemon else self.run_dir
@@ -953,6 +961,53 @@ class JitSettings:
                 f"write outside the mount and FTIO will see nothing.[/]"
             )
         return flags
+
+    def prepare_run_dir(self, deck_dir: str, files: list[str] | None = None) -> str:
+        """Copy an app's deck to scratch and return that as the run directory.
+
+        The apps are *installed* under $HOME, but they must not *run* there: the
+        cwd is where they drop their per-rank output. WRF alone writes
+        rsl.out.<rank> + rsl.error.<rank>, so a 16 x 112 job would land ~3600 files
+        in GPFS home -- which has a quota and is not meant for parallel I/O.
+
+        So the deck is copied to $STAGE_DIR/run/<app> and the app runs from there.
+        The install tree stays clean, and a rerun starts from a fresh copy.
+
+        Falls back to `deck_dir` when there is no tmp_dir (e.g. STAGE_DIR unset
+        locally), so nothing changes off the cluster.
+
+        Args:
+            deck_dir (str): Where the deck lives in the install tree.
+            files (list[str] | None): Which files to copy; None copies the lot.
+
+        Returns:
+            str: The directory the application should run in.
+        """
+        if not self.tmp_dir:
+            return deck_dir
+
+        run_dir = os.path.join(self.tmp_dir, "run", self.app)
+        try:
+            os.makedirs(run_dir, exist_ok=True)
+            names = files if files is not None else os.listdir(deck_dir)
+            for name in names:
+                src = os.path.join(deck_dir, name)
+                if os.path.isfile(src):
+                    shutil.copy2(src, os.path.join(run_dir, name))
+                elif files is not None:
+                    # Named explicitly, so its absence is a mistake, not a choice:
+                    # the app would start in an empty directory and fail obscurely.
+                    console.print(
+                        f"[bold red]Deck file missing: {src}. "
+                        f"{self.app} will run without it.[/]"
+                    )
+        except OSError as e:
+            console.print(
+                f"[yellow]Could not stage the deck into {run_dir} ({e}); "
+                f"running from {deck_dir} instead[/]"
+            )
+            return deck_dir
+        return run_dir
 
     def point_wrf_restarts_at(self, ckptdir: str) -> None:
         """Rewrite rst_outname in the WRF namelist so restarts land in `ckptdir`.
