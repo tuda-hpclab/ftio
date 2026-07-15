@@ -2602,18 +2602,19 @@ def get_env(settings: JitSettings, mode: str = "srun") -> str:
 
 
 def bandwidth_path(settings: JitSettings) -> str:
-    """Path FTIO's dump_json writes to (the predictor's cwd)."""
-    return os.path.join(os.path.dirname(settings.log_dir), "bandwidth.json")
+    """Where FTIO's dump_json writes bandwidth.json: the predictor cds into the
+    run's log dir first (see the predictor call in setup_core), so it lands here."""
+    return os.path.join(settings.log_dir, "bandwidth.json")
 
 
 def clear_bandwidth(settings: JitSettings) -> None:
     """
-    Drop a bandwidth.json left behind by an earlier run.
+    Drop any stale bandwidth.json in this run's log dir before FTIO starts.
 
-    save_bandwidth() copies that file into this run's log dir. If FTIO sees no
-    I/O at all (e.g. the app never wrote into the gkfs mount) no new file is
-    produced, and without this the log dir silently inherits the previous run's
-    trace -- which then looks like a valid result.
+    FTIO writes bandwidth.json into the log dir directly. The dir is fresh per
+    run so there is normally nothing to remove, but if FTIO sees no I/O at all
+    (e.g. the app never wrote into the gkfs mount) it produces no file -- this
+    guarantees a leftover can never be mistaken for this run's trace.
 
     Args:
         settings (JitSettings): The JIT settings object.
@@ -2626,24 +2627,21 @@ def clear_bandwidth(settings: JitSettings) -> None:
 
 def save_bandwidth(settings: JitSettings) -> None:
     """
-    Save bandwidth data to a file.
+    Verify FTIO produced a bandwidth trace in this run's log dir.
+
+    No copy is needed: the predictor cds into the log dir so dump_json writes
+    bandwidth.json there directly. This only warns when the file is absent.
 
     Args:
         settings (JitSettings): The JIT settings object.
     """
     if settings.exclude_ftio:
         return
-    src = bandwidth_path(settings)
-    if not os.path.exists(src):
+    if not os.path.exists(bandwidth_path(settings)):
         jit_print(
             "[yellow]No bandwidth.json was produced: FTIO captured no I/O. "
             "Does the application write into the gkfs mountdir?"
         )
-        return
-    try:
-        shutil.copy(src, os.path.join(settings.log_dir, "bandwidth.json"))
-    except Exception as e:
-        jit_print(f"[red]Error saving bandwidth:\n{e}")
 
 
 def parse_time(line: str) -> float | None:

@@ -574,7 +574,11 @@ def start_ftio(settings: JitSettings) -> None:
             jit_print(
                 f"[cyan]FTIO is listening node is {settings.address_ftio}:{settings.port_ftio} [/]"
             )
+            # cd into the run's log dir so FTIO's dump_json writes bandwidth.json
+            # straight there (its cwd), instead of into a shared RES_DIR to be
+            # copied afterwards -- see save_bandwidth.
             call = (
+                f"cd {settings.log_dir} && "
                 f"srun --jobid={settings.job_id} {settings.ftio_node_command} "
                 f"--disable-status -N 1 --ntasks=1 --cpus-per-task={settings.procs_ftio} "
                 f"--ntasks-per-node=1 --overcommit --overlap --oversubscribe --mem=0 "
@@ -582,7 +586,7 @@ def start_ftio(settings: JitSettings) -> None:
             )
         else:
             check_port(settings)
-            call = f"{settings.ftio_bin_location}/predictor_jit {ftio_data_staget_args} --  --zmq_address {settings.address_ftio} --zmq_port {settings.port_ftio} {settings.ftio_args} "
+            call = f"cd {settings.log_dir} && {settings.ftio_bin_location}/predictor_jit {ftio_data_staget_args} --  --zmq_address {settings.address_ftio} --zmq_port {settings.port_ftio} {settings.ftio_args} "
 
         jit_print("[cyan]Starting FTIO[/]")
 
