@@ -17,7 +17,65 @@ import argparse
 import json
 import os
 
+from rich.console import Console
+from rich.table import Table
+
 from ftio.api.gekkoFs.jit.jit_result import JitResult
+
+CONSOLE = Console()
+
+
+def _mode_label(mode: str) -> str:
+    """Map the JSON mode letters to a run label (matches add_dict's indexing)."""
+    if "F" in mode:
+        return "glass"
+    if "D" in mode:
+        return "gekko"
+    return "pfs"
+
+
+def totals_by_node(json_path: str) -> dict:
+    """Read a result.json into {compute_nodes: {label: (app, total)}}.
+
+    total = app + stage_in + stage_out. For each (nodes, mode) the latest entry
+    by timestamp wins, so reruns show the most recent number.
+    """
+    with open(json_path) as f:
+        data = json.load(f)
+    rows: dict = {}
+    for grp in data:
+        # jit reserves one node for FTIO, so compute nodes = nodes - 1
+        n = int(grp["nodes"]) - 1
+        latest: dict = {}
+        for e in grp.get("data", []):
+            label = _mode_label(e.get("mode", ""))
+            ts = e.get("timestamp", "")
+            if label not in latest or ts >= latest[label][0]:
+                latest[label] = (ts, e)
+        rows[n] = {
+            label: (e["app"], e["app"] + e["stage_in"] + e["stage_out"])
+            for label, (ts, e) in latest.items()
+        }
+    return rows
+
+
+def print_totals_table(json_path: str) -> None:
+    """Print a per-node app/total table (glass | gekko | pfs) to the console."""
+    rows = totals_by_node(json_path)
+    app = os.path.basename(os.path.dirname(os.path.abspath(json_path)))
+    table = Table(title=f"{app}  —  time in s (app | total = app+in+out)")
+    table.add_column("nodes", justify="right")
+    for label in ("glass", "gekko", "pfs"):
+        table.add_column(f"{label} app", justify="right")
+        table.add_column(f"{label} total", justify="right", style="bold")
+    for n in sorted(rows):
+        cells = [str(n)]
+        for label in ("glass", "gekko", "pfs"):
+            a, t = rows[n].get(label, (None, None))
+            cells.append("-" if a is None else f"{a:.1f}")
+            cells.append("-" if t is None else f"{t:.1f}")
+        table.add_row(*cells)
+    CONSOLE.print(table)
 
 
 def resolve_result_json(arg: str, cwd: str | None = None) -> str:
@@ -44,14 +102,14 @@ def resolve_result_json(arg: str, cwd: str | None = None) -> str:
         return os.path.join(p, "result.json")
     if p.endswith(".json"):
         return p
-    # bare app name: try ./<app>/result.json then ./logs/<app>/result.json
+    # bare app name: ./<app>/result.json (logs/<app> kept as a fallback for old runs)
     for cand in (
         os.path.join(cwd, arg, "result.json"),
         os.path.join(cwd, "logs", arg, "result.json"),
     ):
         if os.path.exists(cand):
             return cand
-    return os.path.join(cwd, "logs", arg, "result.json")
+    return os.path.join(cwd, arg, "result.json")
 
 
 def plot_results(args):
@@ -62,12 +120,14 @@ def plot_results(args):
     Args:
         filenames (list): List of JSON file paths.
     """
-    # No argument: plot ./result.json if we are sitting inside a per-app folder.
+    # No argument: use ./result.json if we are sitting inside a per-app folder.
     if args and not args.filenames:
         here = os.path.join(os.getcwd(), "result.json")
         if os.path.exists(here):
-            results = JitResult()
-            extract_and_plot(results, here, here, no_diff=args.no_diff)
+            if getattr(args, "table", False):
+                print_totals_table(here)
+            else:
+                extract_and_plot(JitResult(), here, here, no_diff=args.no_diff)
             return
 
     if not args:
@@ -134,11 +194,13 @@ def plot_results(args):
         for filename in args.filenames:
             # Resolve an app name / folder / result.json into the actual file.
             json_file_path = resolve_result_json(filename)
+            if getattr(args, "table", False):
+                print_totals_table(json_file_path)
+                continue
             print(f"Processing file: {json_file_path}")
-            results = JitResult()
-            title = json_file_path
-            # title = ""
-            extract_and_plot(results, json_file_path, title, no_diff=args.no_diff)
+            extract_and_plot(
+                JitResult(), json_file_path, json_file_path, no_diff=args.no_diff
+            )
 
 
 def extract_and_plot(
@@ -192,6 +254,13 @@ def main():
         "--no_diff",
         action="store_true",  # This stores True if the argument is provided, False otherwise
         help="Use the latest data based on the timestamp. Otherwise all data are plotted with error bars",
+        default=False,
+    )
+    parser.add_argument(
+        "-t",
+        "--table",
+        action="store_true",
+        help="Print a per-node app/total table to the console; no browser plot.",
         default=False,
     )
     args = parser.parse_args()

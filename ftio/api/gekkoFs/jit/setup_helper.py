@@ -1397,7 +1397,7 @@ def shut_down(settings: JitSettings, name: str, pid: int) -> None:
 def compose_log_dir(
     app: str, nodes: int, mode: str, exists=os.path.exists
 ) -> tuple[str, str]:
-    """Build the per-app log layout: ``logs/<app>/nodes_<n>/rep_<rep>/<mode>``.
+    """Build the per-app log layout: ``<app>/nodes_<n>/rep_<rep>/<mode>``.
 
     Grouping the logs by app (then node count, repetition, and run mode) keeps
     a multi-app sweep from clobbering itself: the old name held only nodes and
@@ -1413,16 +1413,16 @@ def compose_log_dir(
         exists: Existence probe, injectable for testing.
 
     Returns:
-        (log_dir, result_dir): the leaf to run in, and ``logs/<app>`` where the
+        (log_dir, result_dir): the leaf to run in, and ``<app>`` where the
         per-app ``result.json`` and plot live.
     """
     app = app or "app"
     mode = mode or "run"
-    base = os.path.join("logs", app, f"nodes_{nodes}")
+    base = os.path.join(app, f"nodes_{nodes}")
     rep = 1
     while exists(os.path.join(base, f"rep_{rep}", mode)):
         rep += 1
-    return os.path.join(base, f"rep_{rep}", mode), os.path.join("logs", app)
+    return os.path.join(base, f"rep_{rep}", mode), app
 
 
 def log_dir(settings: JitSettings) -> None:
