@@ -18,6 +18,7 @@ from __future__ import annotations
 import multiprocessing
 import os
 import re
+import signal
 import subprocess
 import time
 from datetime import datetime
@@ -761,6 +762,26 @@ def files_filtered(list_of_files: list[str], regex_pattern, verbose=True) -> lis
 #                     )
 
 
+def reset_signal_handlers_to_default() -> None:
+    """Restore SIGINT/SIGTERM/SIGHUP to their default disposition.
+
+    Called at the start of a forked monitor child. ``monitor_log_file`` forks via
+    multiprocessing, so the child inherits the SIGTERM handler that
+    ``install_signal_handlers`` installed on the parent -- and that handler runs
+    ``exit_routine``, which kills FTIO, the gkfs daemon and the FUSE client.
+    ``execute_block_and_monitor`` stops its monitors with ``Process.terminate()``
+    (SIGTERM) as normal cleanup, so without this reset each monitor tears the whole
+    run down: after DLIO's pre-app generation the two monitors killed FUSE, and the
+    parent's subsequent stage_in copy then died with
+    "Transport endpoint is not connected" on the dead mount.
+
+    The parent keeps its handler, so a real SIGTERM/Ctrl-C still cleans up.
+    """
+    for sig in (signal.SIGINT, signal.SIGTERM, getattr(signal, "SIGHUP", None)):
+        if sig is not None:
+            signal.signal(sig, signal.SIG_DFL)
+
+
 def print_file(file, src=""):
     """Continuously monitors the log file for new lines and prints them.
 
@@ -768,6 +789,9 @@ def print_file(file, src=""):
         file (str): absolute file path
         src (str): source of the file for colored output
     """
+    # Never let this forked monitor run the parent's teardown (see the helper).
+    reset_signal_handlers_to_default()
+
     logger = JIT_LOGGER
     newline = True
     wait_time = 0.0
