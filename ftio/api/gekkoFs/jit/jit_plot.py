@@ -87,10 +87,19 @@ def print_totals_table(json_path: str) -> None:
 
     A missing result.json means no mode ever recorded a result -- every attempted
     run is then a FAIL. Read it only if it exists so the table still prints (from
-    the on-disk log dirs) instead of crashing with FileNotFoundError.
+    the on-disk log dirs) instead of crashing with FileNotFoundError. A half-written
+    file (a run is appending to it right now) is treated the same way.
     """
     app_dir = os.path.dirname(os.path.abspath(json_path))
-    rows = totals_by_node(json_path) if os.path.exists(json_path) else {}
+    rows = {}
+    if os.path.exists(json_path):
+        try:
+            rows = totals_by_node(json_path)
+        except json.JSONDecodeError:
+            CONSOLE.print(
+                f"[yellow]{json_path} is being written right now; showing the "
+                f"on-disk runs only.[/yellow]"
+            )
     started = started_runs(app_dir)
     if not rows and not started:
         CONSOLE.print(f"[yellow]No results found under {app_dir}[/yellow]")
@@ -255,9 +264,27 @@ def extract_and_plot(
         title (str): Title for the plot.
         all (bool): Flag to control whether to call add_dict or add_all (default is False).
     """
+    # result.json only appears once a run finishes (it is appended after
+    # stage-out), so a job that is still in flight legitimately has none -- and a
+    # job writing it right now can be caught mid-append. Neither should end in a
+    # traceback.
+    if not os.path.exists(json_file_path):
+        CONSOLE.print(
+            f"[yellow]No result.json at {json_file_path} -- nothing to plot yet "
+            f"(is the run still in progress?). Use -t for the per-run table.[/yellow]"
+        )
+        return
+
     # Open the file and load the JSON data
-    with open(json_file_path) as json_file:
-        data = json.load(json_file)
+    try:
+        with open(json_file_path) as json_file:
+            data = json.load(json_file)
+    except json.JSONDecodeError as e:
+        CONSOLE.print(
+            f"[yellow]{json_file_path} is not valid JSON yet ({e}); a run is "
+            f"probably still writing it. Try again once it finishes.[/yellow]"
+        )
+        return
 
     # Sort the data by 'nodes'
     data = sorted(data, key=lambda x: x["nodes"])

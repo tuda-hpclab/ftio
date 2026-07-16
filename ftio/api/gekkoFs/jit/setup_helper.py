@@ -1941,9 +1941,14 @@ def elapsed_time(
     # console.print(log_message)
     jit_print(log_message)
 
-    # Write to log file
+    # Write to log file. print_to_file appends verbatim, and log_message ends
+    # without a newline -- consecutive blocks only looked right because the next
+    # one starts with "\n". The last block is followed by the run summary, which
+    # then ran onto the same line ("##############################App time ...").
+    # Write a self-terminating block instead: drop the leading newline, add a
+    # trailing one. Console output is unchanged.
     print_to_file(
-        log_message,
+        log_message.lstrip("\n") + "\n",
         os.path.join(settings.log_dir, "time.log"),
     )
 
