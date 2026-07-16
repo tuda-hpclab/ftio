@@ -84,10 +84,18 @@ def print_totals_table(json_path: str) -> None:
 
     Cells: numbers when the run finished, red FAIL when it started but never
     recorded a result (stage-out hang / crash), "-" when never attempted.
+
+    A missing result.json means no mode ever recorded a result -- every attempted
+    run is then a FAIL. Read it only if it exists so the table still prints (from
+    the on-disk log dirs) instead of crashing with FileNotFoundError.
     """
-    rows = totals_by_node(json_path)
-    started = started_runs(os.path.dirname(os.path.abspath(json_path)))
-    app = os.path.basename(os.path.dirname(os.path.abspath(json_path)))
+    app_dir = os.path.dirname(os.path.abspath(json_path))
+    rows = totals_by_node(json_path) if os.path.exists(json_path) else {}
+    started = started_runs(app_dir)
+    if not rows and not started:
+        CONSOLE.print(f"[yellow]No results found under {app_dir}[/yellow]")
+        return
+    app = os.path.basename(app_dir)
     table = Table(title=f"{app}  —  time in s (app | total = app+in+out)")
     table.add_column("nodes", justify="right")
     for label in ("glass", "gekko", "pfs"):

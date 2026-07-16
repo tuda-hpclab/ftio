@@ -1567,15 +1567,7 @@ def set_dir_gekko(settings: JitSettings) -> None:
             with open(file_path) as file:
                 content = file.read()
 
-            # Single regex to replace both key-value pair and standalone path
-            updated_content = re.sub(
-                r'(/[^"]*_gkfs_mountdir)(/[^"]*)',  # old: r'(/[^"]*tarraf_gkfs_mountdir)(/[^"]*)',
-                lambda match: (
-                    f"{settings.gkfs_mntdir}{match.group(2)}"
-                ),  # Replace with 'settings.gkfs_mntdir' and preserve the rest
-                content,
-            )
-            # print(updated_content)
+            updated_content = repoint_mntdir_in_text(content, settings.gkfs_mntdir)
 
             with open(file_path, "w") as file:
                 file.write(updated_content)
@@ -1583,6 +1575,30 @@ def set_dir_gekko(settings: JitSettings) -> None:
                 jit_print(
                     f" |-> File updated: {file_path}",
                 )
+
+
+def repoint_mntdir_in_text(content: str, new_mntdir: str) -> str:
+    """Rewrite every ``<old>_gkfs_mountdir/<rest>`` path to ``<new_mntdir>/<rest>``.
+
+    Re-points files (QMCPACK glass.xml, WRF namelist, wacom json) that were written
+    with the default mount dir before :func:`set_dir_gekko` finalized it to
+    node-local scratch. The character class stops at quotes and whitespace, so it
+    is safe for double-quoted (XML/JSON) and single-quoted (Fortran namelist)
+    values alike -- a greedy ``[^"]*`` would swallow a namelist's closing ``'`` and
+    the rest of the line.
+
+    Args:
+        content: The file text to rewrite.
+        new_mntdir: The finalized GekkoFS mount directory.
+
+    Returns:
+        The text with every mount-dir path re-pointed at ``new_mntdir``.
+    """
+    return re.sub(
+        r"(/[^\"'\s]*_gkfs_mountdir)(/[^\"'\s]*)",
+        lambda match: f"{new_mntdir}{match.group(2)}",
+        content,
+    )
 
 
 def save_hosts_file(settings: JitSettings):

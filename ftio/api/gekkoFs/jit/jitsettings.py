@@ -1065,6 +1065,15 @@ class JitSettings:
             if rewritten != lines:
                 with open(namelist, "w") as f:
                     f.write("\n".join(rewritten) + "\n")
+            # set_dir_gekko finalizes gkfs_mntdir to node-local scratch AFTER this
+            # runs, so rst_outname still holds the default mount dir. Register the
+            # namelist so the mntdir-rewrite pass corrects it; otherwise WRF writes
+            # its restarts to a non-existent dir.
+            if (
+                "_gkfs_mountdir" in ckptdir
+                and namelist not in self.update_files_with_gkfs_mntdir
+            ):
+                self.update_files_with_gkfs_mntdir.append(namelist)
         except OSError as e:
             console.print(f"[yellow]Could not set rst_outname in {namelist}: {e}[/]")
 
@@ -1091,6 +1100,15 @@ class JitSettings:
             if rewritten != text:
                 with open(xml, "w") as f:
                     f.write(rewritten)
+            # set_dir_gekko finalizes gkfs_mntdir to node-local scratch AFTER this
+            # runs, so the path just written still holds the default mount dir.
+            # Register the file so the mntdir-rewrite pass corrects it; otherwise
+            # QMCPACK writes to a non-existent dir and aborts ("cannot open file").
+            if (
+                "_gkfs_mountdir" in ckptdir
+                and xml not in self.update_files_with_gkfs_mntdir
+            ):
+                self.update_files_with_gkfs_mntdir.append(xml)
         except OSError as e:
             console.print(f"[yellow]Could not set the project id in {xml}: {e}[/]")
 

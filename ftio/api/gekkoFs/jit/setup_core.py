@@ -660,9 +660,16 @@ def stage_in(settings: JitSettings, runtime: JitTime) -> None:
                 )
                 > 0
             ):
+                # Copy the directory *contents* with `/.`, not the `/*` glob: when
+                # stage-in holds no real inputs (e.g. DLIO generates its dataset
+                # straight into the mount) the shell leaves `/*` unexpanded and cp
+                # aborts with "failed to access .../stage-in/*", which raised out of
+                # stage_in and killed the whole run before the app ever launched.
+                # `cp -r <dir>/. <dst>` copies the contents and is a no-op-safe when
+                # the directory is empty.
                 call = flaged_call(
                     settings,
-                    f"cp  -r {settings.stage_in_path}/* {settings.gkfs_mntdir}",
+                    f"cp  -r {settings.stage_in_path}/. {settings.gkfs_mntdir}",
                     exclude=["ftio"],
                 )
                 # or faster
@@ -680,7 +687,8 @@ def stage_in(settings: JitSettings, runtime: JitTime) -> None:
                 # )
 
             start = time.time()
-            _ = execute_block(call, dry_run=settings.dry_run)
+            if call:
+                _ = execute_block(call, dry_run=settings.dry_run)
         # TODO: fix cpp cargo
         else:
             if settings.cluster:
