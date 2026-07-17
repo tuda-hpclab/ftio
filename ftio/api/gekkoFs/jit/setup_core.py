@@ -790,6 +790,28 @@ def flushable_bytes(settings: JitSettings) -> int:
         return -1
 
 
+def staged_bytes(settings: JitSettings) -> int:
+    """Bytes already at the stage-out destination, or -1 if it cannot be read.
+
+    The destination is on the parallel FS, so no preload is needed.
+
+    Args:
+        settings (JitSettings): The JIT settings.
+
+    Returns:
+        int: Total size of the files at the destination, -1 when the listing failed.
+    """
+    try:
+        raw = subprocess.check_output(
+            f"du -sb {settings.stage_out_path} 2>/dev/null | cut -f1",
+            shell=True,
+            stderr=subprocess.DEVNULL,
+        )
+        return int(raw.decode().strip() or 0)
+    except Exception:
+        return -1
+
+
 def wait_for_flush_to_settle(
     settings: JitSettings, timeout: float = 120.0, poll: float = 2.0
 ) -> None:
@@ -801,8 +823,10 @@ def wait_for_flush_to_settle(
     the post-app sweep, which then aborts and loses whatever was still in the
     mount (this is how WarpX's chk000085 was lost).
 
-    Poll until the mount stops shrinking: either it empties, or two consecutive
-    polls report the same number of bytes, meaning no flush is making progress.
+    A copy in flight leaves the mount unchanged (move_item deletes only after the
+    copy completes), so a shrinking mount is not the only progress signal: the
+    destination grows while a copy runs. Settled therefore means the mount AND the
+    stage-out destination are both unchanged across two polls.
 
     Args:
         settings (JitSettings): The JIT settings.
@@ -810,20 +834,20 @@ def wait_for_flush_to_settle(
         poll (float): Seconds between polls.
     """
     deadline = time.time() + timeout
-    previous = -1
+    previous = (-1, -1)
     while time.time() < deadline:
-        current = flushable_bytes(settings)
-        if current < 0:
+        current = (flushable_bytes(settings), staged_bytes(settings))
+        if current[0] < 0:
             # Could not size the mount. Neither exit condition can match a negative,
             # so waiting on it burns the whole timeout for nothing.
             jit_print("[yellow]Could not size the mount; staging out what is there")
             return
-        if current == 0:
+        if current[0] == 0:
             jit_print("[cyan]FTIO drained the mount, nothing left to stage out")
             return
         if current == previous:
             jit_print(
-                f"[cyan]FTIO flush settled with {format_size(current)} left;"
+                f"[cyan]FTIO flush settled with {format_size(current[0])} left;"
                 " staging the remainder"
             )
             return
