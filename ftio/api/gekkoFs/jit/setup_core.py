@@ -813,10 +813,15 @@ def wait_for_flush_to_settle(
     previous = -1
     while time.time() < deadline:
         current = flushable_bytes(settings)
+        if current < 0:
+            # Could not size the mount. Neither exit condition can match a negative,
+            # so waiting on it burns the whole timeout for nothing.
+            jit_print("[yellow]Could not size the mount; staging out what is there")
+            return
         if current == 0:
             jit_print("[cyan]FTIO drained the mount, nothing left to stage out")
             return
-        if current > 0 and current == previous:
+        if current == previous:
             jit_print(
                 f"[cyan]FTIO flush settled with {format_size(current)} left;"
                 " staging the remainder"
@@ -855,15 +860,10 @@ def stage_out(settings: JitSettings, runtime: JitTime) -> None:
             #     f"cp -r  {settings.gkfs_mntdir} {settings.stage_out_path} || echo 'nothing to stage out'",
             #     exclude=["ftio"],
             # )
+            # FTIO is already down: start_application waits for the flush to settle
+            # and shuts it down on this same path. Timing only jit_move keeps this
+            # comparable with the gekko run, which has no FTIO to tear down.
             start = time.time()
-            # _ = execute_block(call, dry_run=settings.dry_run)
-
-            #  give ftio slightly more time to finish moving
-            if not settings.exclude_ftio:
-                wait_for_flush_to_settle(settings)
-                jit_print("[cyan]Shutting down FTIO as application finished")
-                shut_down(settings, "FTIO", settings.ftio_pid)
-
             jit_move(settings)
             elapsed_time(settings, runtime, "Stage out", time.time() - start)
         else:
@@ -1200,6 +1200,10 @@ def start_application(settings: JitSettings, runtime: JitTime):
             exit_routine(settings)
 
     if not settings.exclude_ftio and settings.exclude_cargo:
+        # Let a flush that is mid-copy finish before FTIO dies. move_item copies
+        # then deletes, so killing it here loses no data -- but it throws the
+        # partial copy away and the post-app stage-out redoes it from scratch.
+        wait_for_flush_to_settle(settings)
         jit_print("[cyan]Shuting down FTIO as application finished")
         shut_down(settings, "FTIO", settings.ftio_pid)
 

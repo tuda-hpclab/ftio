@@ -166,8 +166,8 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install pytest pytest-cov
-          pip install --upgrade .[external-libs,development-libs,plot-libs,amd-libs,ml-libs] || pip install --upgrade . --no-cache-dir
-      # pip install --upgrade .[external-libs,ml-libs,darshan-libs] || pip install --upgrade . --no-cache-dir
+          pip install --upgrade .[external-libs,development-libs,plot-libs,amd-libs] || pip install --upgrade . --no-cache-dir
+      #          pip install --upgrade .[external-libs,development-libs,plot-libs,amd-libs,ml-libs] || pip install --upgrade . --no-cache-dir
 
       - name: Run tests with coverage
         run: |
