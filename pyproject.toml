@@ -28,7 +28,8 @@ dependencies = [
     "pytest",
     "pytest-cov",
     "fastcluster",
-    "requests"
+    "requests",
+    "matplotlib"
 ]
 
 requires-python = ">=3.8"
@@ -101,16 +102,10 @@ external-libs = [
     "colorlog",
 ]
 
-# Only needed to read Darshan traces. The package installs everywhere but its cffi
-# backend needs the darshan-util C library, which pip does not ship -- on 3.13/3.14
-# that made importing FTIO at all fail while darshan sat in the core dependencies.
+# Only needed to read Darshan traces.
 # Keep it opt-in: `pip install .[darshan-libs]` (plus darshan-util on the system).
 darshan-libs = [
     "darshan",
-]
-
-gui = [
-    "dash",
 ]
 
 development-libs = [
