@@ -477,7 +477,9 @@ class JitSettings:
             self.app_flags = self.resolve_app_flags(
                 f"-in {self.run_dir}/in.ckpt -v ckptdir {ckptdir} "
                 f"-v x 168 -v y 168 -v z 168 "
-                f"-v every 15 -v nb 15 -v phases 12 -v tail 8",
+                # 54 phases: nsteps = phases*every + tail = 818 = ~100 s at 8 compute
+                # nodes (0.12 s/step measured in 43420026), 54 restarts x 1.67 GB.
+                f"-v every 15 -v nb 15 -v phases 54 -v tail 8",
                 ckptdir,
             )
         #  ├─ DLIO
