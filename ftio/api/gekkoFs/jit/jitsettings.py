@@ -125,7 +125,11 @@ class JitSettings:
 
         self.nodes = 1
         self.max_time = None
-        self.ftio_args = "-m write -v --freq 10 --ingest-workers 4 "
+        # -au merges autocorrelation into the DFT prediction: on jittery signals
+        # (qmc and warpx drift by design) DFT alone can find no dominant frequency
+        # at all, while the merged result recovers it and lifts confidence past the
+        # 0.5 flush threshold sooner (scratchpad/periodic_check.py).
+        self.ftio_args = "-m write -v --freq 10 --ingest-workers 4 -au "
         self.gkfs_daemon_protocol = (
             "ofi+verbs"  # "ofi+verbs" #"ofi+sockets"  or "ofi+verbs"
         )
@@ -562,9 +566,13 @@ class JitSettings:
             self.app_call = f"{self.home}/WarpX/build/bin/warpx.3d"
             self.run_dir = self.prepare_run_dir(f"{self.home}/WarpX/glass", ["inputs"])
             ckptdir = self.gkfs_mntdir if not self.exclude_daemon else self.run_dir
+            # n_cell 128 -> 192 (~3.4x cells): 20 checkpoints of ~484 MB totalled
+            # 9.7 GB against an 830 s app -- gekko staged it in 1.5 s, so the FS was
+            # invisible. ~1.6 GB per checkpoint (~32 GB total) makes the I/O matter.
+            # Only knob changed; steps/intervals stay from the last calibration.
             self.app_flags = self.resolve_app_flags(
                 f"inputs max_step=40 chk.intervals=2 diag1.intervals=1000 "
-                f"chk.file_prefix={ckptdir}/chk amr.n_cell = 128 128 128",
+                f"chk.file_prefix={ckptdir}/chk amr.n_cell = 192 192 192",
                 ckptdir,
             )
         #  └─ QMCPACK
