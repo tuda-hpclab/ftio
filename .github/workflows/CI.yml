@@ -79,11 +79,48 @@ jobs:
             ${{ runner.os }}-pip-${{ matrix.python-version }}-
             ${{ runner.os }}-pip-
 
+      # The darshan wheel lags new Python releases (there is none for 3.13/3.14),
+      # which is why darshan is an opt-in extra rather than a core dependency. Ask
+      # pip whether it can resolve one for THIS interpreter, so the matrix still
+      # covers the Darshan path wherever it is installable instead of dropping it
+      # everywhere.
+      - name: Check whether darshan is installable on this Python
+        id: darshan
+        run: |
+          if pip install --dry-run darshan >/dev/null 2>&1; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+            echo "darshan wheel resolves for Python ${{ matrix.python-version }}"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "no darshan wheel for Python ${{ matrix.python-version }} -- installing without it"
+          fi
+
+      # Uncomment to test the Darshan path on 3.13/3.14 too: darshan-util from
+      # source gives the C library, which is what the pip package lacks a wheel for.
+      # - name: Install System Darshan-util (Python 3.13+)
+      #   if: matrix.python-version == '3.13' || matrix.python-version == '3.14'
+      #   run: |
+      #     wget https://github.com/darshan-hpc/darshan/archive/refs/tags/3.4.4.tar.gz -O darshan.tar.gz
+      #     tar -xzf darshan.tar.gz
+      #     cd darshan-3.4.4/darshan-util
+      #     ./configure --prefix=/usr
+      #     make -j$(nproc)
+      #     sudo make install
+      #     sudo ldconfig
+
       - name: Install dependencies
+        env:
+          DARSHAN_AVAILABLE: ${{ steps.darshan.outputs.available }}
         run: |
           python -m pip install --upgrade pip
           pip install pytest
-          pip install --upgrade .[external-libs] || pip install --upgrade . --no-cache-dir
+          if [ "$DARSHAN_AVAILABLE" = "true" ]; then
+            EXTRAS="external-libs,darshan-libs"
+          else
+            EXTRAS="external-libs"
+          fi
+          echo "Installing FTIO with extras: $EXTRAS"
+          pip install --upgrade ".[$EXTRAS]" || pip install --upgrade . --no-cache-dir
 
       - name: Run tests
         run: |

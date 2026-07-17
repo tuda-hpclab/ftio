@@ -168,7 +168,16 @@ pip install '.[external-libs,development-libs]'
 
 #Or with external dependencies, style tools, and plot libs (to call `ioplot` with dash support) 
 pip install '.[external-libs,development-libs,plot-libs]'
+
+#Or with Darshan support (only needed to read Darshan traces)
+pip install '.[darshan-libs]'
 ```
+
+> [!note]
+> **Darshan traces** need the optional `darshan-libs` extra. Without it, FTIO works
+> normally and only tells you to install it if you actually hand it a Darshan trace.
+> The `darshan` wheel has no release for Python 3.13/3.14 yet; on those versions
+> build [darshan-util](https://github.com/darshan-hpc/darshan) from source instead.
 
 > [!note]
 > You need to activate the environment to use `ftio` and the other tools using:

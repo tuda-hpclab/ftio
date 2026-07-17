@@ -16,7 +16,6 @@ dependencies = [
     "scikit-learn",
     "pyzmq",
     "numba",
-    "darshan",
     "scipy",
     "pandas",
     "orjson",
@@ -100,6 +99,13 @@ external-libs = [
     "fastdtw",
     "flask",
     "colorlog",
+]
+
+# Darshan is only needed to read Darshan traces, and the `darshan` wheel lags new
+# Python releases (none for 3.13/3.14), which broke installing FTIO at all while
+# it sat in the core dependencies. Keep it opt-in: `pip install .[darshan-libs]`.
+darshan-libs = [
+    "darshan",
 ]
 
 gui = [

@@ -16,12 +16,30 @@ For more information, see the LICENSE file in the project root:
 https://github.com/tuda-parallel/FTIO/blob/main/LICENSE
 """
 
+import importlib.util
 import sys
 import time
 
-import darshan
 import pandas as pd
 from rich.console import Console
+
+# Check if darshan is available. It is an optional dependency: the `darshan` wheel
+# lags new Python releases (none exists for 3.13/3.14), and this module is imported
+# unconditionally via ftio.parse.scales -> parse_darshan, so a hard import would
+# make every FTIO command unusable on those versions just to read Darshan traces.
+DARSHAN_AVAILABLE: bool = importlib.util.find_spec("darshan") is not None
+if DARSHAN_AVAILABLE:
+    import darshan
+
+DARSHAN_MISSING_MSG = (
+    "Reading a Darshan trace needs the optional 'darshan' package, which is not "
+    "installed.\nInstall FTIO with Darshan support:\n"
+    "    pip install 'ftio-hpc[darshan-libs]'\n"
+    "or, from a clone:\n"
+    "    pip install '.[darshan-libs]'\n"
+    "Note: the darshan wheel has no release for Python 3.13/3.14 yet -- on those "
+    "versions install darshan-util from source (see the README, External Libraries)."
+)
 
 
 def extract(path, args) -> tuple[dict, int]:
@@ -59,6 +77,9 @@ def extract_data(path: str, args) -> tuple[list, int, dict]:
     Returns:
         _type_: tuple[dataframe,int]
     """
+    if not DARSHAN_AVAILABLE:
+        raise ImportError(DARSHAN_MISSING_MSG)
+
     start = time.time()
     total_time = {}
     with darshan.DarshanReport(path, read_all=True) as report:
