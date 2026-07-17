@@ -539,23 +539,28 @@ class JitSettings:
                 f"{self.home}/Castro/Exec/hydro_tests/Sedov", ["inputs.3d.sph"]
             )
             ckptdir = self.gkfs_mntdir if not self.exclude_daemon else self.run_dir
-            # max_step/check_int sized up (was 18/2 -> 9 phases) so the run lasts
-            # long enough at 32 nodes for FTIO; n_cell held at 160 so the many-file
-            # checkpoint stage-out does not grow (that path is the fragile one).
+            # 4x max_step (90 -> 360) with check_int scaled to match keeps 15 phases
+            # but lifts the 32-node app from ~15 s to ~60 s: at 15 s the run is over
+            # before overlapping stage-out can pay for itself. n_cell held at 160 so
+            # the many-file checkpoint stage-out does not grow (that path is fragile).
             self.app_flags = self.resolve_app_flags(
-                f"inputs.3d.sph max_step=90 amr.check_int=6 amr.plot_int=-1 "
+                f"inputs.3d.sph max_step=360 amr.check_int=24 amr.plot_int=-1 "
                 f"amr.max_level=0 castro.fixed_dt=4e-6 castro.init_shrink=1.0 "
                 f"amr.check_file={ckptdir}/sedov_3d_sph_chk amr.n_cell = 160 160 160",
                 ckptdir,
             )
         #  ├─ WarpX (AMReX)
         elif "warpx" in self.app:
-            # 10 checkpoint directories of ~484 MB, one every 10 steps.
+            # WarpX was compute-bound to the point of hiding the FS entirely: 830 s
+            # of app against 6 s of stage-out, so glass/gekko/pfs came out within 5%
+            # of each other. Halve the compute (max_step 85 -> 40) and checkpoint 5x
+            # more often (every 2 steps -> 20 dirs), which raises the I/O fraction
+            # by ~10x. n_cell stays at 128 so a checkpoint dir remains ~484 MB.
             self.app_call = f"{self.home}/WarpX/build/bin/warpx.3d"
             self.run_dir = self.prepare_run_dir(f"{self.home}/WarpX/glass", ["inputs"])
             ckptdir = self.gkfs_mntdir if not self.exclude_daemon else self.run_dir
             self.app_flags = self.resolve_app_flags(
-                f"inputs max_step=85 chk.intervals=10 diag1.intervals=1000 "
+                f"inputs max_step=40 chk.intervals=2 diag1.intervals=1000 "
                 f"chk.file_prefix={ckptdir}/chk amr.n_cell = 128 128 128",
                 ckptdir,
             )
@@ -1135,10 +1140,14 @@ class JitSettings:
             self.regex_stage_in_match = ".*"
         # ├─ DLIO
         elif "dlio" in self.app_call:
-            # self.regex_flush_match = ".*/(checkpoints)/.*\\.pt$"
-            # self.regex_stage_out_match = ".*/(checkpoints)/.*\\.pt$"
-            self.regex_flush_match = ".*/(checkpoints)/.*"
-            self.regex_stage_out_match = ".*/(checkpoints)/.*"
+            # The lookahead makes the per-epoch dir a single flush unit (as castro
+            # does); the second alternative keeps the flat checkpoints/*.pt layout.
+            self.regex_flush_match = (
+                ".*/checkpoints/global_epoch\\d+_step\\d+(?=/)|.*/(checkpoints)/.*"
+            )
+            self.regex_stage_out_match = (
+                ".*/checkpoints/global_epoch\\d+_step\\d+(?=/)|.*/(checkpoints)/.*"
+            )
             self.regex_stage_in_match = ".*"
         # ├─ LAMMPS
         elif "lmp" in self.app_call:

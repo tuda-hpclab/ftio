@@ -305,10 +305,33 @@ def get_items_to_submit(files: list, args: argparse.Namespace, mode: str = "file
                         TRIGGER_LOGGER.debug(
                             f"Will move {len(matching_files_in_folder)} files from {folder}"
                         )
+        items_to_submit = drop_nested_items(items_to_submit)
     else:
         items_to_submit = files
 
     return items_to_submit
+
+
+def drop_nested_items(items: list[str]) -> list[str]:
+    """Drop items that live inside another item, keeping the outermost.
+
+    Folders are grouped by immediate parent, so a checkpoint whose entries are
+    themselves directories (TensorFlow writes <epoch>/model_states-N_temp/<shards>)
+    yields both the epoch dir and every model_states dir. Staging both copies the
+    same bytes twice.
+
+    Args:
+        items (list[str]): Items selected for staging.
+
+    Returns:
+        list[str]: The items with any descendant of another item removed.
+    """
+    unique = list(dict.fromkeys(items))  # de-duplicate, keeping the caller's order
+    return [
+        item
+        for item in unique
+        if not any(item.startswith(f"{other}/") for other in unique if other != item)
+    ]
 
 
 def newest_mtime(args: argparse.Namespace, item: str) -> float:
