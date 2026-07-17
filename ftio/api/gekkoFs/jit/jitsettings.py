@@ -539,13 +539,13 @@ class JitSettings:
                 f"{self.home}/Castro/Exec/hydro_tests/Sedov", ["inputs.3d.sph"]
             )
             ckptdir = self.gkfs_mntdir if not self.exclude_daemon else self.run_dir
-            # 30 checkpoint phases: with 15 (max_step=360) the app ended while FTIO
-            # was still building confidence (P(periodic) reached only 25% after 4
-            # predictions in 43418762 -> zero runtime flushes -> glass cannot beat
-            # gekko). n_cell held at 160 so the many-file checkpoint stage-out does
-            # not grow (that path is fragile).
+            # 60 checkpoint phases. FTIO needs ~40 s of signal to lock on (43420026:
+            # P(periodic) hit 88.9% at prediction #8, but the 50 s / 30-phase app was
+            # already ending -> zero runtime flushes). Locking at ~40 s into a ~100 s
+            # run leaves half the checkpoints to flush during compute. n_cell held at
+            # 160 so the many-file checkpoint stage-out does not grow (fragile path).
             self.app_flags = self.resolve_app_flags(
-                f"inputs.3d.sph max_step=720 amr.check_int=24 amr.plot_int=-1 "
+                f"inputs.3d.sph max_step=1440 amr.check_int=24 amr.plot_int=-1 "
                 f"amr.max_level=0 castro.fixed_dt=4e-6 castro.init_shrink=1.0 "
                 f"amr.check_file={ckptdir}/sedov_3d_sph_chk amr.n_cell = 160 160 160",
                 ckptdir,
