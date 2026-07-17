@@ -29,7 +29,8 @@ dependencies = [
     "pytest-cov",
     "fastcluster",
     "requests",
-    "matplotlib"
+    "matplotlib",
+    "seaborn"
 ]
 
 requires-python = ">=3.8"
