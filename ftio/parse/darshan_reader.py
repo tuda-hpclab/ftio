@@ -23,10 +23,9 @@ import time
 import pandas as pd
 from rich.console import Console
 
-# Check if darshan is available. It is an optional dependency: the `darshan` wheel
-# lags new Python releases (none exists for 3.13/3.14), and this module is imported
-# unconditionally via ftio.parse.scales -> parse_darshan, so a hard import would
-# make every FTIO command unusable on those versions just to read Darshan traces.
+# darshan is optional: this module is imported unconditionally via
+# ftio.parse.scales -> parse_darshan, so a hard import made every FTIO command
+# unusable wherever darshan is missing or broken, just to read Darshan traces.
 DARSHAN_AVAILABLE: bool = importlib.util.find_spec("darshan") is not None
 if DARSHAN_AVAILABLE:
     import darshan
@@ -37,8 +36,9 @@ DARSHAN_MISSING_MSG = (
     "    pip install 'ftio-hpc[darshan-libs]'\n"
     "or, from a clone:\n"
     "    pip install '.[darshan-libs]'\n"
-    "Note: the darshan wheel has no release for Python 3.13/3.14 yet -- on those "
-    "versions install darshan-util from source (see the README, External Libraries)."
+    "The package also needs the darshan-util C library: pip installs the Python "
+    "bindings but not the library, so on Python 3.13/3.14 build darshan-util from "
+    "source as well (see the README, Installation)."
 )
 
 

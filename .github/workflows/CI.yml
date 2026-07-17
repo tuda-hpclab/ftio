@@ -79,20 +79,21 @@ jobs:
             ${{ runner.os }}-pip-${{ matrix.python-version }}-
             ${{ runner.os }}-pip-
 
-      # The darshan wheel lags new Python releases (there is none for 3.13/3.14),
-      # which is why darshan is an opt-in extra rather than a core dependency. Ask
-      # pip whether it can resolve one for THIS interpreter, so the matrix still
-      # covers the Darshan path wherever it is installable instead of dropping it
-      # everywhere.
-      - name: Check whether darshan is installable on this Python
+      # darshan installs happily on 3.13/3.14 and then dies on import: its cffi
+      # backend loads the darshan-util C library, which is not shipped in the wheel
+      # (darshan/backend/cffi_backend.py -> find_utils). So "can pip resolve it" is
+      # the wrong question -- import it for real, and drop it again if it is broken,
+      # leaving find_spec to report it absent.
+      - name: Check whether darshan is usable on this Python
         id: darshan
         run: |
-          if pip install --dry-run darshan >/dev/null 2>&1; then
+          if pip install darshan >/dev/null 2>&1 && python -c "import darshan" >/dev/null 2>&1; then
             echo "available=true" >> "$GITHUB_OUTPUT"
-            echo "darshan wheel resolves for Python ${{ matrix.python-version }}"
+            echo "darshan imports on Python ${{ matrix.python-version }}"
           else
             echo "available=false" >> "$GITHUB_OUTPUT"
-            echo "no darshan wheel for Python ${{ matrix.python-version }} -- installing without it"
+            echo "darshan unusable on Python ${{ matrix.python-version }} (no darshan-util C library) -- installing without it"
+            pip uninstall -y darshan >/dev/null 2>&1 || true
           fi
 
       # Uncomment to test the Darshan path on 3.13/3.14 too: darshan-util from

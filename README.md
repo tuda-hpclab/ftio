@@ -176,8 +176,9 @@ pip install '.[darshan-libs]'
 > [!note]
 > **Darshan traces** need the optional `darshan-libs` extra. Without it, FTIO works
 > normally and only tells you to install it if you actually hand it a Darshan trace.
-> The `darshan` wheel has no release for Python 3.13/3.14 yet; on those versions
-> build [darshan-util](https://github.com/darshan-hpc/darshan) from source instead.
+> The extra installs the Python bindings but *not* the `darshan-util` C library they
+> load at import time, so on Python 3.13/3.14 also build
+> [darshan-util](https://github.com/darshan-hpc/darshan) from source.
 
 > [!note]
 > You need to activate the environment to use `ftio` and the other tools using:
