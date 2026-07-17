@@ -64,8 +64,9 @@ def sample_data(
         f"Frequency step: {1/ duration if duration > 0 else 0:.3e} Hz\n"
     )
 
+    # Callers unpack two values.
     if len(t) == 0:
-        return np.empty(0), 0, " "
+        return np.empty(0), 0
 
     # Calculate recommended frequency:
     if freq == -1:

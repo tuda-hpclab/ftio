@@ -161,6 +161,51 @@ def resolve_result_json(arg: str, cwd: str | None = None) -> str:
     return os.path.join(cwd, arg, "result.json")
 
 
+def app_result_jsons(job_dir: str) -> list[str]:
+    """Return every <job_dir>/<app>/result.json, sorted by app name.
+
+    An app whose every mode failed has log dirs but no result.json; its path is
+    returned anyway so the table shows it as FAIL rather than omitting it.
+
+    Args:
+        job_dir: A jit job folder (e.g. ~/jit/<jobid>).
+
+    Returns:
+        The result.json path of every app in the job (existing or not). Empty if
+        this is not a job folder.
+    """
+    if not os.path.isdir(job_dir):
+        return []
+    found = []
+    for entry in sorted(os.listdir(job_dir)):
+        app_dir = os.path.join(job_dir, entry)
+        if not os.path.isdir(app_dir):
+            continue
+        if os.path.exists(os.path.join(app_dir, "result.json")) or started_runs(app_dir):
+            found.append(os.path.join(app_dir, "result.json"))
+    return found
+
+
+def resolve_result_jsons(arg: str, cwd: str | None = None) -> list[str]:
+    """Resolve an argument into every result.json it names.
+
+    An app name or per-app folder names one; a job folder expands to one per app.
+
+    Args:
+        arg: The user-supplied argument.
+        cwd: Base directory, injectable for testing (defaults to os.getcwd()).
+
+    Returns:
+        One or more result.json paths. Falls back to the single resolved path
+        (which may not exist) so the caller still reports a sensible name.
+    """
+    single = resolve_result_json(arg, cwd)
+    if os.path.exists(single):
+        return [single]
+    found = app_result_jsons(os.path.dirname(single))
+    return found or [single]
+
+
 def plot_results(args):
     """
     Plot results from the given JSON files. If no filenames are provided,
@@ -178,6 +223,13 @@ def plot_results(args):
             else:
                 extract_and_plot(JitResult(), here, here, no_diff=args.no_diff)
             return
+        # Standing in a job folder instead: table every app it holds.
+        if getattr(args, "table", False):
+            found = app_result_jsons(os.getcwd())
+            if found:
+                for path in found:
+                    print_totals_table(path)
+                return
 
     if not args:
         results = JitResult()
@@ -241,11 +293,13 @@ def plot_results(args):
         extract_and_plot(results, json_file_path, title)
     else:
         for filename in args.filenames:
+            if getattr(args, "table", False):
+                # A job folder tables every app in it; an app names just itself.
+                for json_file_path in resolve_result_jsons(filename):
+                    print_totals_table(json_file_path)
+                continue
             # Resolve an app name / folder / result.json into the actual file.
             json_file_path = resolve_result_json(filename)
-            if getattr(args, "table", False):
-                print_totals_table(json_file_path)
-                continue
             print(f"Processing file: {json_file_path}")
             extract_and_plot(
                 JitResult(), json_file_path, json_file_path, no_diff=args.no_diff
