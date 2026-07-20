@@ -114,7 +114,6 @@ development-libs = [
     "isort",
     "nbstripout",
     "ruff",
-    "fakeredis",  # in-memory redis for testing RedisAutomatonLibrary
 ]
 
 amd-libs = [
@@ -141,6 +140,7 @@ ml-libs = [
 # reference-automaton library across processes or nodes). Keep it opt-in.
 redis-libs = [
     "redis",
+	"fakeredis",  
 ]
 
 [tool.setuptools.dynamic]

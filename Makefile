@@ -54,7 +54,7 @@ ftio:
 	$(PYTHON) -m pip install . 
 
 ftio_full: 
-	$(PYTHON) -m pip install -e '.[external-libs,development-libs,plot-libs,amd-libs,ml-libs]' --no-cache-dir || \
+	$(PYTHON) -m pip install -e '.[external-libs,development-libs,plot-libs,amd-libs,ml-libs,redis-libs]' --no-cache-dir || \
 	(echo "Installing external libs failed, trying fallback..." && $(PYTHON) -m pip install -e . --no-cache-dir)
 venv: 
 	$(PYTHON) -m venv .venv 
