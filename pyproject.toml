@@ -136,11 +136,9 @@ ml-libs = [
     "statsmodels"
 ]
 
-# Only needed for ftio.modeling.redis_automaton_library (shared/concurrent
-# reference-automaton library across processes or nodes). Keep it opt-in.
 redis-libs = [
     "redis",
-	"fakeredis",  
+	"fakeredis[lua]",
 ]
 
 [tool.setuptools.dynamic]
