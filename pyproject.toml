@@ -114,6 +114,7 @@ development-libs = [
     "isort",
     "nbstripout",
     "ruff",
+    "fakeredis",  # in-memory redis for testing RedisAutomatonLibrary
 ]
 
 amd-libs = [
@@ -134,6 +135,12 @@ plot-libs = [
 ml-libs = [
     "torch",
     "statsmodels"
+]
+
+# Only needed for ftio.modeling.redis_automaton_library (shared/concurrent
+# reference-automaton library across processes or nodes). Keep it opt-in.
+redis-libs = [
+    "redis",
 ]
 
 [tool.setuptools.dynamic]

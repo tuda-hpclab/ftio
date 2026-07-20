@@ -133,6 +133,168 @@ class TestReferenceAutomaton:
         )
 
 
+class TestReferenceAutomatonNodes:
+    """The configuration table: node lookup, seeding, cross-path merging."""
+
+    def test_single_mode_config_returns_one_behavior(self):
+        """A configuration seen with only one stable period gets a
+        single-element behavior list -- no special-casing needed for the
+        common, unambiguous case."""
+        ref = ReferenceAutomaton.from_automaton_dict(
+            _build_automaton([(0.5, 8, 128)]).to_dict(), "app", "128"
+        )
+        behaviors = ref.node(128)
+        assert len(behaviors) == 1
+        assert behaviors[0].period_mean == pytest.approx(2.0)
+
+    def test_nodes_split_into_distinct_behaviors_when_periods_differ(self):
+        """ranks=128 shows two genuinely different periods back to back ->
+        kept as two distinct behaviors, NOT blended into one misleading mean."""
+        ref = _simple_ref()  # ranks=128: period 2.0s, then period 0.667s
+        behaviors = ref.node(128)
+        assert len(behaviors) == 2
+        periods = sorted(b.period_mean for b in behaviors)
+        assert periods[0] == pytest.approx(0.6666666, rel=1e-3)
+        assert periods[1] == pytest.approx(2.0)
+
+    def test_node_at_time_picks_the_right_behavior(self):
+        ref = _simple_ref()
+        early = ref.node(128, at_time=1.0)  # within the first behavior's window
+        late = ref.node(128, at_time=25.0)  # within the second's
+        assert len(early) == 1 and early[0].period_mean == pytest.approx(2.0)
+        assert len(late) == 1 and late[0].period_mean == pytest.approx(
+            0.6666666, rel=1e-3
+        )
+
+    def test_node_at_time_outside_any_window_returns_empty(self):
+        ref = _simple_ref()
+        assert ref.node(128, at_time=9999.0) == []
+
+    def test_node_lookup_missing_returns_empty_list(self):
+        ref = _simple_ref()
+        assert ref.node(9999) == []
+
+    def test_from_automaton_dict_populates_cycle_windows(self):
+        """from_automaton_dict has the raw per-state burst count available,
+        so unlike the generic StateStats-only fallback, its behaviors carry
+        a real (non-NaN) cycle window."""
+        ref = _simple_ref()
+        b = ref.node(128)[0]
+        assert not np.isnan(b.c_start_mean)
+        assert b.c_start_mean == pytest.approx(0.0)
+        assert b.c_end_mean > 0
+
+    def test_node_at_cycle_picks_the_right_behavior(self):
+        """The cycle axis, not wall-clock time, distinguishes behaviors --
+        this is the axis that stays valid when a run speeds up or slows
+        down for reasons unrelated to which behavior is active."""
+        ref = _simple_ref()
+        first_end = ref.node(128)[0].c_end_mean
+        early = ref.node(128, at_cycle=first_end - 1)
+        late = ref.node(128, at_cycle=first_end + 1)
+        assert len(early) == 1 and early[0].period_mean == pytest.approx(2.0)
+        assert len(late) == 1 and late[0].period_mean == pytest.approx(
+            0.6666666, rel=1e-3
+        )
+
+    def test_node_at_time_and_cycle_both_given_is_an_intersection(self):
+        ref = _simple_ref()
+        b0, b1 = ref.node(128)
+        # A time that matches b0 but a cycle that matches b1 -> no behavior
+        # satisfies both at once.
+        result = ref.node(128, at_time=b0.t_start_mean, at_cycle=b1.c_start_mean + 1)
+        assert result == []
+        # Consistent time+cycle from the same behavior -> matches.
+        result = ref.node(128, at_time=b0.t_start_mean, at_cycle=b0.c_start_mean)
+        assert result == [b0]
+
+    def test_seed_has_no_cycle_window(self):
+        """A user can't guess a burst count they've never observed -- a
+        seed's cycle window is unknown (NaN), not a fabricated zero."""
+        ref = ReferenceAutomaton.from_node_seed(
+            "demo", {32: {"period": 3.0, "dwell": 20.0}}
+        )
+        b = ref.node(32)[0]
+        assert np.isnan(b.c_start_mean)
+
+    def test_nodes_pool_matching_repeated_occurrence(self):
+        """ranks=16 appears twice (shrink then regrow) with the SAME period
+        both times -> folds into one behavior, not two."""
+        aut = _build_automaton([(0.5, 8, 16), (1.5, 8, 128), (0.5, 8, 16)])
+        ref = ReferenceAutomaton.from_automaton_dict(aut.to_dict(), "app", "16_128_16")
+        behaviors = ref.node(16)
+        assert len(behaviors) == 1
+        assert behaviors[0].n_samples == 2
+
+    def test_edges_from_transitions(self):
+        """A frequency-drift transition without a rank change is a self-loop
+        at the node level (128 -> 128) -- edges only carry real information
+        when the configuration actually changes, unlike a rank-change trigger."""
+        ref = _simple_ref()
+        edges = ref.edges
+        assert edges == {(128, 128): {"cause": "frequency", "count": 1}}
+
+    def test_edges_across_rank_change(self):
+        aut = _build_automaton([(0.5, 8, 16), (1.5, 8, 128)])
+        ref = ReferenceAutomaton.from_automaton_dict(aut.to_dict(), "app", "16_128")
+        assert ref.edges == {(16, 128): {"cause": "rank_change", "count": 1}}
+
+    def test_from_node_seed_builds_usable_reference(self):
+        ref = ReferenceAutomaton.from_node_seed(
+            "demo",
+            {64: {"period": 20.0, "dwell": 100.0}, 8: {"period": 5.0, "dwell": 40.0}},
+        )
+        assert ref.rank_key == "8_64"  # sorted ascending regardless of dict order
+        assert ref.run_count == 0  # a seed is not a profiled run
+        assert ref.node(8)[0].period_mean == pytest.approx(5.0)
+        assert ref.node(64)[0].t_end_mean == pytest.approx(
+            100.0
+        )  # "dwell" -> window length
+
+    def test_merge_topology_mismatch_pools_shared_node(self):
+        """Two runs with different paths that both touch ranks=128 at the
+        SAME period should share that node's stats (one pooled behavior)
+        even though the paths can't merge."""
+        ref_a = ReferenceAutomaton.from_automaton_dict(
+            _build_automaton([(0.5, 8, 128)]).to_dict(), "app", "128"
+        )
+        ref_b = ReferenceAutomaton.from_automaton_dict(
+            _build_automaton([(0.2, 8, 16), (0.5, 8, 128)]).to_dict(), "app", "16_128"
+        )
+        result = ref_a.merge(ref_b)
+        assert result is ref_a  # topology mismatch -> identity preserved
+        assert 16 in result.nodes  # picked up from ref_b even though topology differs
+        assert len(result.node(128)) == 1  # same period both times -> one behavior
+        assert result.node(128)[0].n_samples == 2  # pooled from both runs
+
+    def test_merge_keeps_genuinely_different_behaviors_separate(self):
+        """If the two paths reach ranks=128 with DIFFERENT periods, the merge
+        must not average them into a meaningless midpoint."""
+        ref_a = ReferenceAutomaton.from_automaton_dict(
+            _build_automaton([(0.5, 8, 128)]).to_dict(), "app", "128"  # period 2.0s
+        )
+        ref_b = ReferenceAutomaton.from_automaton_dict(
+            _build_automaton([(0.2, 8, 16), (0.1, 8, 128)]).to_dict(),
+            "app",
+            "16_128",  # period 10s
+        )
+        result = ref_a.merge(ref_b)
+        behaviors = result.node(128)
+        assert len(behaviors) == 2
+        periods = sorted(b.period_mean for b in behaviors)
+        assert periods[0] == pytest.approx(2.0)
+        assert periods[1] == pytest.approx(10.0)
+
+    def test_nodes_survive_dict_round_trip(self):
+        ref = _simple_ref()
+        ref2 = ReferenceAutomaton.from_dict(ref.to_dict())
+        assert set(ref2.nodes) == set(ref.nodes)
+        assert len(ref2.node(128)) == len(ref.node(128))
+        p1 = sorted(b.period_mean for b in ref.node(128))
+        p2 = sorted(b.period_mean for b in ref2.node(128))
+        assert p1 == pytest.approx(p2)
+
+
 # ---------------------------------------------------------------------------
 # AutomatonLibrary
 # ---------------------------------------------------------------------------
@@ -210,6 +372,83 @@ class TestAutomatonLibrary:
         loaded = lib.load("ior", "128")
         assert loaded is not None
         assert loaded.n_states == 2
+
+
+class TestAutomatonLibraryNodes:
+    """Cross-path configuration lookup and user-supplied early estimates."""
+
+    def test_load_node_across_different_paths(self, tmp_path):
+        """ranks=128 is reachable via two different malleability paths;
+        load_node should pool both without needing an exact path match."""
+        lib = AutomatonLibrary(str(tmp_path))
+        lib.save(_build_automaton([(0.2, 8, 16), (0.5, 8, 128)]), "app", "16_128")
+        lib.save(_build_automaton([(0.3, 8, 32), (0.5, 8, 128)]), "app", "32_128")
+
+        behaviors = lib.load_node("app", 128)
+        assert len(behaviors) == 1  # same period both times -> one behavior
+        assert behaviors[0].n_samples == 2  # pooled from both paths
+
+    def test_load_node_missing_configuration(self, tmp_path):
+        lib = AutomatonLibrary(str(tmp_path))
+        lib.save(_build_automaton([(0.5, 8, 128)]), "app", "128")
+        assert lib.load_node("app", 9999) == []
+
+    def test_seed_then_load(self, tmp_path):
+        lib = AutomatonLibrary(str(tmp_path))
+        lib.seed(
+            "app",
+            {8: {"period": 5.0, "dwell": 40.0}, 64: {"period": 20.0, "dwell": 100.0}},
+        )
+        loaded = lib.load("app", "8_64")
+        assert loaded is not None
+        assert loaded.run_count == 0
+        assert loaded.node(64)[0].period_mean == pytest.approx(20.0)
+
+    def test_seed_does_not_clobber_existing(self, tmp_path):
+        lib = AutomatonLibrary(str(tmp_path))
+        lib.save(_build_automaton([(0.5, 8, 128)]), "app", "128")
+        lib.seed(
+            "app", {128: {"period": 999.0, "dwell": 1.0}}
+        )  # wrong guess, real data exists
+        loaded = lib.load("app", "128")
+        assert loaded.run_count == 1  # untouched by the seed
+
+    def test_seed_close_to_real_gets_diluted(self, tmp_path):
+        """A seed within k-sigma of the real value pools -- the seed is
+        outweighed and the estimate converges on the real one. The default
+        tolerance is tight (k=3, 2% relative floor -> ~6% by default), so
+        "close" here means close, not just same order of magnitude."""
+        lib = AutomatonLibrary(str(tmp_path))
+        lib.seed(
+            "app", {128: {"period": 10.3, "dwell": 20.0}}
+        )  # 3% off -> within tolerance
+        real = _build_automaton([(0.1, 8, 128)])  # true period = 10s
+        lib.save(real, "app", "128")
+
+        after = lib.load_node("app", 128)
+        assert len(after) == 1  # close enough -> pooled into one behavior
+        assert after[0].period_mean == pytest.approx(10.15, rel=0.01)
+        assert after[0].n_samples == 2
+
+    def test_seed_wildly_wrong_is_not_silently_overwritten(self, tmp_path):
+        """A seed far from reality does NOT get quietly corrected -- it is
+        preserved as a separate, permanent (wrong) behavior instead of being
+        blended into the real one. This is the flip side of not corrupting
+        two genuinely distinct real behaviors with a blind average: the
+        clustering rule can't tell "unrelated seed" apart from "a second,
+        real regime that happens to share this rank count." A guess this far
+        off needs to be corrected by hand (or the library file edited/removed),
+        not by hoping real data will dilute it away."""
+        lib = AutomatonLibrary(str(tmp_path))
+        lib.seed("app", {128: {"period": 100.0, "dwell": 100.0}})  # bad guess
+        real = _build_automaton([(0.1, 8, 128)])  # true period = 10s -- 10x off
+        lib.save(real, "app", "128")
+
+        after = lib.load_node("app", 128)
+        assert len(after) == 2  # NOT pooled -- both survive
+        periods = sorted(b.period_mean for b in after)
+        assert periods[0] == pytest.approx(10.0)
+        assert periods[1] == pytest.approx(100.0)  # the bad seed, still there
 
 
 # ---------------------------------------------------------------------------
@@ -429,6 +668,23 @@ class TestModelManager:
         with pytest.raises(ValueError):
             ModelManager(str(tmp_path), "app", strategy="bad_strategy")
 
+    def test_guess_node_from_seed_before_any_step(self, tmp_path):
+        """guess_node should answer from a seed alone, without step() ever
+        having been called -- it's a pure library lookup, independent of the
+        live tracker's state."""
+        lib = AutomatonLibrary(str(tmp_path))
+        lib.seed("ior", {64: {"period": 20.0, "dwell": 100.0}})
+
+        mgr = ModelManager(str(tmp_path), "ior")
+        guess = mgr.guess_node(64)
+        assert len(guess) == 1
+        assert guess[0].period_mean == pytest.approx(20.0)
+
+    def test_guess_node_true_cold_start_returns_empty(self, tmp_path):
+        """No library entry at all for this app -- nothing to guess from."""
+        mgr = ModelManager(str(tmp_path), "never_profiled_app")
+        assert mgr.guess_node(64) == []
+
 
 # ---------------------------------------------------------------------------
 # Shim backward compatibility
@@ -523,3 +779,89 @@ def test_min_cycles_keeps_genuinely_fast_periodic_io():
     aut.step(_windowed_pred(0.5, 0.0, 60.0))
     assert len(aut.states) == 1
     assert aut.states[0].period == pytest.approx(2.0, rel=1e-3)
+
+
+# ---------------------------------------------------------------------------
+# RedisAutomatonLibrary — same semantics as AutomatonLibrary, Redis-backed.
+# Skipped unless the optional `redis` + `fakeredis` packages are installed
+# (pip install .[redis-libs] and .[development-libs]).
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def redis_client():
+    fakeredis = pytest.importorskip("fakeredis")
+    pytest.importorskip("redis")
+    return fakeredis.FakeRedis(decode_responses=True)
+
+
+class TestRedisAutomatonLibrary:
+    def test_save_and_load(self, redis_client):
+        from ftio.modeling.redis_automaton_library import RedisAutomatonLibrary
+
+        lib = RedisAutomatonLibrary(redis_client=redis_client)
+        aut = _build_automaton([(0.5, 8, 128), (1.5, 8, 128)])
+        lib.save(aut, "ior", "128")
+        loaded = lib.load("ior", "128")
+        assert loaded is not None
+        assert loaded.n_states == 2
+        assert loaded.app_name == "ior"
+
+    def test_merge_on_second_save(self, redis_client):
+        from ftio.modeling.redis_automaton_library import RedisAutomatonLibrary
+
+        lib = RedisAutomatonLibrary(redis_client=redis_client)
+        aut = _build_automaton([(0.5, 8, 128), (1.5, 8, 128)])
+        lib.save(aut, "ior", "128")
+        lib.save(aut, "ior", "128")
+        assert lib.load("ior", "128").run_count == 2
+
+    def test_nearest_fallback(self, redis_client):
+        from ftio.modeling.redis_automaton_library import RedisAutomatonLibrary
+
+        lib = RedisAutomatonLibrary(redis_client=redis_client)
+        lib.save(_build_automaton([(0.5, 8, 128)]), "ior", "128")
+        loaded = lib.load("ior", "256")
+        assert loaded is not None
+        assert loaded.rank_key == "128"
+
+    def test_seed_then_guess_before_any_run(self, redis_client):
+        from ftio.modeling.redis_automaton_library import RedisAutomatonLibrary
+
+        lib = RedisAutomatonLibrary(redis_client=redis_client)
+        lib.seed("app", {32: {"period": 3.0, "dwell": 20.0}})
+        behaviors = lib.load_node("app", 32)
+        assert len(behaviors) == 1
+        assert behaviors[0].period_mean == pytest.approx(3.0)
+
+    def test_load_node_pools_across_paths(self, redis_client):
+        from ftio.modeling.redis_automaton_library import RedisAutomatonLibrary
+
+        lib = RedisAutomatonLibrary(redis_client=redis_client)
+        lib.save(_build_automaton([(0.2, 8, 16), (0.5, 8, 128)]), "app", "16_128")
+        lib.save(_build_automaton([(0.3, 8, 32), (0.5, 8, 128)]), "app", "32_128")
+        behaviors = lib.load_node("app", 128)
+        assert len(behaviors) == 1
+        assert behaviors[0].n_samples == 2
+
+    def test_concurrent_saves_do_not_lose_a_contribution(self, redis_client):
+        """The file-based AutomatonLibrary has no locking around its
+        load-merge-write critical section; RedisAutomatonLibrary does. Fire
+        several saves for the same key and confirm every run is accounted
+        for in the final run_count -- none silently dropped by a race."""
+        from ftio.modeling.redis_automaton_library import RedisAutomatonLibrary
+
+        lib = RedisAutomatonLibrary(redis_client=redis_client)
+        n_runs = 5
+        for _ in range(n_runs):
+            lib.save(_build_automaton([(0.5, 8, 128), (1.5, 8, 128)]), "ior", "128")
+        assert lib.load("ior", "128").run_count == n_runs
+
+    def test_missing_redis_package_raises_clear_error(self, monkeypatch):
+        """Without redis-py installed, instantiation fails fast with a
+        clear message rather than an opaque ImportError deep in a call."""
+        import ftio.modeling.redis_automaton_library as mod
+
+        monkeypatch.setattr(mod.importlib.util, "find_spec", lambda name: None)
+        with pytest.raises(ImportError, match="redis"):
+            mod.RedisAutomatonLibrary()

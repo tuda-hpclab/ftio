@@ -24,7 +24,7 @@ import numpy as np
 
 from ftio.freq.prediction import Prediction
 from ftio.modeling.automaton_library import AutomatonLibrary
-from ftio.modeling.reference_automaton import ReferenceAutomaton
+from ftio.modeling.reference_automaton import NodeBehavior, ReferenceAutomaton
 from ftio.modeling.state_tracker import MatchStrategy, StateTracker
 from ftio.modeling.transition_predictor import TransitionForecast, TransitionPredictor
 
@@ -133,6 +133,32 @@ class ModelManager:
 
         self._tracker.update(freq, prediction.t_end, ranks)
         return self._predictor.predict(freq, ranks)
+
+    # ------------------------------------------------------------------
+    # Configuration-level lookup (independent of path/position)
+    # ------------------------------------------------------------------
+
+    def guess_node(
+        self,
+        ranks: int,
+        at_time: float | None = None,
+        at_cycle: float | None = None,
+    ) -> list[NodeBehavior]:
+        """Early-estimate lookup for one configuration, independent of path.
+
+        Works even during cold start (no matching path loaded yet) or for a
+        rank count this run's own path hasn't reached -- folds every stored
+        path for this app that has seen ``ranks``, so a seed
+        (AutomatonLibrary.seed) or a run that reached this configuration via
+        a different malleability sequence still contributes a guess.
+
+        at_time / at_cycle: either, both, or neither may be given -- see
+        ReferenceAutomaton.node() for exact matching semantics. at_cycle
+        (bursts since entering this configuration) is the axis that stays
+        valid across runs of different speed; at_time (wall-clock seconds)
+        can drift for reasons unrelated to which behavior is active.
+        """
+        return self._library.load_node(self._app_name, ranks, at_time, at_cycle)
 
     # ------------------------------------------------------------------
     # Shutdown

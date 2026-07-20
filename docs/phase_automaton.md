@@ -20,6 +20,12 @@ The phase automaton models I/O behaviour as a finite state machine where each **
   - [Malleable applications](#malleable-applications)
   - [Matching strategies](#matching-strategies)
   - [Library file format](#library-file-format)
+  - [Configuration table (nodes)](#configuration-table-nodes)
+    - [Multiple behaviors per configuration](#multiple-behaviors-per-configuration)
+    - [Two axes: wall-clock time vs. cycle count](#two-axes-wall-clock-time-vs-cycle-count)
+    - [Seeding an early estimate](#seeding-an-early-estimate)
+    - [Cross-path sharing](#cross-path-sharing)
+  - [Redis-backed library](#redis-backed-library)
   - [Combining with other flags](#combining-with-other-flags)
 
 ---
@@ -491,7 +497,7 @@ When the tracker reaches the last reference state:
 
 ### Malleable applications
 
-Rank changes mid-run are already captured by the automaton as state transitions (each state stores its `ranks`).  The library key encodes the full rank sequence, so a malleable run is stored separately from a fixed-rank run:
+Rank changes mid-run are already captured by the automaton as state transitions (each state stores its `ranks`).  The library key encodes the full rank sequence, so a malleable run is stored under its own **path** file, separate from a fixed-rank run:
 
 ```bash
 # fixed-rank run  → ftio_models/ior/ranks_128.json
@@ -499,6 +505,8 @@ Rank changes mid-run are already captured by the automaton as state transitions 
 ```
 
 The tracker uses rank count as a secondary matching signal alongside period, so a mid-run rank change in a live malleable run is a strong position cue against a malleable reference.
+
+That per-path separation is deliberate — it is what lets `--pa-match` replay a *specific* rank sequence — but it means two runs that reach the same configuration via *different* paths (`8→128` vs. `32→128`) don't share knowledge at the path level. They do at the **configuration level**: see [Configuration table (nodes)](#configuration-table-nodes) below.
 
 ---
 
@@ -520,7 +528,7 @@ predictor live.jsonl -f 100 --pa-library ./ftio_models --pa-app-name ior --pa-ma
 
 ### Library file format
 
-Library files are compact JSON containing only per-state distribution statistics.  They are intentionally much smaller than the full `--pa-export` single-run snapshot.
+Library files are compact JSON containing per-state distribution statistics (the **path**, used by the tracker), plus a `nodes` table (the **configuration table**, used by `guess_node`/`load_node` — see below).  They are intentionally much smaller than the full `--pa-export` single-run snapshot.
 
 ```json
 {
@@ -533,9 +541,153 @@ Library files are compact JSON containing only per-state distribution statistics
     {"period_mean": 0.96, "period_std": 0.04, "dwell_mean": 62.0, "dwell_std": 5.2, "ranks": 128, "n_samples": 4},
     {"period_mean": 1.93, "period_std": 0.07, "dwell_mean": 38.1, "dwell_std": 2.9, "ranks": 128, "n_samples": 4}
   ],
-  "transition_causes": ["frequency", "frequency"]
+  "transition_causes": ["frequency", "frequency"],
+  "nodes": {
+    "128": [
+      {
+        "period_mean": 1.93, "period_std": 0.08,
+        "t_start_mean": 0.0, "t_start_std": 0.0, "t_end_mean": 45.2, "t_end_std": 3.1,
+        "c_start_mean": 0.0, "c_start_std": 0.0, "c_end_mean": 24.0, "c_end_std": 1.2,
+        "ranks": 128, "n_samples": 4
+      }
+    ]
+  }
 }
 ```
+
+`states` and `nodes` describe the same underlying data from two angles: `states` is the ordered path this specific rank sequence took; `nodes` is keyed by configuration (rank count) and pooled across *every* occurrence of that configuration, including ones reached by a different path. See [Configuration table (nodes)](#configuration-table-nodes).
+
+---
+
+### Configuration table (nodes)
+
+Everything above (the `states` path, `--pa-match` tracking, ETA forecasts) answers questions about *one specific rank sequence*. The **configuration table** (`nodes` in the library file, `ReferenceAutomaton.nodes` in Python) answers a narrower but more reusable question: *"what do we know about `ranks=32`, regardless of how the run got there?"*
+
+It is reached through two Python APIs, not (yet) a CLI flag:
+
+```python
+from ftio.modeling import AutomatonLibrary, ModelManager
+
+lib = AutomatonLibrary("./ftio_models")
+mgr = ModelManager("./ftio_models", "ior")
+
+mgr.guess_node(32)              # every known behavior for ranks=32
+lib.load_node("ior", 32)        # same thing, called directly on the library
+```
+
+Both work even during cold start, or for a rank count the current run's own path hasn't reached yet, as long as *some* stored path (or a seed, below) has seen that configuration.
+
+#### Multiple behaviors per configuration
+
+A configuration does not have to mean one fixed period for its whole dwell. If the statistical detector sees the frequency shift *without* a rank change, that becomes a second, distinct `NodeBehavior` for the same node — not blended into a misleading average of the two:
+
+```python
+>>> ref.node(32)
+[NodeBehavior(period_mean=3.0, ...),   # first few bursts
+ NodeBehavior(period_mean=8.0, ...)]   # after that
+```
+
+Calling `node()`/`guess_node()`/`load_node()` with no further arguments returns every behavior ever seen for that configuration. Give a specific point (see below) and it narrows to whichever behavior(s) actually apply there — one if unambiguous, several if the query falls in a genuine overlap between two behaviors, zero if nothing has ever been observed to cover it.
+
+#### Two axes: wall-clock time vs. cycle count
+
+Every `NodeBehavior` carries **two** windows describing when it applies, because they answer two different questions and only one of them survives runs of different speed:
+
+| Axis | What it is | Reliable across runs? |
+|---|---|---|
+| `c_start` / `c_end` | bursts observed since entering this configuration | **yes** — driven by the app's own control flow |
+| `t_start` / `t_end` | wall-clock seconds since entering this configuration | no — drifts with contention, load, checkpoint size |
+
+Concretely, two runs of the same 4-burst → 8s-period behavior, one 20% slower than the other for reasons unrelated to which behavior is active:
+
+```
+FAST run (ranks=32):
+  period=3.00s  time=[ 0.0,20.0]s  cycle=[0,5]
+  period=8.00s  time=[20.0,44.0]s  cycle=[5,8]
+
+SLOW run (ranks=32, 20% slower throughout):
+  period=3.60s  time=[ 0.0,24.0]s  cycle=[0,5]
+  period=9.60s  time=[24.0,52.8]s  cycle=[5,8]
+
+Query both runs at t=22s (a fixed wall-clock instant):
+  fast run -> ['8.00s']   already switched
+  slow run -> ['3.60s']   hasn't switched yet
+  -> SAME instant, OPPOSITE answers. Wall-clock time is unreliable here.
+
+Query both runs at cycle=3 (a fixed logical point):
+  fast run -> ['3.00s']
+  slow run -> ['3.60s']
+  -> different periods (as expected -- the runs really do run at different
+     speeds), but the SAME behavior is identified both times, correctly.
+```
+
+```python
+ref.node(32, at_cycle=3)        # the authoritative axis
+ref.node(32, at_time=22.0)      # drifts across runs of different speed
+ref.node(32, at_time=22.0, at_cycle=3)   # both given -> intersection
+```
+
+`at_cycle` is the axis to reach for when you want to know *which regime is active*. `at_time` stays useful for a different question — "how many seconds until this transitions" — which is what the ETA forecast (`Transition in ~Xs [...] → next period ≈ Ys`, shown earlier) still uses it for.
+
+#### Seeding an early estimate
+
+A user can seed a configuration's expected behavior before any profiling run exists:
+
+```python
+AutomatonLibrary("./ftio_models").seed(
+    "ior", {32: {"period": 3.0, "dwell": 40.0}, 64: {"period": 20.0, "dwell": 100.0}}
+)
+```
+
+The next real run that reaches that configuration folds in as a normal observation. **If the guess was close** (within ~6% by default — the same k-sigma tolerance that decides whether any two observations are "the same behavior"), it pools and the seed is diluted away:
+
+```
+seed=10.3s, real=10.0s  (3% off, within tolerance)
+  -> 1 behavior: 10.15s (n=2)        # seed successfully overwritten
+```
+
+**If the guess was far off**, it is *not* silently corrected — it survives as a separate, permanent entry, because the same rule that protects two genuinely distinct real behaviors from being averaged together can't tell "stale wrong guess" apart from "a second real regime that happens to share this rank count":
+
+```
+seed=100.0s, real=10.0s  (10x off, outside tolerance)
+  -> 2 behaviors: 100.00s (n=1), 10.00s (n=1)   # bad seed just sits there
+```
+
+A guess this far off needs to be corrected by hand (edit or remove the library file) — don't rely on real data to quietly fix it.
+
+#### Cross-path sharing
+
+The node table is pooled across every malleability path stored for an app, not just the one matching your exact rank sequence:
+
+```
+path A:  8   -> 128  (period=10s)
+path B:  32  -> 128  (period=10s)
+
+load_node("ior", 128) -> 1 behavior, n_samples=2   # pooled from BOTH paths
+```
+
+This is the mechanism referenced in [Malleable applications](#malleable-applications) above: paths are stored separately, but a configuration common to two paths still shares its stats.
+
+---
+
+### Redis-backed library
+
+`AutomatonLibrary` is a directory of JSON files — fine for one machine, but it assumes a shared filesystem if multiple predictor processes (different nodes, different jobs) need to read and write the *same* library, and it has no locking: `save()` is a plain load → merge → write, so two concurrent writers to the same `(app_name, rank_key)` can interleave and one's contribution is silently lost.
+
+`RedisAutomatonLibrary` (`ftio/modeling/redis_automaton_library.py`) is a drop-in alternative with the exact same methods (`load`, `save`, `seed`, `load_node`, `available_apps`, `available_rank_keys`) and the exact same merge/dilution/clustering semantics — only the storage backend changes. `save()`/`seed()` additionally hold a Redis lock around their critical section, so concurrent writers can't race:
+
+```python
+from ftio.modeling.redis_automaton_library import RedisAutomatonLibrary
+
+lib = RedisAutomatonLibrary(host="redis.cluster.local", port=6379)
+lib.seed("ior", {32: {"period": 3.0, "dwell": 40.0}})
+lib.save(automaton, "ior", "8_32")   # locked, race-safe
+lib.load_node("ior", 32)             # same semantics as AutomatonLibrary
+```
+
+Requires the optional `redis` package (`pip install redis`, or `pip install .[redis-libs]`); importing `ftio.modeling` never requires it — only instantiating `RedisAutomatonLibrary` does, and it fails with a clear message if it's missing. Tests (`TestRedisAutomatonLibrary` in `test/test_modeling.py`) run against an in-memory `fakeredis` server, no real Redis instance needed — install with `pip install .[development-libs]`.
+
+There is no `--pa-redis-*` CLI flag yet; use `RedisAutomatonLibrary` from Python, or swap it in where `ModelManager` constructs an `AutomatonLibrary` internally if you need it wired into `predictor`.
 
 ---
 
