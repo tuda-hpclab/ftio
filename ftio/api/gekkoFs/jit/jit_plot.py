@@ -36,7 +36,7 @@ def _mode_label(mode: str) -> str:
 
 
 def totals_by_node(json_path: str) -> dict:
-    """Read a result.json into {compute_nodes: {label: (app, total)}}.
+    """Read a result.json into {compute_nodes: {label: {app,stage_in,stage_out,total}}}.
 
     total = app + stage_in + stage_out. For each (nodes, mode) the latest entry
     by timestamp wins, so reruns show the most recent number.
@@ -54,7 +54,12 @@ def totals_by_node(json_path: str) -> dict:
             if label not in latest or ts >= latest[label][0]:
                 latest[label] = (ts, e)
         rows[n] = {
-            label: (e["app"], e["app"] + e["stage_in"] + e["stage_out"])
+            label: {
+                "app": e["app"],
+                "stage_in": e["stage_in"],
+                "stage_out": e["stage_out"],
+                "total": e["app"] + e["stage_in"] + e["stage_out"],
+            }
             for label, (ts, e) in latest.items()
         }
     return rows
@@ -105,24 +110,68 @@ def print_totals_table(json_path: str) -> None:
         CONSOLE.print(f"[yellow]No results found under {app_dir}[/yellow]")
         return
     app = os.path.basename(app_dir)
-    table = Table(title=f"{app}  —  time in s (app | total = app+in+out)")
+    table = Table(
+        title=f"{app}  —  time in s (total = app+in+out; "
+        f"green = smallest, yellow = largest per row)"
+    )
     table.add_column("nodes", justify="right")
-    for label in ("glass", "gekko", "pfs"):
+    for label in ("glass", "gekko"):
         table.add_column(f"{label} app", justify="right")
+        table.add_column(f"{label} in", justify="right")
+        table.add_column(f"{label} out", justify="right")
         table.add_column(f"{label} total", justify="right", style="bold")
+    table.add_column("pfs app", justify="right")
+    table.add_column("pfs total", justify="right", style="bold")
+
     for n in sorted(set(rows) | {node for node, _ in started}):
+        row = rows.get(n, {})
+        # smallest/largest app and smallest/largest total across modes for this
+        # row get highlighted, kept as separate groups since total >= app always
+        # and would otherwise dominate.
+        app_vals = {label: row[label]["app"] for label in row}
+        total_vals = {label: row[label]["total"] for label in row}
+        smallest_app = min(app_vals, key=app_vals.get) if app_vals else None
+        biggest_app = max(app_vals, key=app_vals.get) if app_vals else None
+        smallest_total = min(total_vals, key=total_vals.get) if total_vals else None
+        biggest_total = max(total_vals, key=total_vals.get) if total_vals else None
+
+        def _cell(
+            row: dict, label: str, key: str, smallest: str | None, biggest: str | None
+        ) -> str:
+            value = f"{row[label][key]:.1f}"
+            if smallest != biggest and label == smallest:
+                return f"[green]{value}[/green]"
+            if smallest != biggest and label == biggest:
+                return f"[yellow]{value}[/yellow]"
+            return value
+
         cells = [str(n)]
-        for label in ("glass", "gekko", "pfs"):
-            if label in rows.get(n, {}):
-                a, t = rows[n][label]
-                cells.append(f"{a:.1f}")
-                cells.append(f"{t:.1f}")
+        for label in ("glass", "gekko"):
+            if label in row:
+                cells.append(_cell(row, label, "app", smallest_app, biggest_app))
+                cells.append(f"{row[label]['stage_in']:.1f}")
+                cells.append(f"{row[label]['stage_out']:.1f}")
+                cells.append(_cell(row, label, "total", smallest_total, biggest_total))
             elif (n, label) in started:
-                cells.append("[red]FAIL[/red]")
-                cells.append("[red]FAIL[/red]")
+                cells.extend(["[red]FAIL[/red]"] * 4)
             else:
-                cells.append("-")
-                cells.append("-")
+                cells.extend(["-"] * 4)
+        if "pfs" in row:
+            cells.append(_cell(row, "pfs", "app", smallest_app, biggest_app))
+            cells.append(_cell(row, "pfs", "total", smallest_total, biggest_total))
+        elif (n, "pfs") in started:
+            cells.extend(["[red]FAIL[/red]"] * 2)
+        else:
+            cells.extend(["-"] * 2)
+
+        # GLASS goal for the row: glass total < gekko total < pfs total. Flag it
+        # on the "nodes" cell only -- coloring the whole row would swamp the
+        # per-cell smallest/largest highlighting done above.
+        goal_hit = {"glass", "gekko", "pfs"} <= set(total_vals) and total_vals[
+            "glass"
+        ] < total_vals["gekko"] < total_vals["pfs"]
+        if goal_hit:
+            cells[0] = f"[bold green]{cells[0]}[/bold green]"
         table.add_row(*cells)
     CONSOLE.print(table)
 

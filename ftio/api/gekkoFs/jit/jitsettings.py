@@ -208,15 +208,19 @@ class JitSettings:
             )
 
     def update_app_nodes(self):
-        if self.pre_app_call:
-            if "$APP_PROCS_X_NODES" in self.pre_app_call:
-                self.pre_app_call = self.pre_app_call.replace(
+        def _substitute(call: str) -> str:
+            if "$APP_PROCS_X_NODES" in call:
+                return call.replace(
                     "$APP_PROCS_X_NODES", str(self.procs_app * self.app_nodes)
                 )
-            elif "$APP_NODES" in self.pre_app_call:
-                self.pre_app_call = self.pre_app_call.replace(
-                    "$APP_NODES", str(self.app_nodes)
-                )
+            if "$APP_NODES" in call:
+                return call.replace("$APP_NODES", str(self.app_nodes))
+            return call
+
+        if isinstance(self.pre_app_call, list):
+            self.pre_app_call = [_substitute(call) for call in self.pre_app_call]
+        elif self.pre_app_call:
+            self.pre_app_call = _substitute(self.pre_app_call)
 
     def set_absolute_path(self) -> None:
         self.run_dir = os.path.expanduser(self.run_dir)
@@ -640,16 +644,30 @@ class JitSettings:
                 # dlio_dir = (
                 # f"{self.tmp_dir}/stage-in"  # write to stag-in, than stage-in data
                 # )
-                self.pre_app_call = (
-                    f"mpirun -np $APP_PROCS_X_NODES dlio_benchmark "
-                    f"{workload} "
-                    f"++workload.workflow.generate_data=True "
-                    f"++workload.workflow.train=False "
-                    f"++workload.workflow.checkpoint=False "
-                    f"++workload.dataset.data_folder={dlio_dir}/data "
-                    f"++workload.checkpoint.checkpoint_folder={dlio_dir}/checkpoints "
-                    f"++workload.output.output_folder={dlio_dir}/hydra_log "
-                )
+                # generate_data used to launch straight into the $APP_PROCS_X_NODES
+                # mpirun below, so every rank raced to create data/checkpoints/
+                # hydra_log under the FUSE mount at once. At 65 nodes (256 ranks)
+                # that races the same three mkdir()s over and over -- gekko_fuse.log
+                # showed the daemon stuck spinning "root node allocated / . / .."
+                # (readdir on the mount root) for the full 30-minute timeout, never
+                # reaching the actual data-generation writes. The same workload at
+                # the same concurrency runs fine on a real FS (see exclude_daemon
+                # above), so this is FUSE-mount-specific contention, not dlio_benchmark
+                # itself. Pre-creating the three dirs as a single serial step first
+                # removes the race outright.
+                self.pre_app_call = [
+                    f"mkdir -p {dlio_dir}/data {dlio_dir}/checkpoints {dlio_dir}/hydra_log",
+                    (
+                        f"mpirun -np $APP_PROCS_X_NODES dlio_benchmark "
+                        f"{workload} "
+                        f"++workload.workflow.generate_data=True "
+                        f"++workload.workflow.train=False "
+                        f"++workload.workflow.checkpoint=False "
+                        f"++workload.dataset.data_folder={dlio_dir}/data "
+                        f"++workload.checkpoint.checkpoint_folder={dlio_dir}/checkpoints "
+                        f"++workload.output.output_folder={dlio_dir}/hydra_log "
+                    ),
+                ]
                 self.post_app_call = ""
         # ├─ Nek5000
         elif "nek" in self.app:
@@ -1165,8 +1183,12 @@ class JitSettings:
             # An empty flush pattern matches nothing, so FTIO would trigger on
             # time but stage 0 items and the checkpoints would pile up in the
             # rootdir until the post-app copy hits EDQUOT. The mountdir only
-            # ever holds ckpt.restart.<step>, so match them explicitly.
-            self.regex_flush_match = ".*/ckpt\\.restart\\.\\d+$"
+            # ever holds ckpt.restart.<step>.<fileidx> (nfile 64 in in.ckpt
+            # splits each checkpoint into 64 concurrently-written files so a
+            # single writer isn't the one throttling GekkoFS's daemon fan-out)
+            # plus one ckpt.restart.<step>.base metadata file per checkpoint --
+            # confirmed against an actual local run, not assumed from the docs.
+            self.regex_flush_match = ".*/ckpt\\.restart\\.\\d+\\.(\\d+|base)$"
             self.regex_stage_out_match = ".*"
             self.regex_stage_in_match = ".*"
         # ├─ S3D-IO

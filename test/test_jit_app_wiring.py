@@ -33,7 +33,7 @@ MNT = "/mnt/gkfs"
 
 # The patterns jitsettings assigns per app, and a path each one must select.
 APP_PATTERNS = {
-    "lammps": (r".*/ckpt\.restart\.\d+$", f"{MNT}/ckpt.restart.80"),
+    "lammps": (r".*/ckpt\.restart\.\d+\.(\d+|base)$", f"{MNT}/ckpt.restart.80.5"),
     "castro": (r".*/sedov_3d_sph_chk\d+(?=/)", f"{MNT}/sedov_3d_sph_chk00010/Header"),
     "warpx": (r".*/chk\d+(?=/)", f"{MNT}/chk000010/WarpXHeader"),
     "qmcpack": (r".*/glass_heg\.s\d+\.config\.h5$", f"{MNT}/glass_heg.s000.config.h5"),
@@ -54,6 +54,16 @@ def test_wrf_regex_matches_restarts_not_history_or_logs():
     assert wrf.match(f"{MNT}/wrfrst_d01_0001-01-01_02:00:00")
     for never in ("wrfout_d01_0001-01-01_00:00:00", "rsl.error.0000", "namelist.input"):
         assert not wrf.match(f"{MNT}/{never}"), f"{never} must never be staged out"
+
+
+def test_lammps_regex_matches_the_base_metadata_file_too():
+    # nfile 64 splits each checkpoint into per-group data files (.0, .1, ...)
+    # plus one ckpt.restart.<step>.base metadata file -- confirmed against a
+    # real local LAMMPS run, not assumed from the docs. Missing it here means
+    # it never gets staged out and piles up in the mount.
+    lammps = re.compile(APP_PATTERNS["lammps"][0])
+    assert lammps.match(f"{MNT}/ckpt.restart.80.base")
+    assert lammps.match(f"{MNT}/ckpt.restart.80.0")
 
 
 def test_amrex_regexes_exclude_the_temp_rename_artifacts():
@@ -189,3 +199,47 @@ def test_no_app_is_wired_with_the_cdf_cpf_cluster_aliases():
                 "a cdf/cpf pre_app_call is back -- those aliases do not exist "
                 "off the cluster: " + stripped
             )
+
+
+# ── pre_app_call as a list (dlio: mkdir before the racy parallel mpirun) ─────
+
+
+def _node_settings(pre_app_call, procs_app=4, app_nodes=64) -> SimpleNamespace:
+    return SimpleNamespace(
+        pre_app_call=pre_app_call, procs_app=procs_app, app_nodes=app_nodes
+    )
+
+
+def test_update_app_nodes_substitutes_every_call_in_a_list():
+    # dlio's pre_app_call is a [mkdir, mpirun] list: pre-creating data/
+    # checkpoints/hydra_log serially avoids every one of the $APP_PROCS_X_NODES
+    # ranks racing to create the same three dirs under the FUSE mount at once
+    # (that race is what hung dlio glass/gekko at 33 and 65 nodes -- confirmed
+    # against gekko_fuse.log spinning on root readdir for the full timeout).
+    # `"$APP_PROCS_X_NODES" in a_list` checks list membership, not substring
+    # containment, so a naive fix would silently skip substitution here.
+    s = _node_settings(["mkdir -p /mnt/data", "mpirun -np $APP_PROCS_X_NODES foo"])
+    JitSettings.update_app_nodes(s)
+    assert s.pre_app_call == ["mkdir -p /mnt/data", "mpirun -np 256 foo"]
+
+
+def test_set_dir_gekko_relocates_mntdir_inside_a_pre_app_call_list(monkeypatch):
+    from ftio.api.gekkoFs.jit.setup_helper import set_dir_gekko
+
+    monkeypatch.setattr("socket.gethostname", lambda: "gs01r1b01")
+    s = SimpleNamespace(
+        node_local=True,
+        cluster=True,
+        job_id="123",
+        gkfs_rootdir="/dev/shm/tarraf_gkfs_rootdir",
+        gkfs_mntdir="/dev/shm/tarraf_gkfs_mountdir",
+        run_dir="/run",
+        app_flags="",
+        pre_app_call=["mkdir -p /dev/shm/tarraf_gkfs_mountdir/data", "mpirun foo"],
+        post_app_call="",
+        app_call="",
+        update_files_with_gkfs_mntdir=[],
+    )
+    set_dir_gekko(s)
+    assert s.pre_app_call[0] == "mkdir -p /scratch/tmp/123/tarraf_gkfs_mountdir/data"
+    assert s.pre_app_call[1] == "mpirun foo"

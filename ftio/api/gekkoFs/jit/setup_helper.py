@@ -1550,13 +1550,21 @@ def set_dir_gekko(settings: JitSettings) -> None:
         jit_print(f" |-> Gekko mnt dir updated to: {settings.gkfs_mntdir}")
 
         for attr in ["run_dir", "app_flags", "pre_app_call", "post_app_call", "app_call"]:
-            if old_gkfs_mntdir in getattr(settings, attr):
+            value = getattr(settings, attr)
+            # pre_app_call may be a list of calls (e.g. dlio's mkdir + mpirun
+            # steps) instead of a single string.
+            if isinstance(value, list):
                 setattr(
                     settings,
                     attr,
-                    getattr(settings, attr).replace(
-                        old_gkfs_mntdir, settings.gkfs_mntdir
-                    ),
+                    [
+                        call.replace(old_gkfs_mntdir, settings.gkfs_mntdir)
+                        for call in value
+                    ],
+                )
+            elif old_gkfs_mntdir in value:
+                setattr(
+                    settings, attr, value.replace(old_gkfs_mntdir, settings.gkfs_mntdir)
                 )
                 jit_print(
                     f" |-> {attr.replace('_', ' ').capitalize()} updated to: {getattr(settings, attr)}"

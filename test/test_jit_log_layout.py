@@ -157,9 +157,24 @@ def test_totals_by_node_totals_and_compute_nodes(tmp_path):
     )
     rows = totals_by_node(j)
     assert set(rows) == {8}  # 9 minus the dedicated FTIO node
-    assert rows[8]["glass"] == (24.0, 44.0)
-    assert rows[8]["gekko"] == (20.0, 36.0)
-    assert rows[8]["pfs"] == (22.0, 22.0)
+    assert rows[8]["glass"] == {
+        "app": 24.0,
+        "stage_in": 4.0,
+        "stage_out": 16.0,
+        "total": 44.0,
+    }
+    assert rows[8]["gekko"] == {
+        "app": 20.0,
+        "stage_in": 0.0,
+        "stage_out": 16.0,
+        "total": 36.0,
+    }
+    assert rows[8]["pfs"] == {
+        "app": 22.0,
+        "stage_in": 0.0,
+        "stage_out": 0.0,
+        "total": 22.0,
+    }
 
 
 def test_totals_by_node_latest_timestamp_wins(tmp_path):
@@ -187,7 +202,7 @@ def test_totals_by_node_latest_timestamp_wins(tmp_path):
             }
         ],
     )
-    assert totals_by_node(j)[2]["glass"][0] == 9.0
+    assert totals_by_node(j)[2]["glass"]["app"] == 9.0
 
 
 def test_started_runs_finds_attempted_modes(tmp_path):
