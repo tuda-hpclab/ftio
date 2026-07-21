@@ -41,6 +41,8 @@ def ftio_stft(
     total_bytes: int = 0,
     ranks: int = 1,
     text: str = "",
+    rank_sequence: np.ndarray | None = None,
+    rank_sequence_time: np.ndarray | None = None,
 ) -> tuple[Prediction, AnalysisFigures]:
     """
     Performs a Short-Time Fourier Transform (STFT) on the sampled bandwidth data.
@@ -52,6 +54,17 @@ def ftio_stft(
         total_bytes (int, optional): Total number of bytes transferred.
         ranks (int, optional): The number of ranks.
         text (str, optional): Additional text for output.
+        rank_sequence (np.ndarray, optional): per-burst rank count -- only
+            non-None when the source trace's rank count actually changed
+            mid-run (malleability; see extract.get_time_behavior). Has its
+            OWN time basis, `rank_sequence_time` -- it comes from a different
+            granularity of the source data than `time_stamps`/`bandwidth`
+            (see extract._rank_sequence), so it is matched to each STFT
+            window by time range, not by index. Used to label each window
+            with the rank count actually active during it, instead of the
+            one constant `ranks` value for windows that don't match it.
+        rank_sequence_time (np.ndarray, optional): time basis for
+            `rank_sequence`, same length as it.
 
     Returns:
         tuple: (prediction, analysis_figures)
@@ -203,6 +216,28 @@ def ftio_stft(
     phases.insert(0, np.angle(np.mean(Zxx[best_idx_global, :], axis=0)))
     ranges.insert(0, [t_start_trace, t_end_trace])
 
+    #! Per-window rank count, only when the trace's rank count actually
+    #! varies (malleability) -- otherwise leave it empty and let consumers
+    #! fall back to the constant `ranks` scalar. rank_sequence has its own
+    #! time basis (rank_sequence_time), not time_stamps -- see docstring.
+    ranks_per_window: list[int] = []
+    if (
+        rank_sequence is not None
+        and rank_sequence_time is not None
+        and len(rank_sequence) == len(rank_sequence_time)
+        and len(rank_sequence) > 0
+        and len(np.unique(rank_sequence)) > 1
+    ):
+        rank_sequence = np.asarray(rank_sequence)
+        rank_sequence_time = np.asarray(rank_sequence_time)
+        for win_t_start, win_t_end in ranges:
+            mask = (rank_sequence_time >= win_t_start) & (rank_sequence_time <= win_t_end)
+            if np.any(mask):
+                values, counts = np.unique(rank_sequence[mask], return_counts=True)
+                ranks_per_window.append(int(values[np.argmax(counts)]))
+            else:
+                ranks_per_window.append(ranks)
+
     #! Assign data to prediction (global summary + windows)
     prediction.dominant_freq = np.array(dominant_freqs)
     prediction.conf = np.array(conf_vals)
@@ -212,6 +247,7 @@ def ftio_stft(
     prediction.t_end = t_end_trace
     prediction.freq = args.freq
     prediction.ranks = ranks
+    prediction.ranks_per_window = np.array(ranks_per_window)
     prediction.total_bytes = total_bytes
     prediction.n_samples = len(b_sampled)
     prediction.ranges = np.array(ranges)

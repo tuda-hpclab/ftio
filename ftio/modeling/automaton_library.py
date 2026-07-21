@@ -217,7 +217,7 @@ class AutomatonLibrary:
     # Node lookup (configuration-level, cross-path)
     # ------------------------------------------------------------------
 
-    def load_node(
+    def get_rank_behavior(
         self,
         app_name: str,
         ranks: int,
@@ -236,14 +236,14 @@ class AutomatonLibrary:
         being blended into one average.
 
         at_time / at_cycle: either, both, or neither may be given -- see
-        ReferenceAutomaton.node() for exact matching semantics.
+        ReferenceAutomaton.get_rank_behavior() for exact matching semantics.
         """
         nodes: dict[int, list[NodeBehavior]] = {}
         for key in self.available_rank_keys(app_name):
             ref = self._load_file(self._path(app_name, key))
             if ref is None:
                 continue
-            for behavior in ref.node(ranks):
+            for behavior in ref.get_rank_behavior(ranks):
                 ReferenceAutomaton._fold_behavior(nodes, ranks, behavior)
 
         merged_ref = ReferenceAutomaton(
@@ -255,4 +255,4 @@ class AutomatonLibrary:
             run_count=0,
             nodes=nodes,
         )
-        return merged_ref.node(ranks, at_time=at_time, at_cycle=at_cycle)
+        return merged_ref.get_rank_behavior(ranks, at_time=at_time, at_cycle=at_cycle)

@@ -95,7 +95,7 @@ def demo_malleability():
     ref = ReferenceAutomaton.from_automaton_dict(aut.to_dict(), "app_A", "8_16_32_64")
     print("\n  node table (one behavior per rank count, as expected):")
     for ranks in (8, 16, 32, 64):
-        b = ref.node(ranks)[0]
+        b = ref.get_rank_behavior(ranks)[0]
         print(
             f"    ranks={ranks:3d}  period={b.period_mean:5.1f}s  "
             f"cycles=[{b.c_start_mean:.0f},{b.c_end_mean:.0f}]"
@@ -124,20 +124,23 @@ def demo_speed_confound():
 
     for label, ref in (("FAST", ref_fast), ("SLOW", ref_slow)):
         print(f"  {label} run behaviors:")
-        for b in ref.node(32):
+        for b in ref.get_rank_behavior(32):
             print(
                 f"    period={b.period_mean:.2f}s  "
                 f"time=[{b.t_start_mean:.1f},{b.t_end_mean:.1f}]s  "
                 f"cycle=[{b.c_start_mean:.0f},{b.c_end_mean:.0f}]"
             )
 
-    probe_t = (ref_fast.node(32)[0].t_end_mean + ref_slow.node(32)[0].t_end_mean) / 2
+    probe_t = (
+        ref_fast.get_rank_behavior(32)[0].t_end_mean
+        + ref_slow.get_rank_behavior(32)[0].t_end_mean
+    ) / 2
     print(f"\n  Querying BOTH runs at t={probe_t:.1f}s (between the two switch times):")
     print(
-        f"    fast -> {[f'{b.period_mean:.2f}s' for b in ref_fast.node(32, at_time=probe_t)]}  (already switched)"
+        f"    fast -> {[f'{b.period_mean:.2f}s' for b in ref_fast.get_rank_behavior(32, at_time=probe_t)]}  (already switched)"
     )
     print(
-        f"    slow -> {[f'{b.period_mean:.2f}s' for b in ref_slow.node(32, at_time=probe_t)]}  (hasn't switched yet)"
+        f"    slow -> {[f'{b.period_mean:.2f}s' for b in ref_slow.get_rank_behavior(32, at_time=probe_t)]}  (hasn't switched yet)"
     )
     print(
         "    -> wall-clock time gives DIFFERENT, inconsistent answers for the same logical point."
@@ -146,10 +149,10 @@ def demo_speed_confound():
     probe_c = 3  # still inside the first 4-burst behavior on BOTH runs
     print(f"\n  Querying BOTH runs at cycle={probe_c} (bursts observed so far):")
     print(
-        f"    fast -> {[f'{b.period_mean:.2f}s' for b in ref_fast.node(32, at_cycle=probe_c)]}"
+        f"    fast -> {[f'{b.period_mean:.2f}s' for b in ref_fast.get_rank_behavior(32, at_cycle=probe_c)]}"
     )
     print(
-        f"    slow -> {[f'{b.period_mean:.2f}s' for b in ref_slow.node(32, at_cycle=probe_c)]}"
+        f"    slow -> {[f'{b.period_mean:.2f}s' for b in ref_slow.get_rank_behavior(32, at_cycle=probe_c)]}"
     )
     print(
         "    -> cycle count gives the SAME behavior identified, regardless of run speed."
@@ -166,13 +169,13 @@ def demo_seeding(lib: AutomatonLibrary):
 
     lib.seed("seed_demo_close", {128: {"period": 10.3, "dwell": 20.0}})
     lib.save(automaton([(128, 10.0, 8)]), "seed_demo_close", "128")
-    close_result = lib.load_node("seed_demo_close", 128)
+    close_result = lib.get_rank_behavior("seed_demo_close", 128)
     print("  seed=10.3s, real=10.0s (3% off, within ~6% tolerance):")
     print(f"    -> {[f'{b.period_mean:.2f}s (n={b.n_samples})' for b in close_result]}")
 
     lib.seed("seed_demo_far", {128: {"period": 100.0, "dwell": 100.0}})
     lib.save(automaton([(128, 10.0, 8)]), "seed_demo_far", "128")
-    far_result = lib.load_node("seed_demo_far", 128)
+    far_result = lib.get_rank_behavior("seed_demo_far", 128)
     print("  seed=100.0s, real=10.0s (10x off, outside tolerance):")
     print(f"    -> {[f'{b.period_mean:.2f}s (n={b.n_samples})' for b in far_result]}")
     print(
@@ -197,10 +200,10 @@ def demo_cross_path(lib: AutomatonLibrary):
         "32_128",
     )
 
-    shared = lib.load_node("cross_path_demo", 128)
+    shared = lib.get_rank_behavior("cross_path_demo", 128)
     print("  path A: 8->128, path B: 32->128, both reach 128 at period=10s")
     print(
-        f"  load_node('cross_path_demo', 128) -> {len(shared)} behavior(s), "
+        f"  get_rank_behavior('cross_path_demo', 128) -> {len(shared)} behavior(s), "
         f"n_samples={shared[0].n_samples} (pooled from BOTH paths)"
     )
 

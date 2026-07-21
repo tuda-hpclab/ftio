@@ -39,9 +39,18 @@ class ParseZmq:
             self.msgs = get_msgs_zmq(args)
 
         if "direct" in args.zmq_source:
+            # Multiple messages can arrive in one drain cycle (see
+            # processes_zmq.receive_messages) -- keep every one of them
+            # instead of only the last, same as jsonl/msgpack do for their
+            # own multi-part files. ext="jsonl" reuses that existing
+            # multi-part merge path (Simrun.merge_parts): extract() already
+            # shapes each message like one JSONL line/part.
+            dataframes = []
+            ranks = 0
             for msg in self.msgs:
                 dataframe, ranks = extract(msg, args)
-            return Simrun(dataframe, "txt", str(ranks), args, index)
+                dataframes.append(dataframe)
+            return Simrun(dataframes, "jsonl", str(ranks), args, index)
         elif "tmio" in args.zmq_source.lower():
             data = extract_data(self.msgs[0], [])
             return Simrun(data, "msgpack", "0", args, index)

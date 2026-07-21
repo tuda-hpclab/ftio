@@ -31,10 +31,25 @@ class Sample:
         self.max_io_ops_per_rank = self.assign(values, "max_io_ops_per_rank")
         self.max_io_ops_in_phase = self.assign(values, "max_io_ops_in_phase")
         self.total_io_ops = self.assign(values, "total_io_ops")
-        self.number_of_ranks = self.assign(values, "number_of_ranks")
-        self.total_number_of_ranks = self.assign(values, "total_number_of_ranks")
+        self.number_of_ranks, self.number_of_ranks_sequence = self._split_ranks(
+            self.assign(values, "number_of_ranks")
+        )
+        self.total_number_of_ranks, self.total_number_of_ranks_sequence = (
+            self._split_ranks(self.assign(values, "total_number_of_ranks"))
+        )
         self.bandwidth = self.assign_bandwidth(values, io_type, args)
         self.file_index = args.file_index
+
+    @staticmethod
+    def _split_ranks(value):
+        """Merged rank counts may be a burst-aligned list when malleability
+        changed the rank count mid-run (see Simrun.merge_fields). Keep a
+        scalar summary (the per-Sample value everything else expects) plus
+        the full sequence (only used by find_data(), when its length lines
+        up with the specific burst array being built)."""
+        if isinstance(value, list):
+            return (max(value) if value else float("NaN")), value
+        return value, None
 
     def get_data(self):
         #! append list is much faster than append data frame
@@ -46,9 +61,16 @@ class Sample:
         name_ind_ovr = ["b_overlap_ind", "t_overlap_ind"]
         name_ind = ["b_ind", "t_ind_s", "t_ind_e"]
 
-        # add phase statistics
+        # add phase statistics. file_index IS kept here (unlike bandwidth) so
+        # df0 can be matched back to the right df1 rows per source file --
+        # needed once a single file's own rank count can vary (malleability).
+        excluded = (
+            "bandwidth",
+            "number_of_ranks_sequence",
+            "total_number_of_ranks_sequence",
+        )
         for attr, value in self.__dict__.items():
-            if attr not in ["bandwidth", "file_index"]:
+            if attr not in excluded:
                 name0.append(attr)
                 data0.append(value)
 
@@ -99,5 +121,11 @@ class Sample:
         data = [getattr(self.bandwidth, s) for s in name]
         length = len(data[-1])
         name = name + common
-        data.extend([[self.number_of_ranks] * length, [self.file_index] * length])
+        if self.number_of_ranks_sequence is not None and (
+            len(self.number_of_ranks_sequence) == length
+        ):
+            ranks_col = list(self.number_of_ranks_sequence)
+        else:
+            ranks_col = [self.number_of_ranks] * length
+        data.extend([ranks_col, [self.file_index] * length])
         return name, data

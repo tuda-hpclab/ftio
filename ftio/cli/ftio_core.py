@@ -213,10 +213,12 @@ def freq_analysis(args: Namespace, data: dict) -> tuple[Prediction, AnalysisFigu
     time_b = data["time"] if "time" in data else np.array([])
     total_bytes = data.get("total_bytes", 0)
     ranks = data.get("ranks", 0)
+    rank_sequence = data.get("rank_sequence")
+    rank_sequence_time = data.get("rank_sequence_time")
 
     #! Extract relevant data
-    bandwidth, time_b, text = data_in_time_window(
-        args, bandwidth, time_b, total_bytes, ranks
+    bandwidth, time_b, text, rank_sequence, rank_sequence_time = data_in_time_window(
+        args, bandwidth, time_b, total_bytes, ranks, rank_sequence, rank_sequence_time
     )
 
     #! Perform transformation
@@ -235,7 +237,14 @@ def freq_analysis(args: Namespace, data: dict) -> tuple[Prediction, AnalysisFigu
 
     elif "stft" in args.transformation and "astft" not in args.transformation:
         prediction, analysis_figures = ftio_stft(
-            args, bandwidth, time_b, total_bytes, ranks, text
+            args,
+            bandwidth,
+            time_b,
+            total_bytes,
+            ranks,
+            text,
+            rank_sequence,
+            rank_sequence_time,
         )
 
     elif "astft" in args.transformation:

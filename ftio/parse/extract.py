@@ -24,45 +24,93 @@ def get_time_behavior(df) -> list[dict]:
 
     Args:
         df (dataframe): obtained from scales.py
+
+    Groups by source file (``file_index``), not by rank count: a single file's
+    own rank count can vary mid-run under malleability (see
+    Simrun.merge_fields), so filtering rows by "number_of_ranks == <value>"
+    would silently drop whichever rank count wasn't picked as the file's
+    label. Grouping by file_index instead keeps every row from a file
+    together regardless of how many distinct rank counts it contains.
     """
     out = []
-    files = [int(i) for i in pd.unique(df[0]["number_of_ranks"])]
-    for i in files:
-        ranks = df[1]["number_of_ranks"].isin([i])
-        reported_ranks = _resolve_ranks(df[0], i)
-        if len(df[1]["file_index"][ranks]) != 0:
-            for j in range(0, int(df[1]["file_index"][ranks].max() + 1)):
-                # print(f"  \033[1;32mRanks {i}\033[1;0m")
-                file_index = df[1]["file_index"][ranks].isin([j])
-                time = df[1]["t_overlap"][ranks][file_index].to_numpy()
-                bandwidth = df[1]["b_overlap_avr"][ranks][file_index].to_numpy()
-                try:
-                    total_bytes = df[0]["total_bytes"].to_numpy()
-                    total_bytes = int(float(total_bytes[-1]))
-                except ValueError:
-                    total_bytes = 0
-                    # expe.center()np.sum(bandwidth * (np.concatenate([time[1:], time[-1:]]) - time)
-                tmp = {
-                    "time": time,
-                    "bandwidth": bandwidth,
-                    "total_bytes": total_bytes,
-                    "ranks": reported_ranks,
-                }
-                out.append(tmp)
+    file_indices = [int(i) for i in pd.unique(df[0]["file_index"])]
+    for j in file_indices:
+        file_mask = df[1]["file_index"].isin([j])
+        if len(df[1]["file_index"][file_mask]) == 0:
+            continue
+        time = df[1]["t_overlap"][file_mask].to_numpy()
+        bandwidth = df[1]["b_overlap_avr"][file_mask].to_numpy()
+        try:
+            total_bytes = df[0]["total_bytes"].to_numpy()
+            total_bytes = int(float(total_bytes[-1]))
+        except ValueError:
+            total_bytes = 0
+            # expe.center()np.sum(bandwidth * (np.concatenate([time[1:], time[-1:]]) - time)
+        rank_sequence, rank_sequence_time = _rank_sequence(df[2], j)
+        tmp = {
+            "time": time,
+            "bandwidth": bandwidth,
+            "total_bytes": total_bytes,
+            "ranks": _resolve_ranks(df[0], j),
+            "rank_sequence": rank_sequence,
+            "rank_sequence_time": rank_sequence_time,
+        }
+        out.append(tmp)
     return out
 
 
-def _resolve_ranks(df0, number_of_ranks: int) -> int:
+def _rank_sequence(df2, file_index: int) -> tuple[np.ndarray, np.ndarray]:
+    """Per-burst (rank-level) rank count + its own time basis, for one file.
+
+    This deliberately reads df2 (the rank-level "t_rank_s"/"t_rank_e"
+    grouping), not df1 (the overlap-merged "t_overlap" signal FTIO actually
+    analyses): Sample.number_of_ranks_sequence is built burst-aligned to
+    whichever raw array Simrun.merge_fields saw per JSONL/msgpack part
+    (t_rank_s/t_rank_e), which is *not* the same length as the overlap
+    algorithm's output in df1 -- overlap merges concurrent per-rank
+    intervals into fewer, non-1:1-corresponding points. Pairing the sequence
+    with its own (df2) time basis and doing a time-range lookup later (see
+    ftio_stft) sidesteps needing that alignment at all.
+
+    Returns two empty arrays if this file's rank count never varied (the
+    common case) -- callers should fall back to the scalar ``ranks`` value.
+    """
+    if "number_of_ranks" not in df2 or "t_rank_e" not in df2:
+        return np.array([]), np.array([])
+    mask = df2["file_index"].isin([file_index])
+    ranks_col = df2["number_of_ranks"][mask]
+    if ranks_col.empty or ranks_col.nunique() <= 1:
+        return np.array([]), np.array([])
+    return ranks_col.to_numpy(), df2["t_rank_e"][mask].to_numpy()
+
+
+def _resolve_ranks(df0, file_index: int) -> int:
     """Prefer the rank count the trace reports directly (``total_number_of_ranks``,
     the size of the run's own communicator) over ``number_of_ranks``, which is
-    only a grouping key -- online, it reflects however many ranks' messages had
-    arrived by the time this window was assembled, so it can look like a rank
-    change when a straggler rank was just running behind schedule.
+    only a grouping label -- online, it reflects however many ranks' messages
+    had arrived by the time this window was assembled, so it can look like a
+    rank change when a straggler rank was just running behind schedule.
+
+    This is a single scalar summary for the whole file (its peak rank count,
+    since number_of_ranks/total_number_of_ranks collapse to max() across a
+    malleable run -- see Simrun.merge_fields). For a per-window rank count use
+    the ``rank_sequence`` array on the returned dict instead.
+
+    df0 mixes a string column ("type") in with the rest, which forces the
+    whole frame to string dtype (see Scales.assign_data_io) -- values are
+    coerced through pd.to_numeric rather than compared/cast directly.
     """
+    file_index_col = pd.to_numeric(df0["file_index"], errors="coerce")
+    row = df0.loc[file_index_col == file_index]
+    if row.empty:
+        return 0
+    number_of_ranks = pd.to_numeric(row["number_of_ranks"], errors="coerce").iloc[0]
+    if pd.isna(number_of_ranks):
+        return 0
+    number_of_ranks = int(number_of_ranks)
     if "total_number_of_ranks" not in df0:
         return number_of_ranks
-    reported = df0.loc[df0["number_of_ranks"] == number_of_ranks, "total_number_of_ranks"]
-    reported = reported.dropna()
+    reported = pd.to_numeric(row["total_number_of_ranks"], errors="coerce").dropna()
     if reported.empty:
         return number_of_ranks
     value = int(reported.iloc[0])

@@ -638,6 +638,12 @@ def windows_from_stft_prediction(prediction: Prediction) -> list[Prediction]:
     This is what makes phase-automaton modelling possible offline, from a
     single ``ftio --transformation stft`` run, without a live ZMQ stream.
 
+    Each window's `ranks` comes from `prediction.ranks_per_window` when the
+    source trace's rank count actually varied mid-run (malleability -- see
+    Simrun.merge_fields and ftio_stft), so a genuine `rank_change` transition
+    can fire at the real boundary; otherwise every window falls back to the
+    one constant `prediction.ranks` value, as before.
+
     Returns an empty list if `prediction` does not carry a per-window
     sequence (e.g. it came from DFT/wavelet, or autocorrelation merging
     collapsed the arrays).
@@ -648,6 +654,9 @@ def windows_from_stft_prediction(prediction: Prediction) -> list[Prediction]:
     if len(freqs) < 2 or len(ranges) < 2 or len(freqs) != len(ranges):
         return []
 
+    ranks_per_window = prediction.ranks_per_window
+    has_ranks_per_window = len(ranks_per_window) == len(freqs)
+
     windows = []
     for i in range(1, len(freqs)):  # skip index 0: the whole-trace summary
         t_start, t_end = ranges[i]
@@ -655,7 +664,7 @@ def windows_from_stft_prediction(prediction: Prediction) -> list[Prediction]:
             transformation=prediction.source or "stft",
             t_start=float(t_start),
             t_end=float(t_end),
-            ranks=prediction.ranks,
+            ranks=int(ranks_per_window[i]) if has_ranks_per_window else prediction.ranks,
         )
         win.dominant_freq = np.array([freqs[i]])
         win.conf = np.array([confs[i] if i < len(confs) else np.nan])

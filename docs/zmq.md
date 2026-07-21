@@ -125,6 +125,18 @@ data = {
 sock.send(msgpack.dumps(data))
 ```
 
+**Streaming multiple messages (phase automaton demo):** the single-message example above is enough to check the wire format works, but it can't show the phase automaton doing anything — that needs a *sequence* of bursts over time. `examples/API/zmq/stream_phase_demo.py` sends 10 bursts with a ~2s period, then 10 more with a ~1s period, so you can watch a state open, a period change get detected, and a transition fire — with no trace file, no TMIO, no compiled sender:
+
+```bash
+# terminal 1
+predictor --zmq -f 10 --phase-automaton --pa-method ksigma -e no
+
+# terminal 2
+python examples/API/zmq/stream_phase_demo.py
+```
+
+Expect `predictor` to log a state at ~2.1s period for the first ~20s, then a `TRANSITION: State 0 → 1 (0.48 → 1.00 Hz)` once the faster phase kicks in. Use `--speed 0.1` for a 10x-faster smoke test.
+
 ---
 
 ## ZMQ with TMIO

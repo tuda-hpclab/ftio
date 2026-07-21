@@ -138,27 +138,29 @@ class ModelManager:
     # Configuration-level lookup (independent of path/position)
     # ------------------------------------------------------------------
 
-    def guess_node(
+    def get_rank_behavior(
         self,
         ranks: int,
         at_time: float | None = None,
         at_cycle: float | None = None,
     ) -> list[NodeBehavior]:
-        """Early-estimate lookup for one configuration, independent of path.
+        """Look up known behavior for one configuration, independent of path.
 
         Works even during cold start (no matching path loaded yet) or for a
         rank count this run's own path hasn't reached -- folds every stored
         path for this app that has seen ``ranks``, so a seed
         (AutomatonLibrary.seed) or a run that reached this configuration via
-        a different malleability sequence still contributes a guess.
+        a different malleability sequence still contributes. The result may
+        be a real pooled observation or just a hand-authored seed with no run
+        behind it yet -- check ``n_samples`` if that distinction matters.
 
         at_time / at_cycle: either, both, or neither may be given -- see
-        ReferenceAutomaton.node() for exact matching semantics. at_cycle
-        (bursts since entering this configuration) is the axis that stays
-        valid across runs of different speed; at_time (wall-clock seconds)
-        can drift for reasons unrelated to which behavior is active.
+        ReferenceAutomaton.get_rank_behavior() for exact matching semantics.
+        at_cycle (bursts since entering this configuration) is the axis that
+        stays valid across runs of different speed; at_time (wall-clock
+        seconds) can drift for reasons unrelated to which behavior is active.
         """
-        return self._library.load_node(self._app_name, ranks, at_time, at_cycle)
+        return self._library.get_rank_behavior(self._app_name, ranks, at_time, at_cycle)
 
     # ------------------------------------------------------------------
     # Shutdown

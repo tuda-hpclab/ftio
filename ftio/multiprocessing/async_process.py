@@ -13,6 +13,7 @@ https://github.com/tuda-parallel/FTIO/blob/main/LICENSE
 
 from __future__ import annotations
 
+import multiprocessing
 from collections.abc import Callable
 from multiprocessing import Process
 
@@ -27,7 +28,14 @@ def handle_in_process(function: Callable, args) -> Process:
     Returns:
         None
     """
-    process = Process(target=function, args=args)
+    # Explicitly fork rather than take the platform default (which changed to
+    # "forkserver" on some newer Python/Linux combinations): SharedResources
+    # carries a multiprocessing.Manager() proxy that a forked child inherits
+    # directly (no serialization needed), but that forkserver/spawn instead
+    # try to pickle -- and can't ("cannot pickle 'weakref.ReferenceType'
+    # object"). Fork-only; not available on Windows, but this codebase
+    # already assumes POSIX multiprocessing throughout.
+    process = multiprocessing.get_context("fork").Process(target=function, args=args)
     # print(f'Process {process.name} (PID {os.getpid()}) started to execute {function}')
     process.start()
     # print(f'Process {process.name} (PID {os.getpid()}) ended')

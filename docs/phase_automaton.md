@@ -11,6 +11,7 @@ The phase automaton models I/O behaviour as a finite state machine where each **
 - [Combining triggers](#combining-triggers)
 - [Export](#export)
 - [Offline STFT](#offline-stft)
+  - [Worked example: a real malleable run (HACC-IO, ranks 4 → 8 → 4)](#worked-example-a-real-malleable-run-hacc-io-ranks-4--8--4)
 - [Examples](#examples)
 - [Example output](#example-output)
 - [Output JSON format](#output-json-format)
@@ -182,6 +183,58 @@ aut.print_graph()
 ```
 
 See `demo_offline_stft()` in `examples/API/phase_automaton_demo.py` for a runnable version (a synthetic 5 Hz → 10 Hz trace, one STFT call, two states, one transition).
+
+### Worked example: a real malleable run (HACC-IO, ranks 4 → 8 → 4)
+
+This is a real trace, not a synthetic signal — HACC-IO run under [DMR](https://github.com/bsc-pm/dmr) (Dynamic MPI Resources) + DLB, scaling from 4 to 8 ranks and back to 4 mid-run. TMIO logged one JSONL line per flush, each carrying its own `number_of_ranks` at the time of that flush, so the rank change is genuinely recorded in the trace, flush by flush.
+
+```bash
+ftio all_MPI.jsonl -f 10 --transformation stft --phase-automaton -e no
+```
+
+```
+Identified segments
+┏━━━━━━━━┳━━━━━━━━━━━┳━━━━━━━━━━━━┳━━━━━━━━━━━┳━━━━━━━━━━━━━━━━┓
+┃ Window ┃ Freq (Hz) ┃ Period (s) ┃ Conf. (%) ┃ Time Range (s) ┃
+┡━━━━━━━━╇━━━━━━━━━━━╇━━━━━━━━━━━━╇━━━━━━━━━━━╇━━━━━━━━━━━━━━━━┩
+│      0 │ 7.895e-01 │     1.2667 │    100.00 │   [0.82, 8.42] │
+│      1 │ 2.632e-01 │     3.8000 │    100.00 │  [6.52, 14.12] │
+│      2 │ 3.947e-01 │     2.5333 │    100.00 │ [12.22, 19.82] │
+│      3 │ 3.947e-01 │     2.5333 │    100.00 │ [17.92, 25.52] │
+│      4 │ 7.895e-01 │     1.2667 │    100.00 │ [23.62, 31.22] │
+└────────┴───────────┴────────────┴───────────┴────────────────┘
+
+PhaseAutomaton  method='ksigma'  rank_sensitive=True (confirm=2)  states=2  transitions=1
+  State(0: freq=0.7895 Hz, period=1.27 s, ranks=4, n_phases=3, duration=19.0 s)
+  State(1: freq=0.3947 Hz, period=2.53 s, ranks=8, n_phases=2, duration=11.4 s)
+  Transition(0→1 at t=19.82 s, 0.7895→0.3947 Hz, cause='rank_change', pred #3)
+```
+
+![Phase automaton on a real HACC-IO malleability trace: two states (4 ranks, 8 ranks) and one rank_change transition](images/phase_automaton_malleability.png)
+
+Two things worth noticing here:
+
+- **The transition is labelled `rank_change`, not `frequency`**, even though the statistical detector would have fired on the period shift alone (0.79 Hz → 0.26/0.39 Hz is a large jump). The rank count differing on the very same window the frequency shifts is exactly the corroboration case described above — the automaton attributes the transition to the more specific, more actionable cause.
+- **The run's final return to 4 ranks (window 4, the rightmost dot in the plot) does not open a third state.** The trace ends immediately after that one window, so `--pa-rank-confirm`'s default of 2 never gets a second window to confirm the reading. This is the debounce working as intended, not a bug — a single trailing window is exactly the kind of reading it's designed not to trust on its own (see [Rank-count trigger](#rank-count-trigger)). A longer trailing segment (or `--pa-rank-confirm 1`) would have caught it.
+
+#### Where this trace comes from
+
+HACC-IO's malleability support lives in the `HACC-IO` repo's `Makefile`, gated by `make MALLEABLE=1` (needs `DMR_PATH`/`DLB_HOME` pointing at DMR/DLB installs). Under the hood it's real MPI rank resizing via DMR's `dmr_wrapper`, not a simulated rank count:
+
+```bash
+# build against DMR/DLB
+make MALLEABLE=1 run_malleable_with_include2
+
+# submitted via sbatch, which launches through dmr_wrapper:
+$DMR_PATH/scripts/dmr_wrapper mpirun --host "$NODELIST_WITH_COUNTS" ./HACC_ASYNC_IO 1000000 test_run/mpi
+```
+
+There are two ways to attach the TMIO tracer to the same DMR-driven run, which is where the `_MPI`/`_Libc` naming in the example trace files (`4_MPI.jsonl`, `4_Libc.jsonl`, ...) comes from — both scale the same 4→8→4, they just differ in how TMIO gets linked in:
+
+| Target | TMIO attached via |
+|---|---|
+| `run_malleable_with_include2` (→ `_MPI` traces) | linked in at compile time (`-ltmio`) |
+| `run_malleable_with_lib` (→ `_Libc` traces) | `LD_PRELOAD=./libtmio.so`, no recompile needed |
 
 ---
 
@@ -573,7 +626,7 @@ predictor live.jsonl -f 100 --pa-library ./ftio_models --pa-app-name ior --pa-ma
 
 ### Library file format
 
-Library files are compact JSON containing per-state distribution statistics (the **path**, used by the tracker), plus a `nodes` table (the **configuration table**, used by `guess_node`/`load_node` — see below).  They are intentionally much smaller than the full `--pa-export` single-run snapshot.
+Library files are compact JSON containing per-state distribution statistics (the **path**, used by the tracker), plus a `nodes` table (the **configuration table**, used by `get_rank_behavior` — see below).  They are intentionally much smaller than the full `--pa-export` single-run snapshot.
 
 ```json
 {
@@ -616,8 +669,8 @@ from ftio.modeling import AutomatonLibrary, ModelManager
 lib = AutomatonLibrary("./ftio_models")
 mgr = ModelManager("./ftio_models", "ior")
 
-mgr.guess_node(32)              # every known behavior for ranks=32
-lib.load_node("ior", 32)        # same thing, called directly on the library
+mgr.get_rank_behavior(32)              # every known behavior for ranks=32
+lib.get_rank_behavior("ior", 32)        # same thing, called directly on the library
 ```
 
 Both work even during cold start, or for a rank count the current run's own path hasn't reached yet, as long as *some* stored path (or a seed, below) has seen that configuration.
@@ -640,14 +693,14 @@ But at the moment all three reach `ranks=128`, they are describing the *same und
                         ranks = 128
                  ┌──────────────────────────┐
   Run A  ───────▶│  period_mean ≈ 9.93 s     │
-  Run B  ───────▶│  period_std  ≈ 0.13 s     │   ◀── mgr.guess_node(128)
-  Run C  ───────▶│  n_samples = 3            │       lib.load_node("ior", 128)
+  Run B  ───────▶│  period_std  ≈ 0.13 s     │   ◀── mgr.get_rank_behavior(128)
+  Run C  ───────▶│  n_samples = 3            │       lib.get_rank_behavior("ior", 128)
                  └──────────────────────────┘
 ```
 
 ```python
 mgr = ModelManager("./ftio_models", "ior")
-mgr.guess_node(128)
+mgr.get_rank_behavior(128)
 # -> [NodeBehavior(period_mean=9.93, period_std=0.13, n_samples=3, ...)]
 ```
 
@@ -658,12 +711,12 @@ One call answers "what happens at `ranks=128`, across every run we've ever seen"
 A configuration does not have to mean one fixed period for its whole dwell. If the statistical detector sees the frequency shift *without* a rank change, that becomes a second, distinct `NodeBehavior` for the same node — not blended into a misleading average of the two:
 
 ```python
->>> ref.node(32)
+>>> ref.get_rank_behavior(32)
 [NodeBehavior(period_mean=3.0, ...),   # first few bursts
  NodeBehavior(period_mean=8.0, ...)]   # after that
 ```
 
-Calling `node()`/`guess_node()`/`load_node()` with no further arguments returns every behavior ever seen for that configuration. Give a specific point (see below) and it narrows to whichever behavior(s) actually apply there — one if unambiguous, several if the query falls in a genuine overlap between two behaviors, zero if nothing has ever been observed to cover it.
+Calling `get_rank_behavior()` (on `ReferenceAutomaton`, `AutomatonLibrary`, or `ModelManager` — same method name on all three) with no further arguments returns every behavior ever seen for that configuration. Give a specific point (see below) and it narrows to whichever behavior(s) actually apply there — one if unambiguous, several if the query falls in a genuine overlap between two behaviors, zero if nothing has ever been observed to cover it.
 
 #### Two axes: wall-clock time vs. cycle count
 
@@ -698,9 +751,9 @@ Query both runs at cycle=3 (a fixed logical point):
 ```
 
 ```python
-ref.node(32, at_cycle=3)        # the authoritative axis
-ref.node(32, at_time=22.0)      # drifts across runs of different speed
-ref.node(32, at_time=22.0, at_cycle=3)   # both given -> intersection
+ref.get_rank_behavior(32, at_cycle=3)        # the authoritative axis
+ref.get_rank_behavior(32, at_time=22.0)      # drifts across runs of different speed
+ref.get_rank_behavior(32, at_time=22.0, at_cycle=3)   # both given -> intersection
 ```
 
 `at_cycle` is the axis to reach for when you want to know *which regime is active*. `at_time` stays useful for a different question — "how many seconds until this transitions" — which is what the ETA forecast (`Transition in ~Xs [...] → next period ≈ Ys`, shown earlier) still uses it for.
@@ -739,7 +792,7 @@ The node table is pooled across every malleability path stored for an app, not j
 path A:  8   -> 128  (period=10s)
 path B:  32  -> 128  (period=10s)
 
-load_node("ior", 128) -> 1 behavior, n_samples=2   # pooled from BOTH paths
+get_rank_behavior("ior", 128) -> 1 behavior, n_samples=2   # pooled from BOTH paths
 ```
 
 This is the mechanism referenced in [Malleable applications](#malleable-applications) above: paths are stored separately, but a configuration common to two paths still shares its stats.
@@ -750,7 +803,7 @@ This is the mechanism referenced in [Malleable applications](#malleable-applicat
 
 `AutomatonLibrary` is a directory of JSON files — fine for one machine, but it assumes a shared filesystem if multiple predictor processes (different nodes, different jobs) need to read and write the *same* library, and it has no locking: `save()` is a plain load → merge → write, so two concurrent writers to the same `(app_name, rank_key)` can interleave and one's contribution is silently lost.
 
-`RedisAutomatonLibrary` (`ftio/modeling/redis_automaton_library.py`) is a drop-in alternative with the exact same methods (`load`, `save`, `seed`, `load_node`, `available_apps`, `available_rank_keys`) and the exact same merge/dilution/clustering semantics — only the storage backend changes. `save()`/`seed()` additionally hold a Redis lock around their critical section, so concurrent writers can't race:
+`RedisAutomatonLibrary` (`ftio/modeling/redis_automaton_library.py`) is a drop-in alternative with the exact same methods (`load`, `save`, `seed`, `get_rank_behavior`, `available_apps`, `available_rank_keys`) and the exact same merge/dilution/clustering semantics — only the storage backend changes. `save()`/`seed()` additionally hold a Redis lock around their critical section, so concurrent writers can't race:
 
 ```python
 from ftio.modeling.redis_automaton_library import RedisAutomatonLibrary
@@ -758,7 +811,7 @@ from ftio.modeling.redis_automaton_library import RedisAutomatonLibrary
 lib = RedisAutomatonLibrary(host="redis.cluster.local", port=6379)
 lib.seed("ior", {32: {"period": 3.0, "dwell": 40.0}})
 lib.save(automaton, "ior", "8_32")   # locked, race-safe
-lib.load_node("ior", 32)             # same semantics as AutomatonLibrary
+lib.get_rank_behavior("ior", 32)             # same semantics as AutomatonLibrary
 ```
 
 Requires the optional `redis` package (`pip install redis`, or `pip install .[redis-libs]`); importing `ftio.modeling` never requires it — only instantiating `RedisAutomatonLibrary` does, and it fails with a clear message if it's missing. Tests (`TestRedisAutomatonLibrary` in `test/test_modeling.py`) run against an in-memory `fakeredis` server, no real Redis instance needed — install with `pip install .[development-libs]`.

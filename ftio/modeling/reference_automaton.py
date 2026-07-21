@@ -295,7 +295,7 @@ class ReferenceAutomaton:
                 return
         lst.append(new_behavior)
 
-    def node(
+    def get_rank_behavior(
         self, ranks: int, at_time: float | None = None, at_cycle: float | None = None
     ) -> list[NodeBehavior]:
         """Look up this reference's own knowledge of one configuration.

@@ -277,7 +277,22 @@ class Simrun:
                     for i, _ in enumerate(data_array):
                         my_dict[field].extend(data_array[i][field])
                 else:
-                    if any(x in field for x in ["total", "_t_"]):
+                    if field in ("number_of_ranks", "total_number_of_ranks"):
+                        values = [x[field] for x in data_array]
+                        if len(set(values)) == 1:
+                            my_dict[field] = values[0]
+                        else:
+                            # Ranks changed across merged parts (malleability) --
+                            # collapsing to one number (e.g. max()) would hide
+                            # that a rank change happened at all. Keep a
+                            # burst-aligned sequence instead, so each burst can
+                            # still be tagged with whichever rank count was
+                            # active when it happened.
+                            my_dict[field] = []
+                            for x in data_array:
+                                n = self._burst_count(x.get("bandwidth", {}))
+                                my_dict[field].extend([x[field]] * n)
+                    elif any(x in field for x in ["total", "_t_"]):
                         my_dict[field] = sum(x[field] for x in data_array)
                     elif any(x in field for x in ["max", "number"]):
                         my_dict[field] = max(x[field] for x in data_array)
@@ -287,3 +302,17 @@ class Simrun:
                         my_dict[field] = st.mean(x[field] for x in data_array)
 
         return my_dict
+
+    @staticmethod
+    def _burst_count(bandwidth: dict) -> int:
+        """Number of bursts one merged-part's bandwidth dict contributes.
+
+        Used to replicate a per-part scalar (e.g. number_of_ranks) into a
+        burst-aligned sequence with the same length as whichever burst array
+        that part actually reports.
+        """
+        for key in ("t_overlap", "t_rank_s", "t_rank_e", "b_overlap_avr", "b_rank_avr"):
+            value = bandwidth.get(key)
+            if isinstance(value, list):
+                return len(value)
+        return 1

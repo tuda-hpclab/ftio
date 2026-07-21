@@ -2,7 +2,7 @@
 RedisAutomatonLibrary: Redis-backed alternative to AutomatonLibrary.
 
 Same interface and merge semantics as AutomatonLibrary (load, save, seed,
-load_node, available_apps, available_rank_keys), but backed by a Redis
+get_rank_behavior, available_apps, available_rank_keys), but backed by a Redis
 server instead of the filesystem -- for sharing one reference library
 across multiple processes or nodes without a shared filesystem.
 
@@ -245,7 +245,7 @@ class RedisAutomatonLibrary:
     # Node lookup (configuration-level, cross-path)
     # ------------------------------------------------------------------
 
-    def load_node(
+    def get_rank_behavior(
         self,
         app_name: str,
         ranks: int,
@@ -253,13 +253,13 @@ class RedisAutomatonLibrary:
         at_cycle: float | None = None,
     ) -> list[NodeBehavior]:
         """Look up what's known about one configuration, across every stored
-        path -- same semantics as AutomatonLibrary.load_node()."""
+        path -- same semantics as AutomatonLibrary.get_rank_behavior()."""
         nodes: dict[int, list[NodeBehavior]] = {}
         for key in self.available_rank_keys(app_name):
             ref = self._load_key(app_name, key)
             if ref is None:
                 continue
-            for behavior in ref.node(ranks):
+            for behavior in ref.get_rank_behavior(ranks):
                 ReferenceAutomaton._fold_behavior(nodes, ranks, behavior)
 
         merged_ref = ReferenceAutomaton(
@@ -271,4 +271,4 @@ class RedisAutomatonLibrary:
             run_count=0,
             nodes=nodes,
         )
-        return merged_ref.node(ranks, at_time=at_time, at_cycle=at_cycle)
+        return merged_ref.get_rank_behavior(ranks, at_time=at_time, at_cycle=at_cycle)

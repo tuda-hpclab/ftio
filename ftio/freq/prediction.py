@@ -60,6 +60,7 @@ class Prediction:
         self._top_freqs = {}
         self._candidates = np.array([])
         self._ranges = np.array([])
+        self._ranks_per_window = np.array([])
         self._metric = ""
         self._b_sampled = np.array([])
         self._burst_widths = np.array([])
@@ -245,6 +246,25 @@ class Prediction:
                 "candidates must be a numpy ndarray or list convertible to ndarray"
             )
         self._ranges = value
+
+    @property
+    def ranks_per_window(self):
+        """Per-STFT-window rank count, aligned index-for-index with `ranges`
+        (index 0 is the whole-trace summary, indices 1..N the windows) --
+        only populated when the source trace's rank count actually varies
+        (see ftio_stft / Simrun.merge_fields). Empty otherwise; consumers
+        should fall back to the scalar `ranks` in that case."""
+        return self._ranks_per_window
+
+    @ranks_per_window.setter
+    def ranks_per_window(self, value):
+        if isinstance(value, list):
+            value = np.array(value)
+        if not isinstance(value, np.ndarray):
+            raise TypeError(
+                "ranks_per_window must be a numpy ndarray or list convertible to ndarray"
+            )
+        self._ranks_per_window = value
 
     @property
     def metric(self):

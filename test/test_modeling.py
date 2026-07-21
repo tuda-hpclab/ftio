@@ -143,7 +143,7 @@ class TestReferenceAutomatonNodes:
         ref = ReferenceAutomaton.from_automaton_dict(
             _build_automaton([(0.5, 8, 128)]).to_dict(), "app", "128"
         )
-        behaviors = ref.node(128)
+        behaviors = ref.get_rank_behavior(128)
         assert len(behaviors) == 1
         assert behaviors[0].period_mean == pytest.approx(2.0)
 
@@ -151,7 +151,7 @@ class TestReferenceAutomatonNodes:
         """ranks=128 shows two genuinely different periods back to back ->
         kept as two distinct behaviors, NOT blended into one misleading mean."""
         ref = _simple_ref()  # ranks=128: period 2.0s, then period 0.667s
-        behaviors = ref.node(128)
+        behaviors = ref.get_rank_behavior(128)
         assert len(behaviors) == 2
         periods = sorted(b.period_mean for b in behaviors)
         assert periods[0] == pytest.approx(0.6666666, rel=1e-3)
@@ -159,8 +159,10 @@ class TestReferenceAutomatonNodes:
 
     def test_node_at_time_picks_the_right_behavior(self):
         ref = _simple_ref()
-        early = ref.node(128, at_time=1.0)  # within the first behavior's window
-        late = ref.node(128, at_time=25.0)  # within the second's
+        early = ref.get_rank_behavior(
+            128, at_time=1.0
+        )  # within the first behavior's window
+        late = ref.get_rank_behavior(128, at_time=25.0)  # within the second's
         assert len(early) == 1 and early[0].period_mean == pytest.approx(2.0)
         assert len(late) == 1 and late[0].period_mean == pytest.approx(
             0.6666666, rel=1e-3
@@ -168,18 +170,18 @@ class TestReferenceAutomatonNodes:
 
     def test_node_at_time_outside_any_window_returns_empty(self):
         ref = _simple_ref()
-        assert ref.node(128, at_time=9999.0) == []
+        assert ref.get_rank_behavior(128, at_time=9999.0) == []
 
     def test_node_lookup_missing_returns_empty_list(self):
         ref = _simple_ref()
-        assert ref.node(9999) == []
+        assert ref.get_rank_behavior(9999) == []
 
     def test_from_automaton_dict_populates_cycle_windows(self):
         """from_automaton_dict has the raw per-state burst count available,
         so unlike the generic StateStats-only fallback, its behaviors carry
         a real (non-NaN) cycle window."""
         ref = _simple_ref()
-        b = ref.node(128)[0]
+        b = ref.get_rank_behavior(128)[0]
         assert not np.isnan(b.c_start_mean)
         assert b.c_start_mean == pytest.approx(0.0)
         assert b.c_end_mean > 0
@@ -189,9 +191,9 @@ class TestReferenceAutomatonNodes:
         this is the axis that stays valid when a run speeds up or slows
         down for reasons unrelated to which behavior is active."""
         ref = _simple_ref()
-        first_end = ref.node(128)[0].c_end_mean
-        early = ref.node(128, at_cycle=first_end - 1)
-        late = ref.node(128, at_cycle=first_end + 1)
+        first_end = ref.get_rank_behavior(128)[0].c_end_mean
+        early = ref.get_rank_behavior(128, at_cycle=first_end - 1)
+        late = ref.get_rank_behavior(128, at_cycle=first_end + 1)
         assert len(early) == 1 and early[0].period_mean == pytest.approx(2.0)
         assert len(late) == 1 and late[0].period_mean == pytest.approx(
             0.6666666, rel=1e-3
@@ -199,13 +201,17 @@ class TestReferenceAutomatonNodes:
 
     def test_node_at_time_and_cycle_both_given_is_an_intersection(self):
         ref = _simple_ref()
-        b0, b1 = ref.node(128)
+        b0, b1 = ref.get_rank_behavior(128)
         # A time that matches b0 but a cycle that matches b1 -> no behavior
         # satisfies both at once.
-        result = ref.node(128, at_time=b0.t_start_mean, at_cycle=b1.c_start_mean + 1)
+        result = ref.get_rank_behavior(
+            128, at_time=b0.t_start_mean, at_cycle=b1.c_start_mean + 1
+        )
         assert result == []
         # Consistent time+cycle from the same behavior -> matches.
-        result = ref.node(128, at_time=b0.t_start_mean, at_cycle=b0.c_start_mean)
+        result = ref.get_rank_behavior(
+            128, at_time=b0.t_start_mean, at_cycle=b0.c_start_mean
+        )
         assert result == [b0]
 
     def test_seed_has_no_cycle_window(self):
@@ -214,7 +220,7 @@ class TestReferenceAutomatonNodes:
         ref = ReferenceAutomaton.from_node_seed(
             "demo", {32: {"period": 3.0, "dwell": 20.0}}
         )
-        b = ref.node(32)[0]
+        b = ref.get_rank_behavior(32)[0]
         assert np.isnan(b.c_start_mean)
 
     def test_nodes_pool_matching_repeated_occurrence(self):
@@ -222,7 +228,7 @@ class TestReferenceAutomatonNodes:
         both times -> folds into one behavior, not two."""
         aut = _build_automaton([(0.5, 8, 16), (1.5, 8, 128), (0.5, 8, 16)])
         ref = ReferenceAutomaton.from_automaton_dict(aut.to_dict(), "app", "16_128_16")
-        behaviors = ref.node(16)
+        behaviors = ref.get_rank_behavior(16)
         assert len(behaviors) == 1
         assert behaviors[0].n_samples == 2
 
@@ -246,8 +252,8 @@ class TestReferenceAutomatonNodes:
         )
         assert ref.rank_key == "8_64"  # sorted ascending regardless of dict order
         assert ref.run_count == 0  # a seed is not a profiled run
-        assert ref.node(8)[0].period_mean == pytest.approx(5.0)
-        assert ref.node(64)[0].t_end_mean == pytest.approx(
+        assert ref.get_rank_behavior(8)[0].period_mean == pytest.approx(5.0)
+        assert ref.get_rank_behavior(64)[0].t_end_mean == pytest.approx(
             100.0
         )  # "dwell" -> window length
 
@@ -264,8 +270,10 @@ class TestReferenceAutomatonNodes:
         result = ref_a.merge(ref_b)
         assert result is ref_a  # topology mismatch -> identity preserved
         assert 16 in result.nodes  # picked up from ref_b even though topology differs
-        assert len(result.node(128)) == 1  # same period both times -> one behavior
-        assert result.node(128)[0].n_samples == 2  # pooled from both runs
+        assert (
+            len(result.get_rank_behavior(128)) == 1
+        )  # same period both times -> one behavior
+        assert result.get_rank_behavior(128)[0].n_samples == 2  # pooled from both runs
 
     def test_merge_keeps_genuinely_different_behaviors_separate(self):
         """If the two paths reach ranks=128 with DIFFERENT periods, the merge
@@ -279,7 +287,7 @@ class TestReferenceAutomatonNodes:
             "16_128",  # period 10s
         )
         result = ref_a.merge(ref_b)
-        behaviors = result.node(128)
+        behaviors = result.get_rank_behavior(128)
         assert len(behaviors) == 2
         periods = sorted(b.period_mean for b in behaviors)
         assert periods[0] == pytest.approx(2.0)
@@ -289,9 +297,9 @@ class TestReferenceAutomatonNodes:
         ref = _simple_ref()
         ref2 = ReferenceAutomaton.from_dict(ref.to_dict())
         assert set(ref2.nodes) == set(ref.nodes)
-        assert len(ref2.node(128)) == len(ref.node(128))
-        p1 = sorted(b.period_mean for b in ref.node(128))
-        p2 = sorted(b.period_mean for b in ref2.node(128))
+        assert len(ref2.get_rank_behavior(128)) == len(ref.get_rank_behavior(128))
+        p1 = sorted(b.period_mean for b in ref.get_rank_behavior(128))
+        p2 = sorted(b.period_mean for b in ref2.get_rank_behavior(128))
         assert p1 == pytest.approx(p2)
 
 
@@ -377,21 +385,21 @@ class TestAutomatonLibrary:
 class TestAutomatonLibraryNodes:
     """Cross-path configuration lookup and user-supplied early estimates."""
 
-    def test_load_node_across_different_paths(self, tmp_path):
+    def test_get_rank_behavior_across_different_paths(self, tmp_path):
         """ranks=128 is reachable via two different malleability paths;
-        load_node should pool both without needing an exact path match."""
+        get_rank_behavior should pool both without needing an exact path match."""
         lib = AutomatonLibrary(str(tmp_path))
         lib.save(_build_automaton([(0.2, 8, 16), (0.5, 8, 128)]), "app", "16_128")
         lib.save(_build_automaton([(0.3, 8, 32), (0.5, 8, 128)]), "app", "32_128")
 
-        behaviors = lib.load_node("app", 128)
+        behaviors = lib.get_rank_behavior("app", 128)
         assert len(behaviors) == 1  # same period both times -> one behavior
         assert behaviors[0].n_samples == 2  # pooled from both paths
 
-    def test_load_node_missing_configuration(self, tmp_path):
+    def test_get_rank_behavior_missing_configuration(self, tmp_path):
         lib = AutomatonLibrary(str(tmp_path))
         lib.save(_build_automaton([(0.5, 8, 128)]), "app", "128")
-        assert lib.load_node("app", 9999) == []
+        assert lib.get_rank_behavior("app", 9999) == []
 
     def test_seed_then_load(self, tmp_path):
         lib = AutomatonLibrary(str(tmp_path))
@@ -402,7 +410,7 @@ class TestAutomatonLibraryNodes:
         loaded = lib.load("app", "8_64")
         assert loaded is not None
         assert loaded.run_count == 0
-        assert loaded.node(64)[0].period_mean == pytest.approx(20.0)
+        assert loaded.get_rank_behavior(64)[0].period_mean == pytest.approx(20.0)
 
     def test_seed_does_not_clobber_existing(self, tmp_path):
         lib = AutomatonLibrary(str(tmp_path))
@@ -425,7 +433,7 @@ class TestAutomatonLibraryNodes:
         real = _build_automaton([(0.1, 8, 128)])  # true period = 10s
         lib.save(real, "app", "128")
 
-        after = lib.load_node("app", 128)
+        after = lib.get_rank_behavior("app", 128)
         assert len(after) == 1  # close enough -> pooled into one behavior
         assert after[0].period_mean == pytest.approx(10.15, rel=0.01)
         assert after[0].n_samples == 2
@@ -444,7 +452,7 @@ class TestAutomatonLibraryNodes:
         real = _build_automaton([(0.1, 8, 128)])  # true period = 10s -- 10x off
         lib.save(real, "app", "128")
 
-        after = lib.load_node("app", 128)
+        after = lib.get_rank_behavior("app", 128)
         assert len(after) == 2  # NOT pooled -- both survive
         periods = sorted(b.period_mean for b in after)
         assert periods[0] == pytest.approx(10.0)
@@ -668,22 +676,22 @@ class TestModelManager:
         with pytest.raises(ValueError):
             ModelManager(str(tmp_path), "app", strategy="bad_strategy")
 
-    def test_guess_node_from_seed_before_any_step(self, tmp_path):
-        """guess_node should answer from a seed alone, without step() ever
+    def test_get_rank_behavior_from_seed_before_any_step(self, tmp_path):
+        """get_rank_behavior should answer from a seed alone, without step() ever
         having been called -- it's a pure library lookup, independent of the
         live tracker's state."""
         lib = AutomatonLibrary(str(tmp_path))
         lib.seed("ior", {64: {"period": 20.0, "dwell": 100.0}})
 
         mgr = ModelManager(str(tmp_path), "ior")
-        guess = mgr.guess_node(64)
+        guess = mgr.get_rank_behavior(64)
         assert len(guess) == 1
         assert guess[0].period_mean == pytest.approx(20.0)
 
-    def test_guess_node_true_cold_start_returns_empty(self, tmp_path):
+    def test_get_rank_behavior_true_cold_start_returns_empty(self, tmp_path):
         """No library entry at all for this app -- nothing to guess from."""
         mgr = ModelManager(str(tmp_path), "never_profiled_app")
-        assert mgr.guess_node(64) == []
+        assert mgr.get_rank_behavior(64) == []
 
 
 # ---------------------------------------------------------------------------
@@ -830,17 +838,17 @@ class TestRedisAutomatonLibrary:
 
         lib = RedisAutomatonLibrary(redis_client=redis_client)
         lib.seed("app", {32: {"period": 3.0, "dwell": 20.0}})
-        behaviors = lib.load_node("app", 32)
+        behaviors = lib.get_rank_behavior("app", 32)
         assert len(behaviors) == 1
         assert behaviors[0].period_mean == pytest.approx(3.0)
 
-    def test_load_node_pools_across_paths(self, redis_client):
+    def test_get_rank_behavior_pools_across_paths(self, redis_client):
         from ftio.modeling.redis_automaton_library import RedisAutomatonLibrary
 
         lib = RedisAutomatonLibrary(redis_client=redis_client)
         lib.save(_build_automaton([(0.2, 8, 16), (0.5, 8, 128)]), "app", "16_128")
         lib.save(_build_automaton([(0.3, 8, 32), (0.5, 8, 128)]), "app", "32_128")
-        behaviors = lib.load_node("app", 128)
+        behaviors = lib.get_rank_behavior("app", 128)
         assert len(behaviors) == 1
         assert behaviors[0].n_samples == 2
 
