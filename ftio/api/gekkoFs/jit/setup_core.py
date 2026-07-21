@@ -1307,6 +1307,14 @@ def pre_call(settings: JitSettings) -> None:
                 for call in settings.pre_app_call:
                     if any(x in call for x in ["mpiex", "mpirun"]):
                         call = flaged_call(settings, call, exclude=["ftio"])
+                    else:
+                        # Non-MPI steps (e.g. a plain mkdir) still need to land
+                        # on an app node -- otherwise they run bare on whatever
+                        # host the JIT driver process itself is on, which is
+                        # not one of the GekkoFS-mounted app nodes.
+                        call = flaged_call(
+                            settings, call, nodes=1, procs_per_node=1, exclude=["ftio"]
+                        )
                     returncode = execute_block_and_monitor(
                         settings.verbose,
                         call,

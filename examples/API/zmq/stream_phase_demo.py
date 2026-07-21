@@ -18,10 +18,12 @@ Run (two terminals):
     # terminal 2 -- stream synthetic bursts
     python examples/API/zmq/stream_phase_demo.py
 
-Phase A (checkpoints every ~2s) runs for 10 bursts, then Phase B
-(checkpoints every ~1s, roughly double the frequency) runs for another 10 --
-predictor's phase automaton should report one state for each phase and a
-transition around t=20s.
+Phase A (checkpoints every ~6s) runs for 6 bursts (~36s), then Phase B
+(checkpoints every ~3s, double the frequency) for 6 more (~18s), then back
+to Phase A's ~6s period for a final 6 (~36s) -- about 1.5 minutes total.
+predictor's phase automaton should report three states (A, B, A again) and
+two transitions, around t=33s and t=51s. Use --speed to shorten this for a
+quick smoke test.
 
 Author: Ahmad Tarraf
 Copyright (c) 2024-2026 TU Darmstadt, Germany
@@ -56,7 +58,8 @@ def send_burst(sock, t_start: float, duration: float) -> None:
 
 
 def stream(address: str, speed: float) -> None:
-    """Send Phase A (period ~2s) then Phase B (period ~1s), 10 bursts each.
+    """Send Phase A (period ~6s), Phase B (period ~3s), then Phase A again,
+    6 bursts each (~1.5 minutes total at real-time speed).
 
     `speed` scales the real sleep time (1.0 = real-time; use e.g. 0.1 for a
     quick smoke test).
@@ -68,8 +71,9 @@ def stream(address: str, speed: float) -> None:
 
     t = 0.0
     phases = [
-        ("A", 10, 2.0, 0.3),  # label, n_bursts, period, burst_duration
-        ("B", 10, 1.0, 0.15),
+        ("A", 6, 6.0, 0.9),  # label, n_bursts, period, burst_duration
+        ("B", 6, 3.0, 0.45),
+        ("A", 6, 6.0, 0.9),
     ]
     for label, n_bursts, period, duration in phases:
         for i in range(n_bursts):

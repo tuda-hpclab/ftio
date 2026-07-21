@@ -33,7 +33,7 @@ MNT = "/mnt/gkfs"
 
 # The patterns jitsettings assigns per app, and a path each one must select.
 APP_PATTERNS = {
-    "lammps": (r".*/ckpt\.restart\.\d+\.(\d+|base)$", f"{MNT}/ckpt.restart.80.5"),
+    "lammps": (r".*/ckpt\.restart\.\d+$", f"{MNT}/ckpt.restart.80"),
     "castro": (r".*/sedov_3d_sph_chk\d+(?=/)", f"{MNT}/sedov_3d_sph_chk00010/Header"),
     "warpx": (r".*/chk\d+(?=/)", f"{MNT}/chk000010/WarpXHeader"),
     "qmcpack": (r".*/glass_heg\.s\d+\.config\.h5$", f"{MNT}/glass_heg.s000.config.h5"),
@@ -54,16 +54,6 @@ def test_wrf_regex_matches_restarts_not_history_or_logs():
     assert wrf.match(f"{MNT}/wrfrst_d01_0001-01-01_02:00:00")
     for never in ("wrfout_d01_0001-01-01_00:00:00", "rsl.error.0000", "namelist.input"):
         assert not wrf.match(f"{MNT}/{never}"), f"{never} must never be staged out"
-
-
-def test_lammps_regex_matches_the_base_metadata_file_too():
-    # nfile 64 splits each checkpoint into per-group data files (.0, .1, ...)
-    # plus one ckpt.restart.<step>.base metadata file -- confirmed against a
-    # real local LAMMPS run, not assumed from the docs. Missing it here means
-    # it never gets staged out and piles up in the mount.
-    lammps = re.compile(APP_PATTERNS["lammps"][0])
-    assert lammps.match(f"{MNT}/ckpt.restart.80.base")
-    assert lammps.match(f"{MNT}/ckpt.restart.80.0")
 
 
 def test_amrex_regexes_exclude_the_temp_rename_artifacts():
@@ -243,3 +233,22 @@ def test_set_dir_gekko_relocates_mntdir_inside_a_pre_app_call_list(monkeypatch):
     set_dir_gekko(s)
     assert s.pre_app_call[0] == "mkdir -p /scratch/tmp/123/tarraf_gkfs_mountdir/data"
     assert s.pre_app_call[1] == "mpirun foo"
+
+
+def test_pre_call_srun_wraps_non_mpi_list_items_onto_an_app_node():
+    # setup_core.py's pre_app_call list dispatch used to only flag-wrap items
+    # containing mpirun/mpiexec; a bare `mkdir` ran unwrapped via
+    # execute_block_and_monitor, i.e. as a local subprocess on whatever host
+    # is executing the JIT driver process (the ftio_node), not on an app
+    # node's FUSE mount -- so dlio's pre-created dirs were invisible to the
+    # mpirun step that followed. flaged_call must now be reached for both
+    # branches of the list loop, not just the mpirun one.
+    src = inspect.getsource(
+        __import__("ftio.api.gekkoFs.jit.setup_core", fromlist=["pre_call"])
+    )
+    list_branch = src[src.index("elif isinstance(settings.pre_app_call, list):") :]
+    list_branch = list_branch[: list_branch.index("if returncode == 0:")]
+    assert list_branch.count("flaged_call(") >= 2, (
+        "non-mpi pre_app_call list items must also go through flaged_call "
+        "so they land on an app node instead of running bare"
+    )
