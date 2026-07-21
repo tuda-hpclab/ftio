@@ -10,6 +10,7 @@ The phase automaton models I/O behaviour as a finite state machine where each **
   - [Statistical detector](#statistical-detector)
 - [Combining triggers](#combining-triggers)
 - [Export](#export)
+- [Offline STFT](#offline-stft)
 - [Examples](#examples)
 - [Example output](#example-output)
 - [Output JSON format](#output-json-format)
@@ -21,6 +22,7 @@ The phase automaton models I/O behaviour as a finite state machine where each **
   - [Matching strategies](#matching-strategies)
   - [Library file format](#library-file-format)
   - [Configuration table (nodes)](#configuration-table-nodes)
+    - [Path view vs. node view](#path-view-vs-node-view)
     - [Multiple behaviors per configuration](#multiple-behaviors-per-configuration)
     - [Two axes: wall-clock time vs. cycle count](#two-axes-wall-clock-time-vs-cycle-count)
     - [Seeding an early estimate](#seeding-an-early-estimate)
@@ -50,7 +52,7 @@ States accumulate a history of predictions.  When a transition fires, a new stat
 predictor live.jsonl -f 100 --phase-automaton
 ```
 
-The automaton is only available in `predictor` (online mode), not in offline `ftio`.
+The automaton also works offline with `ftio --transformation stft` — see [Offline STFT](#offline-stft) below.
 
 ---
 
@@ -60,9 +62,20 @@ Three independent triggers can fire a transition.  They can be used individually
 
 ### Rank-count trigger
 
-**Default: enabled.**  Fires immediately when the number of active I/O ranks in the new prediction differs from the current state's rank count.
+**Default: enabled.**  Fires when the number of active I/O ranks in the new prediction differs from the current state's rank count.
 
-Disable with `--pa-no-rank-trigger`:
+The rank count itself comes from one of two places:
+
+- **Authoritative, when available** — TMIO's msgpack trace format reports `total_number_of_ranks` directly (the size of the run's own communicator) on every sample. When present, FTIO uses it verbatim, and the trigger fires the moment it changes — there is nothing to guess.
+- **Inferred, otherwise** — older traces, or formats without that field, only give `number_of_ranks`, a grouping key that reflects however many ranks' messages had been received into the current window. A single window where a straggler rank hadn't reported yet can look exactly like a rank change even though nothing changed. To guard against that, an inferred rank difference must repeat for `--pa-rank-confirm` consecutive predictions (default: **2**) before it is accepted:
+
+    ```bash
+    predictor live.jsonl -f 100 --phase-automaton --pa-rank-confirm 3
+    ```
+
+    Set it to `1` to fire immediately on the first differing window (the old behaviour). There is one exception even before confirmation: if the period-ratio or statistical detector *also* fires on that same first differing window, that is strong corroborating evidence the rank change is real (a stray straggler wouldn't also move the frequency estimate), so the transition fires immediately and is still labelled `rank_change` rather than `frequency`.
+
+Disable the trigger entirely with `--pa-no-rank-trigger`:
 ```bash
 predictor live.jsonl -f 100 --phase-automaton --pa-no-rank-trigger
 ```
@@ -137,6 +150,38 @@ predictor live.jsonl -f 100 --phase-automaton --pa-export /tmp/my_automaton.json
 ```
 
 Default path: `./phase_automaton.json`.
+
+---
+
+## Offline STFT
+
+The automaton is not limited to the online predictor. `--transformation stft` already slides a window across the *entire* trace in a single call and reports a dominant frequency per window (see `ftio_stft` in `ftio/freq/_stft_workflow.py`) — that per-window sequence is exactly what the automaton needs, so one offline run reconstructs the same state/transition history the online predictor would have produced by polling ZMQ the whole time:
+
+```bash
+ftio trace.jsonl --transformation stft --phase-automaton
+```
+
+All the `--pa-*` flags described above apply the same way (`--pa-method`, `--pa-period-ratio`, `--pa-rank-confirm`, `--pa-export`, ...). On exit, `ftio` prints the same summary/graph the online predictor logs and writes the same `phase_automaton.json`.
+
+Only STFT produces a window sequence — DFT and wavelet each return one global result for the whole trace, so `--phase-automaton` has nothing to build from with those transformations and is silently skipped.
+
+Using the Python API directly (what the CLI does under the hood):
+
+```python
+from ftio.freq._stft_workflow import ftio_stft
+from ftio.modeling.phase_automaton import PhaseAutomaton, windows_from_stft_prediction
+from ftio.parse.args import parse_args
+
+args = parse_args(["-tr", "stft", "-e", "no"], "ftio")
+prediction, _ = ftio_stft(args, bandwidth, time_stamps, ranks=8)
+
+windows = windows_from_stft_prediction(prediction)   # one Prediction per STFT window
+aut = PhaseAutomaton(method="ksigma")
+aut.build(windows)
+aut.print_graph()
+```
+
+See `demo_offline_stft()` in `examples/API/phase_automaton_demo.py` for a runnable version (a synthetic 5 Hz → 10 Hz trace, one STFT call, two states, one transition).
 
 ---
 
@@ -576,6 +621,37 @@ lib.load_node("ior", 32)        # same thing, called directly on the library
 ```
 
 Both work even during cold start, or for a rank count the current run's own path hasn't reached yet, as long as *some* stored path (or a seed, below) has seen that configuration.
+
+#### Path view vs. node view
+
+Three runs of the same `ior` benchmark, each following the automaton's usual `states` → `transitions` path, but scaling to `ranks=128` from a different starting point:
+
+```
+Run A, path "8_128":    [ranks=8,  period=3.0s] --rank_change--> [ranks=128, period=10.1s]
+Run B, path "32_128":   [ranks=32, period=5.0s] --rank_change--> [ranks=128, period=9.9s]
+Run C, path "128":                                                [ranks=128, period=9.8s]
+```
+
+Each run is stored under its own **path** file — `ranks_8_128.json`, `ranks_32_128.json`, `ranks_128.json` — because `--pa-match` replays one *specific* rank sequence, so a run that scaled up from 8 must stay separate from one that scaled up from 32.
+
+But at the moment all three reach `ranks=128`, they are describing the *same underlying configuration*, whichever path got them there. The node table pools exactly that:
+
+```
+                        ranks = 128
+                 ┌──────────────────────────┐
+  Run A  ───────▶│  period_mean ≈ 9.93 s     │
+  Run B  ───────▶│  period_std  ≈ 0.13 s     │   ◀── mgr.guess_node(128)
+  Run C  ───────▶│  n_samples = 3            │       lib.load_node("ior", 128)
+                 └──────────────────────────┘
+```
+
+```python
+mgr = ModelManager("./ftio_models", "ior")
+mgr.guess_node(128)
+# -> [NodeBehavior(period_mean=9.93, period_std=0.13, n_samples=3, ...)]
+```
+
+One call answers "what happens at `ranks=128`, across every run we've ever seen" — independent of whether that run's own `states` path ever reached 128 itself. That is the difference to hold onto: **`states`/`--pa-match` are about one run's trajectory; the node table is about a configuration, pooled over every trajectory that ever visited it.**
 
 #### Multiple behaviors per configuration
 

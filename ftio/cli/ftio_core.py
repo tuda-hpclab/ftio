@@ -92,7 +92,53 @@ def main(
         analysis_figures.show()
     console.print(f"[cyan]Total elapsed time:[/] {time.time() - start:.3f} s\n")
 
+    # Offline phase automaton: only for direct (non-predictor) STFT runs --
+    # the online predictor already steps its own automaton once per elapsed-
+    # time invocation (see ftio.prediction.online_analysis._automaton_step).
+    # STFT already slides a window across the whole trace and reports a
+    # dominant frequency per window, so that sequence can be fed to the
+    # automaton directly, without a live ZMQ stream.
+    if (
+        shared_resource is None
+        and getattr(args, "phase_automaton", False)
+        and "stft" in args.transformation
+        and "astft" not in args.transformation
+    ):
+        _run_offline_phase_automaton(args, list_predictions, console)
+
     return list_predictions, args
+
+
+def _run_offline_phase_automaton(
+    args: Namespace, predictions: list[Prediction], console: MyConsole
+) -> None:
+    """Build and export a PhaseAutomaton from an STFT run's per-window sequence.
+
+    Each Prediction in `predictions` (one per input file/rank-group) already
+    holds a per-window dominant-frequency sequence from `ftio_stft`; unpack it
+    with `windows_from_stft_prediction` and feed the automaton one window at a
+    time, exactly as the online predictor feeds it one Prediction per step.
+    """
+    from ftio.modeling.phase_automaton import (
+        PhaseAutomaton,
+        windows_from_stft_prediction,
+    )
+
+    for prediction in predictions:
+        windows = windows_from_stft_prediction(prediction)
+        if not windows:
+            console.print(
+                "[yellow]Phase automaton: no per-window STFT sequence found "
+                "(need --transformation stft with more than one window); "
+                "skipping.[/]"
+            )
+            continue
+
+        aut = PhaseAutomaton.from_args(args)
+        aut.build(windows)
+        aut.print_summary()
+        aut.print_graph()
+        aut.save_json(getattr(args, "pa_export", "./phase_automaton.json"))
 
 
 def core(sim: dict, args: Namespace) -> tuple[Prediction, AnalysisFigures]:

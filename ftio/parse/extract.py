@@ -29,6 +29,7 @@ def get_time_behavior(df) -> list[dict]:
     files = [int(i) for i in pd.unique(df[0]["number_of_ranks"])]
     for i in files:
         ranks = df[1]["number_of_ranks"].isin([i])
+        reported_ranks = _resolve_ranks(df[0], i)
         if len(df[1]["file_index"][ranks]) != 0:
             for j in range(0, int(df[1]["file_index"][ranks].max() + 1)):
                 # print(f"  \033[1;32mRanks {i}\033[1;0m")
@@ -45,10 +46,27 @@ def get_time_behavior(df) -> list[dict]:
                     "time": time,
                     "bandwidth": bandwidth,
                     "total_bytes": total_bytes,
-                    "ranks": i,
+                    "ranks": reported_ranks,
                 }
                 out.append(tmp)
     return out
+
+
+def _resolve_ranks(df0, number_of_ranks: int) -> int:
+    """Prefer the rank count the trace reports directly (``total_number_of_ranks``,
+    the size of the run's own communicator) over ``number_of_ranks``, which is
+    only a grouping key -- online, it reflects however many ranks' messages had
+    arrived by the time this window was assembled, so it can look like a rank
+    change when a straggler rank was just running behind schedule.
+    """
+    if "total_number_of_ranks" not in df0:
+        return number_of_ranks
+    reported = df0.loc[df0["number_of_ranks"] == number_of_ranks, "total_number_of_ranks"]
+    reported = reported.dropna()
+    if reported.empty:
+        return number_of_ranks
+    value = int(reported.iloc[0])
+    return value if value > 0 else number_of_ranks
 
 
 def get_time_behavior_and_args(cmd_input: list[str], msgs=None):

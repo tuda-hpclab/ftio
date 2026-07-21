@@ -422,6 +422,64 @@ def demo_multi_rank():
 
 
 # ──────────────────────────────────────────────────────────────────────
+# Demo 8: offline STFT -- phase automaton from a single trace, no ZMQ stream
+# ──────────────────────────────────────────────────────────────────────
+
+
+def demo_offline_stft():
+    """Build a phase automaton offline, from one STFT run -- no ZMQ stream.
+
+    Everywhere else in this file, predictions are fed to the automaton one at
+    a time, the way the online predictor sees them (one Prediction per
+    elapsed-time step, each covering the whole trace observed so far).
+
+    STFT works differently even offline: `ftio_stft` already slides a window
+    across the *entire* trace in one call and reports a dominant frequency
+    per window. `windows_from_stft_prediction` unpacks that one Prediction's
+    per-window arrays into the same one-Prediction-per-window shape
+    `PhaseAutomaton.build()` expects -- so a single offline STFT run can
+    reconstruct the same state/transition history the online predictor would
+    have produced by polling ZMQ the whole time.
+
+    The CLI equivalent of this whole demo is:
+
+        ftio trace.jsonl --transformation stft --phase-automaton
+
+    which prints the same summary/graph and saves `./phase_automaton.json`.
+    """
+    _bar("DEMO 8 — offline STFT: one call, no live stream")
+
+    import numpy as np
+
+    from ftio.freq._stft_workflow import ftio_stft
+    from ftio.modeling.phase_automaton import (
+        PhaseAutomaton,
+        windows_from_stft_prediction,
+    )
+    from ftio.parse.args import parse_args
+
+    # Synthetic trace: 5 Hz for the first half, 10 Hz for the second --
+    # a single file, analysed once, offline.
+    fs = 100
+    t = np.arange(0, 10, 1 / fs)
+    bandwidth = np.zeros_like(t)
+    bandwidth[: len(t) // 2] = np.sin(2 * np.pi * 5 * t[: len(t) // 2])
+    bandwidth[len(t) // 2 :] = np.sin(2 * np.pi * 10 * t[len(t) // 2 :])
+
+    args = parse_args(["-tr", "stft", "-e", "no"], "ftio")
+    args.freq = fs
+    prediction, _ = ftio_stft(args, bandwidth, t, ranks=8)
+
+    windows = windows_from_stft_prediction(prediction)
+    print(f"\n  STFT produced {len(windows)} windows from one offline call.")
+
+    aut = PhaseAutomaton(method="ksigma")
+    aut.build(windows)
+    aut.print_summary()
+    aut.print_graph()
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Show all queued matplotlib figures
 # ──────────────────────────────────────────────────────────────────────
 
@@ -546,6 +604,7 @@ if __name__ == "__main__":
     demo_period_ratio()
     demo_real_files()
     demo_multi_rank()
+    demo_offline_stft()
     demo_warmup_artifact()
     demo_build_a_model_from_a_real_run()
     _show_all()

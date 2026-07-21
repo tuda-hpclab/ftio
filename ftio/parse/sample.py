@@ -32,6 +32,7 @@ class Sample:
         self.max_io_ops_in_phase = self.assign(values, "max_io_ops_in_phase")
         self.total_io_ops = self.assign(values, "total_io_ops")
         self.number_of_ranks = self.assign(values, "number_of_ranks")
+        self.total_number_of_ranks = self.assign(values, "total_number_of_ranks")
         self.bandwidth = self.assign_bandwidth(values, io_type, args)
         self.file_index = args.file_index
 

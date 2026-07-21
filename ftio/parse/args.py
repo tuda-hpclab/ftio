@@ -713,8 +713,25 @@ Full documentation:
             default=True,
             help=(
                 "Disable the rank-change trigger in the phase automaton. "
-                "By default a prediction with a different rank count immediately "
-                "opens a new state."
+                "By default a prediction whose rank count differs from the "
+                "current state's, and stays different for --pa-rank-confirm "
+                "consecutive predictions, opens a new state."
+            ),
+        )
+        group.add_argument(
+            "--pa-rank-confirm",
+            "--pa_rank_confirm",
+            dest="pa_rank_confirm",
+            type=int,
+            default=2,
+            metavar="N",
+            help=(
+                "Number of consecutive predictions a new rank count must persist "
+                "before the rank-change trigger fires (default: 2). Guards "
+                "against a single window where not all ranks' ZMQ messages had "
+                "arrived yet looking like a rank change. Set to 1 to fire "
+                "immediately (old behaviour). Ignored when --pa-no-rank-trigger "
+                "is set."
             ),
         )
         group.add_argument(
