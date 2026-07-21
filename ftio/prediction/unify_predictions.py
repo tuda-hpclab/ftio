@@ -51,7 +51,7 @@ def merge_predictions(
         text = f"Merging Autocorrelation and {args.transformation.upper()}\n"
         if not pred_auto.is_empty() and not np.isnan(pred_auto.dominant_freq):
             pred_merged, text = merge_core(pred_dft, pred_auto, args.freq, text)
-            if pred_merged.dominant_freq:
+            if len(pred_merged.dominant_freq) > 0:
                 text += f"Dominant frequency: [blue bold]{np.round(pred_merged.dominant_freq[-1],4)}[/] Hz -> [blue bold]{np.round(1/pred_merged.dominant_freq[-1],4)}[/] sec\n"
                 text += f"Confidence: [bold]{pred_merged.conf[-1]}{np.round(pred_merged.conf[-1]*100,2)}[/] %\n"
             pred_auto.candidates = []
@@ -189,8 +189,31 @@ def merge_core(
                 # text += f"[red bold]{alike[dominant_index]} + {pred_dft.conf[dominant_index]} + {pred_auto.conf}[/]\n"
             if conf >= 0.2:
                 out_freq, out_conf = [dominant_freq], [conf]
+                # amp/phi/periodicity are parallel arrays to pred_dft.dominant_freq
+                # (see _dft_workflow.py: all four are indexed by the same
+                # dominant_index). dominant_freq/conf get narrowed to the single
+                # merge winner above -- narrow these the same way, to the same
+                # index, or get_dominant_index() later argmaxes over the stale,
+                # longer amp array and indexes the now-shorter dominant_freq with
+                # an out-of-range position.
+                out_amp = (
+                    [pred_dft.amp[dominant_index]]
+                    if len(pred_dft.amp) > dominant_index
+                    else []
+                )
+                out_phi = (
+                    [pred_dft.phi[dominant_index]]
+                    if len(pred_dft.phi) > dominant_index
+                    else []
+                )
+                out_periodicity = (
+                    [pred_dft.periodicity[dominant_index]]
+                    if len(pred_dft.periodicity) > dominant_index
+                    else []
+                )
             else:
                 out_freq, out_conf = [], []
+                out_amp, out_phi, out_periodicity = [], [], []
                 text += "[red bold]Too low confidence, no dominant freq[/]\n"
 
     else:  # no dft result
@@ -198,8 +221,16 @@ def merge_core(
         conf = pred_auto.conf / 3
         text += "Confidence: [red] Warning! Low confidence! [/]\n"
         out_freq, out_conf = dominant_freq, conf
+        out_amp, out_phi, out_periodicity = (
+            pred_dft.amp,
+            pred_dft.phi,
+            pred_dft.periodicity,
+        )
 
     pred_merged = pred_dft
     pred_merged.dominant_freq = out_freq
     pred_merged.conf = out_conf
+    pred_merged.amp = out_amp
+    pred_merged.phi = out_phi
+    pred_merged.periodicity = out_periodicity
     return pred_merged, text

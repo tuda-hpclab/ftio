@@ -646,15 +646,18 @@ class JitSettings:
                 # )
                 # generate_data used to launch straight into the $APP_PROCS_X_NODES
                 # mpirun below, so every rank raced to create data/checkpoints/
-                # hydra_log under the FUSE mount at once. At 65 nodes (256 ranks)
-                # that races the same three mkdir()s over and over -- gekko_fuse.log
-                # showed the daemon stuck spinning "root node allocated / . / .."
-                # (readdir on the mount root) for the full 30-minute timeout, never
-                # reaching the actual data-generation writes. The same workload at
-                # the same concurrency runs fine on a real FS (see exclude_daemon
-                # above), so this is FUSE-mount-specific contention, not dlio_benchmark
-                # itself. Pre-creating the three dirs as a single serial step first
-                # removes the race outright.
+                # hydra_log (and, deeper, the data/train/ subdir tf.io.TFRecordWriter
+                # creates itself) under the FUSE mount at once, which hangs/crashes
+                # at scale (65 nodes: 30-min hang; 448 ranks: NotFoundError racing
+                # data/train/). Pre-creating the three dirs as a single serial step
+                # first removes the race. That step used to silently land on the
+                # JIT driver's own node instead of an app node's FUSE mount --
+                # setup_core.py's pre_app_call list dispatch only srun-wrapped
+                # items containing mpirun/mpiexec, so a bare mkdir ran locally on
+                # whatever host was executing the JIT driver process. Fixed by
+                # having pre_call() flag-wrap non-MPI list items too (single node,
+                # single proc), so the mkdir now runs via srun on an actual app
+                # node.
                 self.pre_app_call = [
                     f"mkdir -p {dlio_dir}/data {dlio_dir}/checkpoints {dlio_dir}/hydra_log",
                     (
@@ -1183,12 +1186,15 @@ class JitSettings:
             # An empty flush pattern matches nothing, so FTIO would trigger on
             # time but stage 0 items and the checkpoints would pile up in the
             # rootdir until the post-app copy hits EDQUOT. The mountdir only
-            # ever holds ckpt.restart.<step>.<fileidx> (nfile 64 in in.ckpt
-            # splits each checkpoint into 64 concurrently-written files so a
-            # single writer isn't the one throttling GekkoFS's daemon fan-out)
-            # plus one ckpt.restart.<step>.base metadata file per checkpoint --
-            # confirmed against an actual local run, not assumed from the docs.
-            self.regex_flush_match = ".*/ckpt\\.restart\\.\\d+\\.(\\d+|base)$"
+            # ever holds ckpt.restart.<step>, so match them explicitly.
+            #
+            # Tried nfile 64 (multi-file "%" restart, regex
+            # ckpt\.restart\.\d+\.(\d+|base)$) to let GekkoFS's daemons fan
+            # out. Confirmed on BSC (43561676, 448 ranks): it segfaults inside
+            # libc _IO_ferror under GekkoFS's LD_PRELOAD intercept specifically
+            # -- identical config on plain GPFS runs fine. Reverted to
+            # single-writer until that's resolved on the GekkoFS side.
+            self.regex_flush_match = ".*/ckpt\\.restart\\.\\d+$"
             self.regex_stage_out_match = ".*"
             self.regex_stage_in_match = ".*"
         # ├─ S3D-IO
