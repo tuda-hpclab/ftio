@@ -81,6 +81,8 @@ _GEKKO_CONN_PATTERNS = (
     "transport endpoint is not connected",
     "stale file handle",
     "device or resource busy",  # EBUSY (errno 16) — GekkoFS mount unresponsive
+    "failed to load hosts addresses",  # hostfile written on one node, not yet
+    "failed to open hosts file",  # visible from another — GPFS metadata lag
 )
 
 
@@ -688,7 +690,29 @@ def stage_in(settings: JitSettings, runtime: JitTime) -> None:
 
             start = time.time()
             if call:
-                _ = execute_block(call, dry_run=settings.dry_run)
+                # The hosts file the daemon just wrote can lag behind on GPFS's
+                # per-node metadata cache: stage_in's srun step reads it from an
+                # app node moments later and sees "no such file" even though
+                # wait_for_file() already confirmed it exists (from the node
+                # running jit itself). Retry through that window instead of
+                # aborting the whole run (43646952, LAMMPS/GLASS, 2026-07-22).
+                for attempt in range(_MAX_RETRIES):
+                    try:
+                        _ = execute_block(call, dry_run=settings.dry_run)
+                        break
+                    except subprocess.CalledProcessError as e:
+                        text = f"{e.stdout or ''}\n{e.stderr or ''}"
+                        if (
+                            attempt == _MAX_RETRIES - 1
+                            or not _has_gekko_connection_error(text)
+                        ):
+                            raise
+                        jit_print(
+                            f"[bold yellow]Stage-in hit a transient GekkoFS/GPFS "
+                            f"error (attempt {attempt + 1}/{_MAX_RETRIES}), "
+                            f"retrying...[/]"
+                        )
+                        time.sleep(5)
         # TODO: fix cpp cargo
         else:
             if settings.cluster:
