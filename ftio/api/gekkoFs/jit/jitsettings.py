@@ -446,12 +446,14 @@ class JitSettings:
         #  ├─ IOR
         if "ior" in self.app:
             self.app_call = "./ior "
-            self.run_dir = f"{self.home}/ior/src"
+            # installed in $HOME, but run from scratch -- see prepare_run_dir
+            self.run_dir = self.prepare_run_dir(f"{self.home}/ior/src", ["ior"])
             self.app_flags = "-a POSIX -i 4 -o ./iortest -t 128k -b 512m -F"
         #  ├─ HACCIO
         elif "hacc" in self.app:
             self.app_call = "./HACC_ASYNC_IO"
-            self.run_dir = f"{self.home}/HACC-IO"
+            # installed in $HOME, but run from scratch -- see prepare_run_dir
+            self.run_dir = self.prepare_run_dir(f"{self.home}/HACC-IO", ["HACC_ASYNC_IO"])
             self.app_flags = "1000000 test_run/mpi"
         # ├─ NEK5000 --> change gkfs_daemon_protocol to socket
         elif "nek" in self.app:
@@ -709,10 +711,14 @@ class JitSettings:
                 )
         #  ├─ HACCIO
         elif "hacc" in self.app:
-            self.pre_app_call = ""
             self.post_app_call = ""
             if not self.exclude_daemon:
+                self.pre_app_call = ""
                 self.app_flags = self.app_flags.replace("test_run", f"{self.gkfs_mntdir}")
+            else:
+                # prepare_run_dir only copies the binary; the output subdir
+                # (test_run/mpi, relative to run_dir) needs creating on scratch.
+                self.pre_app_call = f"mkdir -p {self.run_dir}/test_run/mpi"
         # ├─ wrf
         elif "wrf" in self.app:
             # Deliberately empty. The old body ran WRF *inside* the mount, which
