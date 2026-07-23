@@ -35,11 +35,18 @@ def _mode_label(mode: str) -> str:
     return "pfs"
 
 
-def totals_by_node(json_path: str) -> dict:
-    """Read a result.json into {compute_nodes: {label: {app,stage_in,stage_out,total}}}.
+def totals_by_node(json_path: str, show_reps: bool = False) -> dict:
+    """Read a result.json into {compute_nodes: {label: entry_or_entries}}.
 
-    total = app + stage_in + stage_out. For each (nodes, mode) the latest entry
-    by timestamp wins, so reruns show the most recent number.
+    total = app + stage_in + stage_out.
+
+    show_reps=False (default): for each (nodes, mode) the latest entry by
+    timestamp wins, so reruns show the most recent number -- value is a
+    single {app,stage_in,stage_out,total} dict.
+
+    show_reps=True: every entry for each (nodes, mode) is kept, sorted by
+    timestamp ascending -- value is a list of
+    {app,stage_in,stage_out,total,node_local} dicts, one per rep.
     """
     with open(json_path) as f:
         data = json.load(f)
@@ -47,22 +54,54 @@ def totals_by_node(json_path: str) -> dict:
     for grp in data:
         # jit reserves one node for FTIO, so compute nodes = nodes - 1
         n = int(grp["nodes"]) - 1
-        latest: dict = {}
+        by_label: dict = {}
         for e in grp.get("data", []):
             label = _mode_label(e.get("mode", ""))
-            ts = e.get("timestamp", "")
-            if label not in latest or ts >= latest[label][0]:
-                latest[label] = (ts, e)
-        rows[n] = {
-            label: {
-                "app": e["app"],
-                "stage_in": e["stage_in"],
-                "stage_out": e["stage_out"],
-                "total": e["app"] + e["stage_in"] + e["stage_out"],
+            by_label.setdefault(label, []).append(e)
+        if show_reps:
+            rows[n] = {
+                label: [
+                    {
+                        "app": e["app"],
+                        "stage_in": e["stage_in"],
+                        "stage_out": e["stage_out"],
+                        "total": e["app"] + e["stage_in"] + e["stage_out"],
+                        "node_local": e.get("settings", {}).get("node local"),
+                    }
+                    for e in sorted(entries, key=lambda e: e.get("timestamp", ""))
+                ]
+                for label, entries in by_label.items()
             }
-            for label, (ts, e) in latest.items()
-        }
+        else:
+            rows[n] = {
+                label: {
+                    "app": e["app"],
+                    "stage_in": e["stage_in"],
+                    "stage_out": e["stage_out"],
+                    "total": e["app"] + e["stage_in"] + e["stage_out"],
+                }
+                for label, e in (
+                    (label, max(entries, key=lambda e: e.get("timestamp", "")))
+                    for label, entries in by_label.items()
+                )
+            }
     return rows
+
+
+def _rep_labels(entries: list[dict]) -> list[str]:
+    """Label each rep in a timestamp-ordered entry list for the "run" column.
+
+    Tags disk/mem when "node local" differs across the reps (the case this
+    was built for: comparing a node_local=True run against a --use_mem run at
+    the same node count). Falls back to a plain ordinal when it doesn't
+    differ (e.g. a plain repeated-for-variance run). No label for a
+    single-entry list.
+    """
+    if len(entries) <= 1:
+        return [""] * len(entries)
+    if len({e["node_local"] for e in entries}) > 1:
+        return ["disk" if e["node_local"] else "mem" for e in entries]
+    return [f"rep {i + 1}" for i in range(len(entries))]
 
 
 def started_runs(app_dir: str) -> set:
@@ -84,7 +123,24 @@ def started_runs(app_dir: str) -> set:
     return out
 
 
-def print_totals_table(json_path: str) -> None:
+def _cell(
+    entry: dict, key: str, smallest: str | None, biggest: str | None, label: str
+) -> str:
+    value = f"{entry[key]:.1f}"
+    if smallest != biggest and label == smallest:
+        return f"[green]{value}[/green]"
+    if smallest != biggest and label == biggest:
+        return f"[yellow]{value}[/yellow]"
+    return value
+
+
+def _highlighted_extremes(vals: dict) -> tuple:
+    smallest = min(vals, key=vals.get) if vals else None
+    biggest = max(vals, key=vals.get) if vals else None
+    return smallest, biggest
+
+
+def print_totals_table(json_path: str, show_reps: bool = False) -> None:
     """Print a per-node app/total table (glass | gekko | pfs) to the console.
 
     Cells: numbers when the run finished, red FAIL when it started but never
@@ -94,12 +150,16 @@ def print_totals_table(json_path: str) -> None:
     run is then a FAIL. Read it only if it exists so the table still prints (from
     the on-disk log dirs) instead of crashing with FileNotFoundError. A half-written
     file (a run is appending to it right now) is treated the same way.
+
+    show_reps=True prints one row per repetition instead of collapsing every
+    rep at a given node count down to the latest by timestamp; see
+    docs/superpowers/specs/2026-07-23-jit-plot-table-reps-design.md.
     """
     app_dir = os.path.dirname(os.path.abspath(json_path))
     rows = {}
     if os.path.exists(json_path):
         try:
-            rows = totals_by_node(json_path)
+            rows = totals_by_node(json_path, show_reps=show_reps)
         except json.JSONDecodeError:
             CONSOLE.print(
                 f"[yellow]{json_path} is being written right now; showing the "
@@ -115,6 +175,8 @@ def print_totals_table(json_path: str) -> None:
         f"green = smallest, yellow = largest per row)"
     )
     table.add_column("nodes", justify="right")
+    if show_reps:
+        table.add_column("run")
     for label in ("glass", "gekko"):
         table.add_column(f"{label} app", justify="right")
         table.add_column(f"{label} in", justify="right")
@@ -125,54 +187,108 @@ def print_totals_table(json_path: str) -> None:
 
     for n in sorted(set(rows) | {node for node, _ in started}):
         row = rows.get(n, {})
-        # smallest/largest app and smallest/largest total across modes for this
-        # row get highlighted, kept as separate groups since total >= app always
-        # and would otherwise dominate.
-        app_vals = {label: row[label]["app"] for label in row}
-        total_vals = {label: row[label]["total"] for label in row}
-        smallest_app = min(app_vals, key=app_vals.get) if app_vals else None
-        biggest_app = max(app_vals, key=app_vals.get) if app_vals else None
-        smallest_total = min(total_vals, key=total_vals.get) if total_vals else None
-        biggest_total = max(total_vals, key=total_vals.get) if total_vals else None
 
-        def _cell(
-            row: dict, label: str, key: str, smallest: str | None, biggest: str | None
-        ) -> str:
-            value = f"{row[label][key]:.1f}"
-            if smallest != biggest and label == smallest:
-                return f"[green]{value}[/green]"
-            if smallest != biggest and label == biggest:
-                return f"[yellow]{value}[/yellow]"
-            return value
+        if not show_reps:
+            # smallest/largest app and smallest/largest total across modes for
+            # this row get highlighted, kept as separate groups since total >=
+            # app always and would otherwise dominate.
+            app_vals = {label: row[label]["app"] for label in row}
+            total_vals = {label: row[label]["total"] for label in row}
+            smallest_app, biggest_app = _highlighted_extremes(app_vals)
+            smallest_total, biggest_total = _highlighted_extremes(total_vals)
 
-        cells = [str(n)]
-        for label in ("glass", "gekko"):
-            if label in row:
-                cells.append(_cell(row, label, "app", smallest_app, biggest_app))
-                cells.append(f"{row[label]['stage_in']:.1f}")
-                cells.append(f"{row[label]['stage_out']:.1f}")
-                cells.append(_cell(row, label, "total", smallest_total, biggest_total))
-            elif (n, label) in started:
-                cells.extend(["[red]FAIL[/red]"] * 4)
+            cells = [str(n)]
+            for label in ("glass", "gekko"):
+                if label in row:
+                    cells.append(
+                        _cell(row[label], "app", smallest_app, biggest_app, label)
+                    )
+                    cells.append(f"{row[label]['stage_in']:.1f}")
+                    cells.append(f"{row[label]['stage_out']:.1f}")
+                    cells.append(
+                        _cell(row[label], "total", smallest_total, biggest_total, label)
+                    )
+                elif (n, label) in started:
+                    cells.extend(["[red]FAIL[/red]"] * 4)
+                else:
+                    cells.extend(["-"] * 4)
+            if "pfs" in row:
+                cells.append(_cell(row["pfs"], "app", smallest_app, biggest_app, "pfs"))
+                cells.append(
+                    _cell(row["pfs"], "total", smallest_total, biggest_total, "pfs")
+                )
+            elif (n, "pfs") in started:
+                cells.extend(["[red]FAIL[/red]"] * 2)
             else:
-                cells.extend(["-"] * 4)
-        if "pfs" in row:
-            cells.append(_cell(row, "pfs", "app", smallest_app, biggest_app))
-            cells.append(_cell(row, "pfs", "total", smallest_total, biggest_total))
-        elif (n, "pfs") in started:
-            cells.extend(["[red]FAIL[/red]"] * 2)
-        else:
-            cells.extend(["-"] * 2)
+                cells.extend(["-"] * 2)
 
-        # GLASS goal for the row: glass total < gekko total < pfs total. Flag it
-        # on the "nodes" cell only -- coloring the whole row would swamp the
-        # per-cell smallest/largest highlighting done above.
-        goal_hit = {"glass", "gekko", "pfs"} <= set(total_vals) and total_vals[
-            "glass"
-        ] < total_vals["gekko"] < total_vals["pfs"]
-        if goal_hit:
-            cells[0] = f"[bold green]{cells[0]}[/bold green]"
-        table.add_row(*cells)
+            # GLASS goal for the row: glass total < gekko total < pfs total.
+            # Flag it on the "nodes" cell only -- coloring the whole row would
+            # swamp the per-cell smallest/largest highlighting done above.
+            goal_hit = {"glass", "gekko", "pfs"} <= set(total_vals) and total_vals[
+                "glass"
+            ] < total_vals["gekko"] < total_vals["pfs"]
+            if goal_hit:
+                cells[0] = f"[bold green]{cells[0]}[/bold green]"
+            table.add_row(*cells)
+            continue
+
+        # show_reps: one row per (n, rep index), aligned across modes by
+        # rep index (rep 0 = each mode's earliest entry by timestamp, etc.).
+        # A mode entirely missing at this node count still gets one FAIL row
+        # if it left a started-but-unfinished log dir (max_reps defaults to 1
+        # so that row isn't skipped); a mode with fewer reps than another
+        # shows "-" past its own last rep, not FAIL.
+        labels_present = [label for label in ("glass", "gekko", "pfs") if label in row]
+        max_reps = max((len(row[label]) for label in labels_present), default=1)
+        rep_labels = {label: _rep_labels(row[label]) for label in labels_present}
+
+        for rep_idx in range(max_reps):
+            entries_this_rep = {
+                label: row[label][rep_idx]
+                for label in labels_present
+                if rep_idx < len(row[label])
+            }
+            app_vals = {label: e["app"] for label, e in entries_this_rep.items()}
+            total_vals = {label: e["total"] for label, e in entries_this_rep.items()}
+            smallest_app, biggest_app = _highlighted_extremes(app_vals)
+            smallest_total, biggest_total = _highlighted_extremes(total_vals)
+
+            run_label = next(
+                (
+                    rep_labels[label][rep_idx]
+                    for label in labels_present
+                    if rep_idx < len(row[label])
+                ),
+                "",
+            )
+            cells = [str(n), run_label]
+            for label in ("glass", "gekko"):
+                if label in entries_this_rep:
+                    e = entries_this_rep[label]
+                    cells.append(_cell(e, "app", smallest_app, biggest_app, label))
+                    cells.append(f"{e['stage_in']:.1f}")
+                    cells.append(f"{e['stage_out']:.1f}")
+                    cells.append(_cell(e, "total", smallest_total, biggest_total, label))
+                elif rep_idx == 0 and label not in row and (n, label) in started:
+                    cells.extend(["[red]FAIL[/red]"] * 4)
+                else:
+                    cells.extend(["-"] * 4)
+            if "pfs" in entries_this_rep:
+                e = entries_this_rep["pfs"]
+                cells.append(_cell(e, "app", smallest_app, biggest_app, "pfs"))
+                cells.append(_cell(e, "total", smallest_total, biggest_total, "pfs"))
+            elif rep_idx == 0 and "pfs" not in row and (n, "pfs") in started:
+                cells.extend(["[red]FAIL[/red]"] * 2)
+            else:
+                cells.extend(["-"] * 2)
+
+            goal_hit = {"glass", "gekko", "pfs"} <= set(total_vals) and total_vals[
+                "glass"
+            ] < total_vals["gekko"] < total_vals["pfs"]
+            if goal_hit:
+                cells[0] = f"[bold green]{cells[0]}[/bold green]"
+            table.add_row(*cells)
     CONSOLE.print(table)
 
 
@@ -264,11 +380,12 @@ def plot_results(args):
         filenames (list): List of JSON file paths.
     """
     # No argument: use ./result.json if we are sitting inside a per-app folder.
+    show_reps = getattr(args, "reps", False)
     if args and not args.filenames:
         here = os.path.join(os.getcwd(), "result.json")
         if os.path.exists(here):
             if getattr(args, "table", False):
-                print_totals_table(here)
+                print_totals_table(here, show_reps=show_reps)
             else:
                 extract_and_plot(JitResult(), here, here, no_diff=args.no_diff)
             return
@@ -277,7 +394,7 @@ def plot_results(args):
             found = app_result_jsons(os.getcwd())
             if found:
                 for path in found:
-                    print_totals_table(path)
+                    print_totals_table(path, show_reps=show_reps)
                 return
 
     if not args:
@@ -345,7 +462,7 @@ def plot_results(args):
             if getattr(args, "table", False):
                 # A job folder tables every app in it; an app names just itself.
                 for json_file_path in resolve_result_jsons(filename):
-                    print_totals_table(json_file_path)
+                    print_totals_table(json_file_path, show_reps=show_reps)
                 continue
             # Resolve an app name / folder / result.json into the actual file.
             json_file_path = resolve_result_json(filename)
@@ -431,6 +548,17 @@ def main():
         "--table",
         action="store_true",
         help="Print a per-node app/total table to the console; no browser plot.",
+        default=False,
+    )
+    parser.add_argument(
+        "-r",
+        "--reps",
+        action="store_true",
+        help=(
+            "With -t, show every repetition at a node count on its own line "
+            "instead of collapsing to the latest by timestamp. Labels reps "
+            "disk/mem when node_local differs across them, else rep 1/2/...."
+        ),
         default=False,
     )
     args = parser.parse_args()
