@@ -16,6 +16,7 @@ https://github.com/tuda-parallel/FTIO/blob/main/LICENSE
 import math
 import os
 import re
+import signal
 
 # import multiprocessing
 import subprocess
@@ -48,6 +49,7 @@ from ftio.api.gekkoFs.jit.setup_helper import (
     get_executable_realpath,
     handle_sigint,
     jit_print,
+    kill_process_tree,
     mpiexec_call,
     relevant_files,
     remove_hostfile,
@@ -1174,7 +1176,7 @@ def start_application(settings: JitSettings, runtime: JitTime):
         try:
             _, stderr = process.communicate(timeout=app_timeout)
         except subprocess.TimeoutExpired:
-            process.kill()
+            kill_process_tree(process.pid, signal.SIGTERM)
             process.communicate()
             timed_out = True
             jit_print(
@@ -1331,6 +1333,14 @@ def pre_call(settings: JitSettings) -> None:
                 for call in settings.pre_app_call:
                     if any(x in call for x in ["mpiex", "mpirun"]):
                         call = flaged_call(settings, call, exclude=["ftio"])
+                    else:
+                        # Non-MPI steps (e.g. a plain mkdir) still need to land
+                        # on an app node -- otherwise they run bare on whatever
+                        # host the JIT driver process itself is on, which is
+                        # not one of the GekkoFS-mounted app nodes.
+                        call = flaged_call(
+                            settings, call, nodes=1, procs_per_node=1, exclude=["ftio"]
+                        )
                     returncode = execute_block_and_monitor(
                         settings.verbose,
                         call,
