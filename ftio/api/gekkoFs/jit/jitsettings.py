@@ -46,7 +46,13 @@ class JitSettings:
         self.debug_lvl = 0  # >0 FTIO, >1 GKFS & FTIO, >2 GKFS & FTIO & CARGO
         self.verbose = True
         self.verbose_error = True
-        self.node_local = True  # execute in node local space or memory
+        # execute in node local space (disk) or memory (/dev/shm, tmpfs).
+        # False (memory) is the default: job 43710099 (2026-07-23) measured
+        # --use_mem roughly halving app time for both glass and gekko over
+        # the node-local-disk path, on IOR at 9 and 19 nodes. --use_mem is
+        # now a no-op (already False); kept for explicitness on the command
+        # line rather than removed.
+        self.node_local = False
         self.env_var = {}
         self.log_speed = 0.1  # how fast to read the log
 

@@ -16,6 +16,7 @@ https://github.com/tuda-parallel/FTIO/blob/main/LICENSE
 import math
 import os
 import re
+import signal
 
 # import multiprocessing
 import subprocess
@@ -48,6 +49,7 @@ from ftio.api.gekkoFs.jit.setup_helper import (
     get_executable_realpath,
     handle_sigint,
     jit_print,
+    kill_process_tree,
     mpiexec_call,
     relevant_files,
     remove_hostfile,
@@ -1174,7 +1176,7 @@ def start_application(settings: JitSettings, runtime: JitTime):
         try:
             _, stderr = process.communicate(timeout=app_timeout)
         except subprocess.TimeoutExpired:
-            process.kill()
+            kill_process_tree(process.pid, signal.SIGTERM)
             process.communicate()
             timed_out = True
             jit_print(
