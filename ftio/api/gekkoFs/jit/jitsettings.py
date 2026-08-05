@@ -490,11 +490,19 @@ class JitSettings:
             # installed in $HOME, but run from scratch -- see prepare_run_dir
             self.run_dir = self.prepare_run_dir(f"{self.home}/mylammps/glass")
             ckptdir = self.gkfs_mntdir if not self.exclude_daemon else self.run_dir
+            # Weak scaling: the lattice grows with the job so bytes-per-rank stay
+            # constant (see weak_scale_lattice). The node count is taken from -n,
+            # not from app_nodes, so all three modes size identically -- app_nodes
+            # is only assigned later, during node allocation.
+            n = self.weak_scale_lattice((self.nodes - 1) * self.procs_app)
             self.app_flags = self.resolve_app_flags(
                 f"-in {self.run_dir}/in.ckpt -v ckptdir {ckptdir} "
-                f"-v x 168 -v y 168 -v z 168 "
+                f"-v x {n} -v y {n} -v z {n} "
                 # 54 phases: nsteps = phases*every + tail = 818 = ~100 s at 8 compute
-                # nodes (0.12 s/step measured in 43420026), 54 restarts x 1.67 GB.
+                # nodes (0.12 s/step measured in 43420026). Per-rank work is fixed
+                # by the weak scaling, so wall time stays flat as nodes grow, but
+                # the restart does not: drop phases for very large node counts or
+                # the sweep will outrun stage-out (a past run hit 6.9 TB).
                 f"-v every 15 -v nb 15 -v phases 54 -v tail 8",
                 ckptdir,
             )
@@ -1036,6 +1044,30 @@ class JitSettings:
             )
         return flags
 
+    @staticmethod
+    def weak_scale_lattice(ranks: int, atoms_per_rank: int = 84_672) -> int:
+        """fcc lattice edge that gives each rank ~`atoms_per_rank` atoms.
+
+        LAMMPS writes its restart from rank 0 only, one record per rank. GekkoFS
+        parallelizes a write across as many daemons as that single write spans
+        512 KB chunks, so what matters is bytes *per rank*, not total file size.
+        With a fixed lattice that shrinks as nodes grow -- at 168^3 over 3584
+        ranks each record is 466 KB, under one chunk, so every write hits one
+        daemon and GekkoFS loses to the PFS. Holding atoms/rank constant keeps
+        each record many chunks wide at any scale.
+
+        The default is the value measured at 4 compute nodes (7.45 MB/record),
+        where GLASS beat the PFS by 2.2x.
+
+        Args:
+            ranks (int): Total application ranks.
+            atoms_per_rank (int): Atoms each rank should own.
+
+        Returns:
+            int: Lattice edge n, so the deck has 4*n^3 atoms.
+        """
+        return max(1, round(((atoms_per_rank * max(1, ranks)) / 4) ** (1 / 3)))
+
     def prepare_run_dir(self, deck_dir: str, files: list[str] | None = None) -> str:
         """Copy an app's deck to scratch and return that as the run directory.
 
@@ -1194,13 +1226,14 @@ class JitSettings:
         elif "lmp" in self.app_call:
             # An empty flush pattern matches nothing, so FTIO would trigger on
             # time but stage 0 items and the checkpoints would pile up in the
-            # rootdir until the post-app copy hits EDQUOT. The mountdir only
-            # ever holds ckpt.restart.<step>.<fileidx> (nfile 64 in in.ckpt
-            # splits each checkpoint into 64 concurrently-written files so a
-            # single writer isn't the one throttling GekkoFS's daemon fan-out)
-            # plus one ckpt.restart.<step>.base metadata file per checkpoint --
-            # confirmed against an actual local run, not assumed from the docs.
-            self.regex_flush_match = ".*/ckpt\\.restart\\.\\d+\\.(\\d+|base)$"
+            # rootdir until the post-app copy hits EDQUOT. That is exactly what
+            # happened once: in.ckpt was switched from multi-file restarts
+            # (ckpt.restart.<step>.<idx>) to single-writer ones
+            # (ckpt.restart.<step>) without updating this regex, so every FTIO
+            # trigger staged 0 items for a whole run (BSC 43752428: "Staging 0
+            # item(s)" on every call). Match BOTH namings so in.ckpt's -v mp
+            # knob can flip writer count without touching the regex again.
+            self.regex_flush_match = ".*/ckpt\\.restart\\.\\d+(\\.(\\d+|base))?$"
             self.regex_stage_out_match = ".*"
             self.regex_stage_in_match = ".*"
         # ├─ S3D-IO
