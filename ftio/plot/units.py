@@ -36,7 +36,12 @@ def set_unit(arr: np.ndarray, suffix="B/s") -> tuple[str, float]:
         arr = np.array(arr)
 
     if arr.size > 0 and np.max(arr) > 0:
-        order = np.log10(np.max(arr))
+        # float() first: a Python int past int64 lands in an object array, and
+        # np.log10 has no loop for that (it raises TypeError). window_adaptation
+        # hands us exactly that when a near-zero frequency makes n_phases tiny
+        # and total_bytes/n_phases blows up -- which killed the FTIO process, and
+        # with it every glass run (BSC 44288164).
+        order = np.log10(float(np.max(arr)))
 
     if order > 9:
         order = 1e-9
