@@ -196,8 +196,16 @@ def merge_core(
                 # index, or get_dominant_index() later argmaxes over the stale,
                 # longer amp array and indexes the now-shorter dominant_freq with
                 # an out-of-range position.
-                out_amp = [pred_dft.amp[dominant_index]] if len(pred_dft.amp) > dominant_index else []
-                out_phi = [pred_dft.phi[dominant_index]] if len(pred_dft.phi) > dominant_index else []
+                out_amp = (
+                    [pred_dft.amp[dominant_index]]
+                    if len(pred_dft.amp) > dominant_index
+                    else []
+                )
+                out_phi = (
+                    [pred_dft.phi[dominant_index]]
+                    if len(pred_dft.phi) > dominant_index
+                    else []
+                )
                 out_periodicity = (
                     [pred_dft.periodicity[dominant_index]]
                     if len(pred_dft.periodicity) > dominant_index
@@ -213,7 +221,11 @@ def merge_core(
         conf = pred_auto.conf / 3
         text += "Confidence: [red] Warning! Low confidence! [/]\n"
         out_freq, out_conf = dominant_freq, conf
-        out_amp, out_phi, out_periodicity = pred_dft.amp, pred_dft.phi, pred_dft.periodicity
+        out_amp, out_phi, out_periodicity = (
+            pred_dft.amp,
+            pred_dft.phi,
+            pred_dft.periodicity,
+        )
 
     pred_merged = pred_dft
     pred_merged.dominant_freq = out_freq
