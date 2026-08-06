@@ -144,7 +144,7 @@ class JitSettings:
         self.preload_via_export = (
             False  # if True, use legacy --export/mpiexec -x; default wraps in bash -c
         )
-        self.gkfs_use_syscall = False
+        self.gkfs_use_syscall = True
         self.trap_exit = True
         self.soft_kill = True
         self.hard_kill = True
@@ -181,7 +181,6 @@ class JitSettings:
         console.print(f"[bold  green]CLUSTER MODE: {self.cluster}[/]")
 
         if "gp" in hostname:
-            self.gkfs_use_syscall = True
             self.fuse = True
             # self.procs = os.cpu_count() / 2
             console.print("[bold green]FUSE MODE: ON[/]")
@@ -204,11 +203,13 @@ class JitSettings:
             self.alloc_call_flags = self.alloc_call_flags.replace(self.job_name, new_name)
             self.job_name = new_name
 
-        # Gekko settings
-        if self.gkfs_use_syscall:
-            # already correct
-            pass
-        else:
+        # Gekko settings. Syscall interception is the default and should stay
+        # that way: the libc interceptor fabricates a FILE* with only
+        # _mode/_flags/_fileno set and never intercepts ferror(), so any app
+        # calling it locks a garbage pointer and segfaults (LAMMPS does, after
+        # every restart -- see glass/gekkofs_ferror_bug.md). If syscall
+        # interception does not work for an app, try FUSE, not libc.
+        if not self.gkfs_use_syscall:
             self.gkfs_intercept = self.gkfs_intercept.replace(
                 "_intercept.so", "_libc_intercept.so"
             )
@@ -531,7 +532,10 @@ class JitSettings:
             workload = f" workload={workload} "
         #  ├─ S3D-IO
         elif "s3d" in self.app:
-            self.app_call = "/lustre/project/nhr-gekko/shared/S3D-IO/s3d_io.x"
+            # $HOME-relative like every other app: the old hardcoded Mogon path
+            # (/lustre/project/nhr-gekko/shared/...) does not exist on BSC, so
+            # -a s3d could never run there even though the binary is installed.
+            self.app_call = os.getenv("S3D_BIN", f"{self.home}/S3D-IO/s3d_io.x")
             self.run_dir = "."
             if not self.app_flags:  # default value if app_flags is not set
                 self.app_flags = "200 200 200 2 2 2 0 F ."
@@ -619,12 +623,26 @@ class JitSettings:
         # > ${POST_APP_CALL}
         # ├─ dlio
         if "dlio" in self.app:
+            # DLIO derives checkpoint_only = (not do_train) and do_checkpoint
+            # (utils/config.py). In that mode run() skips training entirely and
+            # just writes num_checkpoints_write checkpoints spaced by
+            # time_between_checkpoints -- the compute->checkpoint square wave we
+            # want, with no dataset at all. Forcing train=True instead drags the
+            # dataset back in and dies on "Max steps per epoch: 0" as soon as
+            # num_files_train < ranks (llama_7b_zero3 ships 8, so anything past
+            # 8 ranks). Set DLIO_CHECKPOINT_ONLY=1 for such workloads.
+            ckpt_only = os.getenv("DLIO_CHECKPOINT_ONLY", "") not in ("", "0")
+            train = "False" if ckpt_only else "True"
+            # _checkpoint() raises if fewer checkpoints exist than it wants to
+            # read back, and driver apps must only ever write.
+            no_read = "++workload.checkpoint.num_checkpoints_read=0 " if ckpt_only else ""
             if self.exclude_daemon:
                 self.app_flags = (
                     f"{workload} "
                     f"++workload.workflow.generate_data=False "
-                    f"++workload.workflow.train=True "
+                    f"++workload.workflow.train={train} "
                     f"++workload.workflow.checkpoint=True "
+                    f"{no_read}"
                     f"++workload.dataset.data_folder={self.run_dir}/data "
                     f"++workload.checkpoint.checkpoint_folder={self.run_dir}/checkpoints "
                     f"++workload.output.output_folder={self.run_dir}/hydra_log "
@@ -632,14 +650,18 @@ class JitSettings:
                 # self.pre_app_call = f"mpirun -np 8 dlio_benchmark {self.app_flags} ++workload.workflow.generate_data=True ++workload.workflow.train=False"
                 # self.pre_app_call = f"mpirun -np $APP_NODES dlio_benchmark {self.app_flags} ++workload.workflow.generate_data=True ++workload.workflow.train=False"
                 self.pre_app_call = (
-                    f"mpirun -np $APP_PROCS_X_NODES dlio_benchmark "
-                    f"{workload} "
-                    f"++workload.workflow.generate_data=True "
-                    f"++workload.workflow.train=False "
-                    f"++workload.workflow.checkpoint=False "
-                    f"++workload.dataset.data_folder={self.run_dir}/data "
-                    f"++workload.checkpoint.checkpoint_folder={self.run_dir}/checkpoints "
-                    f"++workload.output.output_folder={self.run_dir}/hydra_log "
+                    ""
+                    if ckpt_only  # nothing to generate, there is no dataset
+                    else (
+                        f"mpirun -np $APP_PROCS_X_NODES dlio_benchmark "
+                        f"{workload} "
+                        f"++workload.workflow.generate_data=True "
+                        f"++workload.workflow.train=False "
+                        f"++workload.workflow.checkpoint=False "
+                        f"++workload.dataset.data_folder={self.run_dir}/data "
+                        f"++workload.checkpoint.checkpoint_folder={self.run_dir}/checkpoints "
+                        f"++workload.output.output_folder={self.run_dir}/hydra_log "
+                    )
                 )
                 self.post_app_call = ""
             else:
@@ -648,8 +670,9 @@ class JitSettings:
                     # f"++workload.workflow.generate_data=True ++workload.workflow.train=True ++workload.workflow.checkpoint=True "
                     f"{workload} "
                     f"++workload.workflow.generate_data=False "
-                    f"++workload.workflow.train=True "
+                    f"++workload.workflow.train={train} "
                     f"++workload.workflow.checkpoint=True "
+                    f"{no_read}"
                     f"++workload.dataset.data_folder={self.gkfs_mntdir}/data "
                     f"++workload.checkpoint.checkpoint_folder={self.gkfs_mntdir}/checkpoints "
                     f"++workload.output.output_folder={self.gkfs_mntdir}/hydra_log "
@@ -673,7 +696,9 @@ class JitSettings:
                 # removes the race outright.
                 self.pre_app_call = [
                     f"mkdir -p {dlio_dir}/data {dlio_dir}/checkpoints {dlio_dir}/hydra_log",
-                    (
+                ]
+                if not ckpt_only:  # nothing to generate, there is no dataset
+                    self.pre_app_call.append(
                         f"mpirun -np $APP_PROCS_X_NODES dlio_benchmark "
                         f"{workload} "
                         f"++workload.workflow.generate_data=True "
@@ -682,8 +707,7 @@ class JitSettings:
                         f"++workload.dataset.data_folder={dlio_dir}/data "
                         f"++workload.checkpoint.checkpoint_folder={dlio_dir}/checkpoints "
                         f"++workload.output.output_folder={dlio_dir}/hydra_log "
-                    ),
-                ]
+                    )
                 self.post_app_call = ""
         # ├─ Nek5000
         elif "nek" in self.app:
