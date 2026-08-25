@@ -18,6 +18,7 @@ https://github.com/tuda-parallel/FTIO/blob/main/LICENSE
 from __future__ import annotations
 
 import argparse
+import contextlib
 import math
 import mmap
 import os
@@ -27,6 +28,7 @@ import time
 from concurrent.futures import (
     ProcessPoolExecutor,
     ThreadPoolExecutor,
+    TimeoutError,
     as_completed,
 )
 
@@ -38,6 +40,21 @@ from ftio.api.gekkoFs.jit.logger import Logger
 TRIGGER_LOGGER = Logger(prefix="trigger", stream=sys.stdout).get()
 
 files_in_progress = FileQueue()
+
+# A daemon rank can be alive (os.kill(pid, 0) succeeds) yet unresponsive to every
+# RPC (Mercury NA_TIMEOUT on every destination) -- gkfs_daemon_is_alive() cannot see
+# that. Track consecutive flushes where every item failed; after a few in a row it's
+# the same situation as a dead daemon, just without the crash.
+_CONSECUTIVE_FULL_FAILURE_LIMIT = 3
+_consecutive_full_failures = 0
+_daemon_degraded = False
+
+# A stuck copy (wedged Mercury RPC) previously hung this whole flush call forever --
+# as_completed()/future.result() had no timeout, so nothing stopped it short of
+# SLURM's outer walltime killing the entire job (see QMC 81N: two separate 3h
+# submissions both hit the outer walltime with the gekko leg still "running").
+# Override with STAGE_OUT_FLUSH_TIMEOUT= for a slower/faster filesystem.
+STAGE_OUT_FLUSH_TIMEOUT = float(os.getenv("STAGE_OUT_FLUSH_TIMEOUT", "60"))
 
 
 def format_size(n_bytes: int) -> str:
@@ -110,9 +127,14 @@ def move_files_os(
     # items_to_submit = get_items_to_submit(files, args, "files")
     items_to_submit = get_items_to_submit(files, args, "folder")
 
+    # Size the files get_files() already listed instead of a second full
+    # `find` traversal of the mount just to format a log message.
     try:
-        raw = preloaded_call(args, f"find {args.gkfs_mntdir} -type f -printf '%s\\n'")
-        total_bytes = sum(int(x) for x in raw.splitlines() if x.strip().isdigit())
+        total_bytes = 0
+        for f in files:
+            # suppress: f may be moved/removed between listing and sizing
+            with contextlib.suppress(OSError):
+                total_bytes += os.path.getsize(f)
         size_str = format_size(total_bytes)
     except Exception:
         size_str = "unknown size"
@@ -161,6 +183,40 @@ def flush_using_tar(
     _write_flush_log(flush_log, summary, tar_dst, triggered_by, tar_time, delete_time)
 
 
+def gkfs_daemon_is_alive(args: argparse.Namespace) -> bool:
+    """Checks whether the srun process that launched the gkfs daemon is still
+    running. A dead daemon turns every RPC into a generic EBUSY (GekkoFS's
+    catch-all error), so `cp` failures alone can't tell "busy" from "gone" —
+    this is what actually distinguishes them.
+    """
+    pid = getattr(args, "gkfs_daemon_pid", 0)
+    if not pid:
+        return True
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def _record_flush_outcome(failed: int, total: int) -> None:
+    """Update the daemon-degraded streak from one flush's failed/total item count."""
+    global _consecutive_full_failures, _daemon_degraded
+    if total and failed == total:
+        _consecutive_full_failures += 1
+        if _consecutive_full_failures >= _CONSECUTIVE_FULL_FAILURE_LIMIT:
+            _daemon_degraded = True
+            TRIGGER_LOGGER.critical(
+                f"GEKKO DAEMON DEGRADED: {_consecutive_full_failures} consecutive "
+                "flushes failed every item — treating as unresponsive, further "
+                "flushes will be skipped"
+            )
+    else:
+        _consecutive_full_failures = 0
+
+
 def flush_using_cp(
     args: argparse.Namespace,
     items_to_submit: list[str],
@@ -178,11 +234,29 @@ def flush_using_cp(
     Returns:
         None
     """
+    global _consecutive_full_failures, _daemon_degraded
+    if not gkfs_daemon_is_alive(args):
+        TRIGGER_LOGGER.critical(
+            f"GEKKO DAEMON DEAD (pid {args.gkfs_daemon_pid}) — skipping this "
+            f"{triggered_by} flush of {len(items_to_submit)} item(s) instead of "
+            "retrying against a dead daemon until the job times out"
+        )
+        return
+    if _daemon_degraded:
+        TRIGGER_LOGGER.critical(
+            f"GEKKO DAEMON DEGRADED (pid alive but {_CONSECUTIVE_FULL_FAILURE_LIMIT} "
+            f"consecutive flushes failed every item) — skipping this {triggered_by} "
+            f"flush of {len(items_to_submit)} item(s) instead of retrying against an "
+            "unresponsive daemon until the job times out"
+        )
+        return
+
     # Step 3: Submit tasks to the executor ((only move the files if they are not
     # already in progress
     futures: dict = {}
     num_workers = args.parallel_move_threads
-    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+    executor = ProcessPoolExecutor(max_workers=num_workers)
+    try:
         for idx, item in enumerate(items_to_submit):
             # check that the item is not in progress and not  not in the ignored list
             if not files_in_progress.in_progress(
@@ -204,17 +278,50 @@ def flush_using_cp(
         if args.debug:
             TRIGGER_LOGGER.debug(f"Files in progress: {files_in_progress}")
 
-        for future in as_completed(futures):
-            try:
-                future.result()
-                files_in_progress.mark_done(items_to_submit[futures[future]])
-            except Exception as e:
-                index = futures[future]
-                TRIGGER_LOGGER.error(f"{items_to_submit[index]} had an error: {e}")
-                files_in_progress.mark_done(items_to_submit[index])
-            remaining = len(files_in_progress)
-            if remaining:
-                TRIGGER_LOGGER.info(f"{remaining} item(s) still in the queue")
+        # post_app is the final, complete stage-out -- an incomplete one invalidates
+        # the whole run's result, unlike a live trigger where the next one picks up
+        # the slack. Only live triggers get the wedged-daemon timeout; post_app falls
+        # back to the pre-timeout behavior (SLURM's outer walltime is the backstop).
+        flush_timeout = None if triggered_by == "post_app" else STAGE_OUT_FLUSH_TIMEOUT
+        failed = 0
+        try:
+            for future in as_completed(futures, timeout=flush_timeout):
+                try:
+                    future.result()
+                    files_in_progress.mark_done(items_to_submit[futures[future]])
+                except Exception as e:
+                    index = futures[future]
+                    failed += 1
+                    TRIGGER_LOGGER.error(f"{items_to_submit[index]} had an error: {e}")
+                    files_in_progress.mark_done(items_to_submit[index])
+                remaining = len(files_in_progress)
+                if remaining:
+                    TRIGGER_LOGGER.info(f"{remaining} item(s) still in the queue")
+        except TimeoutError:
+            stuck = [items_to_submit[futures[f]] for f in futures if not f.done()]
+            failed += len(stuck)
+            TRIGGER_LOGGER.critical(
+                f"STAGE-OUT TIMEOUT: {len(stuck)} item(s) still not done after "
+                f"{flush_timeout}s, giving up on this flush instead of "
+                f"hanging until SLURM's outer walltime kills the job: {stuck}"
+            )
+            for item in stuck:
+                files_in_progress.mark_done(item)
+    finally:
+        # wait=False: a wedged worker process must not block jit from moving on.
+        # It's abandoned, not killed -- SLURM reclaims it when the job ends.
+        executor.shutdown(wait=False, cancel_futures=True)
+
+    # A flush where every item failed still returns a time, so the run looks
+    # like a fast stage-out instead of a broken one. Say so loudly.
+    if failed:
+        TRIGGER_LOGGER.error(
+            f"STAGE-OUT INCOMPLETE: {failed}/{len(futures)} item(s) failed to copy "
+            f"— the reported {triggered_by} time is not a valid measurement"
+        )
+
+    if futures:
+        _record_flush_outcome(failed, len(futures))
 
 
 def get_items_to_submit(files: list, args: argparse.Namespace, mode: str = "files"):
@@ -436,6 +543,65 @@ def move_item(
         files_in_progress.mark_failed(item)
 
 
+def _count_files(args: argparse.Namespace, path: str) -> int:
+    """Number of regular files under `path`, or -1 if it cannot be counted."""
+    try:
+        raw = preloaded_call(args, f"find {path} -type f -printf '.' | wc -c")
+        return int(raw.strip().splitlines()[-1])
+    except Exception as e:
+        TRIGGER_LOGGER.error(f"Could not count files under {path}: {e}")
+        return -1
+
+
+_mount_names_logged = False
+
+
+def _log_mount_names_once(args: argparse.Namespace) -> None:
+    """Log the mount's top-level entry names the first time a recovery fails.
+
+    Recovering from the pre-rename prefix assumes `<item>.temp` is where the data
+    still lives. Castro says otherwise and the listing is the only way to see what
+    names really exist at flush time. Once per run: the listing is large.
+    """
+    global _mount_names_logged
+    if _mount_names_logged:
+        return
+    _mount_names_logged = True
+    try:
+        raw = preloaded_call(args, f"find {args.gkfs_mntdir}")
+    except Exception as e:
+        TRIGGER_LOGGER.error(f"Could not list {args.gkfs_mntdir}: {e}")
+        return
+    prefix = f"{args.gkfs_mntdir}/"
+    top = sorted(
+        {
+            p[len(prefix) :].split("/", 1)[0]
+            for p in raw.splitlines()
+            if p.startswith(prefix)
+        }
+    )
+    TRIGGER_LOGGER.warning(f"mount top-level entries at flush time ({len(top)}): {top}")
+
+
+def _orphaned_children(args: argparse.Namespace, item: str) -> list[str]:
+    """Paths under `item` relative to it, for a directory GekkoFS has renamed.
+
+    `rename` re-keys only the directory entry, so after AMReX moves <chk>.temp/
+    to <chk>/ a readdir of <chk> lists the children but every stat on them
+    misses -- their metadata still sits under the old name. `find` walks the
+    listing without stat'ing, so it still returns the tree; a path that another
+    path is nested inside is a directory, everything else is a file.
+    """
+    try:
+        raw = preloaded_call(args, f"find {item}")
+    except Exception as e:
+        TRIGGER_LOGGER.error(f"Could not list {item}: {e}")
+        return []
+    paths = [p for p in raw.splitlines() if p.startswith(f"{item}/")]
+    files = [p for p in paths if not any(q.startswith(f"{p}/") for q in paths)]
+    return [p[len(item) + 1 :] for p in files]
+
+
 def copy_file_and_unlink(
     args: argparse.Namespace, item: str, triggered_by: str = "ftio"
 ) -> None:
@@ -486,10 +652,48 @@ def copy_file_and_unlink(
     fallback_remove_cmd = f"find {item} -type f -exec rm -f {{}} +"
 
     TRIGGER_LOGGER.info(f"Copying {item} to {dst}")
+    n_src = _count_files(args, item)
     start = time.time()
-    preloaded_call(args, cp_cmd)
+    try:
+        preloaded_call(args, cp_cmd)
+    except Exception as e:
+        # A renamed directory keeps its children under the pre-rename name, so
+        # `cp` reads the listing and then cannot stat a single entry. The data
+        # is intact; reach it through the old prefix. Verified on gkfs: after
+        # `mv d.temp d`, `cat d/f` is ENOENT while `cat d.temp/f` still works.
+        rel = _orphaned_children(args, item)
+        if not rel:
+            raise
+        TRIGGER_LOGGER.warning(
+            f"{item} lost its children to a rename ({e}); "
+            f"copying {len(rel)} file(s) from {item}.temp"
+        )
+        src = f"{item}.temp"
+        n_src = len(rel)
+        for r in rel:
+            os.makedirs(os.path.dirname(f"{dst}/{r}"), exist_ok=True)
+        # ponytail: one shell per flush unit, so the command grows with the file
+        # count. Chunk it if a checkpoint ever gets near ARG_MAX.
+        try:
+            preloaded_call(args, "; ".join(f"cp -L {src}/{r} {dst}/{r}" for r in rel))
+        except Exception:
+            _log_mount_names_once(args)
+            raise
+        # `find` cannot reach these either -- the old directory entry is gone
+        # from the namespace even though its children still resolve by path.
+        remove_cmd = " ".join(["rm", "-f", *(f"{src}/{r}" for r in rel)])
+        fallback_remove_cmd = remove_cmd
     copy_time = time.time() - start
     TRIGGER_LOGGER.info(f"Finished copying {item} ({copy_time:.3f} s)")
+
+    # A copy that silently moves nothing looks like a very fast flush, and the
+    # unlink below would then destroy the only copy. Never unlink unverified.
+    n_dst = _count_files(args, dst)
+    if n_src < 0 or n_dst < n_src:
+        raise RuntimeError(
+            f"copy of {item} is incomplete: {n_dst} of {n_src} file(s) reached "
+            f"{dst} — source left in place"
+        )
 
     start = time.time()
     TRIGGER_LOGGER.info(f"Removing {item} from source")
@@ -549,7 +753,7 @@ def delete_items(args: argparse.Namespace, items: list[str]) -> None:
 
 
 def _list_with_retry(
-    args: argparse.Namespace, call: str, attempts: int = 10, delay: float = 3.0
+    args: argparse.Namespace, call: str, attempts: int = 20, delay: float = 5.0
 ) -> str:
     """Run a listing command, retrying while GekkoFS reports the mount busy.
 
@@ -615,7 +819,20 @@ def get_files(args: argparse.Namespace) -> list[str]:
         if args.debug:
             TRIGGER_LOGGER.error(f"Error listing files: {e}")
 
-        files = _list_with_retry(args, f"ls -R {args.gkfs_mntdir}")
+        try:
+            files = _list_with_retry(args, f"ls -R {args.gkfs_mntdir}")
+        except Exception as e2:
+            # Both listing methods exhausted their retries -- a saturated daemon,
+            # not a one-off EBUSY. Raising here used to kill move_files_os() (and
+            # with it the whole FTIO-trigger or post-app stage-out), silently
+            # losing everything still in the mount. Degrade to "nothing to move
+            # this cycle" instead: the FTIO-trigger path gets another chance on
+            # the next flush, and the post-app sweep already retried for
+            # attempts*delay seconds (100 s) before giving up here.
+            TRIGGER_LOGGER.error(
+                f"Mount listing failed after both find and ls -R retries: {e2}"
+            )
+            files = []
 
         if files:
             files = files.splitlines()

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import struct
 import subprocess
+import time
 
 import zmq
 
@@ -94,12 +95,19 @@ def predictor_with_processes_zmq(
                     socket_out.send(packet)
 
                 # get messages
-                msgs, ranks = receive_messages(socket_in, poller)
+                msgs, ranks, recv_time = receive_messages(socket_in, poller)
 
                 if not msgs:
                     CONSOLE.print("[red]No messages[/]")
                     continue
                 CONSOLE.print(f"[cyan]Got message from {ranks}:[/]")
+                # LATENCY line is greppable from job.log: batch size (ranks) vs.
+                # wall-clock FTIO spent draining that batch as a single ZMQ PULL
+                # sink -- the direct signal for whether rank density degrades
+                # FTIO's own response time, independent of prediction cost.
+                CONSOLE.print(
+                    f"[magenta]LATENCY ranks={ranks} recv_ms={recv_time * 1000:.3f}[/]"
+                )
                 status.update("")
 
                 if debounce:
@@ -157,6 +165,13 @@ def setup_socket(addr: str, port: str, socket_type=zmq.PULL, bind: bool = True):
 
         CONSOLE.print("[bold green]Corrected IP address:[/]", addr)
         if bind:
+            # The gekko clients were already launched with the *old* address, so
+            # they now push metrics into a socket nobody drains: FTIO sees a
+            # partial stream and the app can stall on the send path.
+            CONSOLE.print(
+                f"[bold red]WARNING: FTIO moved to {addr}:{port}; already-launched "
+                f"GekkoFS clients still target the previous address.[/]"
+            )
             socket.bind(f"tcp://{addr}:{port}")
         else:
             socket.connect(f"tcp://{addr}:{port}")
@@ -167,33 +182,64 @@ def setup_socket(addr: str, port: str, socket_type=zmq.PULL, bind: bool = True):
 
 
 def receive_messages(socket, poller):
-    """Polls for and receives messages from the socket, returning a list of messages and count."""
+    """Polls for and receives messages from the socket, returning a list of messages and count.
+
+    Also returns the wall-clock time actually spent receiving messages
+    (recv_time) -- FTIO is a single sink for every sender's ZMQ PUSH, so this
+    is the direct measure of whether growing rank density degrades FTIO's
+    own response time, independent of prediction/processing cost downstream.
+
+    Batching behavior is unchanged from before: each poll(1000) gives a
+    straggler rank up to 1s to arrive before the batch is considered done,
+    and the loop naturally bounds itself (it only keeps going while messages
+    keep arriving within that window). What changed is only what gets
+    measured -- recv_time now stops at the last message actually received,
+    not at the final poll(1000) that times out with nothing left to receive.
+    A prior version measured up to that trailing timeout, so every recv_time
+    was inflated by a guaranteed ~1000ms of dead time whenever nothing more
+    arrived (the common case) -- it was measuring the poll timeout, not
+    receive latency.
+    """
     msgs = []
     ranks = 0
-    # start = time.time()
+    start = time.time()
     socks = dict(poller.poll(1000))
-    # 1) just a single msg
-    # msg = socket.recv(zmq.NOBLOCK)
+    recv_time = time.time() - start
 
-    # 2) Loop and accept messages from both channels, acting accordingly
-    # if socks:
-    #     if socks.get(socket) == zmq.POLLIN:
-    #         print(f"got message ",{socket.recv(zmq.NOBLOCK)})
-    # else:
-    #     print("No message received")
-    #     continue
-
-    # 3) Loop and accept messages from both channels, acting accordingly
     while socks:
         if socks.get(socket) == zmq.POLLIN:
             msgs.append(socket.recv(zmq.NOBLOCK))
-            # CONSOLE.print(f"[cyan]Got message {ranks}:[/] {msg}")
             ranks += 1
-        # if time.time() - start > 0.5:
-        #     break
+            recv_time = time.time() - start
         socks = dict(poller.poll(1000))
 
-    return msgs, ranks
+    return msgs, ranks, recv_time
+
+
+def unbatch_messages(msgs: list[bytes]) -> list[bytes]:
+    """Auto-detect and flatten GekkoFS LIBGKFS_METRICS_AGGREGATOR batches.
+
+    A batched message (the aggregator daemon buffers what local ranks sent
+    it and forwards one combined message per window) is a single top-level
+    msgpack array of raw per-rank payloads. A direct, non-aggregated
+    message is a flat sequence of 8-9 top-level scalar/array fields
+    starting with flush_t (an int) -- see parse_gekko.assign(). Peeking at
+    just the first top-level object's type tells them apart, so this needs
+    no flag and works per-message even if a run somehow mixed both (it
+    shouldn't, but nothing here assumes it can't).
+    """
+    import msgpack
+
+    out: list[bytes] = []
+    for m in msgs:
+        unpacker = msgpack.Unpacker(raw=True)
+        unpacker.feed(m)
+        first = next(unpacker, None)
+        if isinstance(first, list):
+            out.extend(first)
+        else:
+            out.append(m)
+    return out
 
 
 #

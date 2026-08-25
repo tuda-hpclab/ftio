@@ -36,22 +36,34 @@ from ftio.api.gekkoFs.jit.logger import Logger
 console = Console()
 jit_logger = Logger(prefix="JIT").get()
 
+# How many consecutive ports check_port tries before giving up.
+PORT_SCAN_RANGE = 20
 
-def is_port_in_use(port_number: int | str) -> bool:
+
+def is_port_in_use(port_number: int | str, settings: JitSettings | None = None) -> bool:
     """
     Check if a given port is in use.
 
     Args:
         port_number (int | str): The port number to check.
+        settings (JitSettings | None): When given and running on a cluster, the
+            check runs on the FTIO node instead of locally.
 
     Returns:
         bool: True if the port is in use, False otherwise.
     """
     out = False
+    call = f"netstat -tlpn | grep ':{port_number} '"
+    # FTIO binds on settings.ftio_node, so a local netstat inspects the wrong
+    # machine and always reports the port free.
+    if settings is not None and settings.cluster:
+        call = generate_cluster_command(
+            settings, call, 1, 1, node_list=settings.ftio_node
+        )
     try:
         # Run the netstat command and search for the port number
         netstat_output = subprocess.check_output(
-            f"netstat -tlpn | grep ':{port_number} '",
+            call,
             shell=True,
             stderr=subprocess.STDOUT,
         ).decode("utf-8")
@@ -71,45 +83,35 @@ def is_port_in_use(port_number: int | str) -> bool:
 
 def check_port(settings: JitSettings) -> None:
     """
-    Check if a port is available and terminate any existing process using it.
+    Move settings.port_ftio to a free port on the FTIO node.
+
+    Must run before the application command is built: the app is handed
+    LIBGKFS_METRICS_IP_PORT, and if FTIO ends up somewhere else the gekko clients
+    push metrics into a socket nobody drains. Picking the port here instead of
+    letting `setup_socket` retry keeps both ends on the same address.
 
     Args:
         settings (JitSettings): The JIT settings object.
     """
-    if is_port_in_use(settings.port_ftio):
-        jit_print(
-            f"[bold red]Error: Port {settings.port_ftio} is already in use on {settings.address_ftio}. Terminating existing process...[/]"
-        )
-
-        # Identify the process ID using the settings.port_ftio
-        try:
-            process_output = (
-                subprocess.check_output(
-                    f"netstat -nlp | grep :{settings.port_ftio} ", shell=True
+    start = int(settings.port_ftio)
+    for port in range(start, start + PORT_SCAN_RANGE):
+        if not is_port_in_use(port, settings):
+            if port != start:
+                jit_print(
+                    f"[bold yellow]Port {start} is taken on {settings.ftio_node};"
+                    f" using {port} instead.[/]"
                 )
-                .decode()
-                .strip()
+            settings.port_ftio = str(port)
+            jit_print(
+                f"[bold  green]Using port {settings.port_ftio} on {settings.address_ftio}.[/]"
             )
-            process_id = process_output.split()[6].split("/")[0]
+            return
 
-            if process_id:
-                jit_print(f"[bold  yellow]Terminating process with PID: {process_id}[/]")
-                os.kill(int(process_id), 9)
-                jit_print(
-                    f"[bold  green]Using port {settings.port_ftio} on {settings.address_ftio}.[/]"
-                )
-            else:
-                jit_print(
-                    f"[bold red] Failed to identify process ID for PORT {settings.port_ftio}.[/]"
-                )
-                exit(1)
-        except subprocess.CalledProcessError as e:
-            jit_print(f"[bold red] Failed to retrieve process information: {e}[/]")
-            exit(1)
-    else:
-        jit_print(
-            f"[bold  green]Using port {settings.port_ftio} on {settings.address_ftio}.[/]"
-        )
+    jit_print(
+        f"[bold red]No free port in {start}-{start + PORT_SCAN_RANGE - 1} on "
+        f"{settings.ftio_node}.[/]"
+    )
+    exit(1)
 
 
 def parse_options(settings: JitSettings, args: list[str]) -> None:
@@ -217,7 +219,7 @@ def parse_options(settings: JitSettings, args: list[str]) -> None:
         "-e",
         "--exclude",
         type=str,
-        help="Exclude specific tools: ftio, daemon, proxy, gkfs (daemon + proxy), cargo, or all.",
+        help="Exclude specific tools: ftio, daemon, proxy, gkfs (daemon + proxy), cargo, stage_in, or all.",
     )
     parser.add_argument(
         "-x",
@@ -395,6 +397,9 @@ def parse_options(settings: JitSettings, args: list[str]) -> None:
                 elif exclude == "proxy":
                     settings.exclude_proxy = True
                     console.print("[yellow]- proxy[/]")
+            elif exclude == "stage_in":
+                settings.exclude_stage_in = True
+                console.print("[yellow]- stage_in[/]")
             elif exclude == "all":
                 settings.exclude_all = True
                 console.print("[yellow]- all[/]")

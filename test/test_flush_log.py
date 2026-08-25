@@ -119,7 +119,8 @@ def test_copy_file_and_unlink_writes_log(tmp_path):
     src.write_text("hello")
 
     with patch("ftio.api.gekkoFs.posix_control.preloaded_call") as mock_call:
-        mock_call.return_value = ""
+        # Same count either side of the copy, so the copy verifies as complete.
+        mock_call.side_effect = lambda a, c: "1" if c.endswith("| wc -c") else ""
         copy_file_and_unlink(args, str(src), triggered_by="ftio")
 
     with open(args.flush_log) as f:
@@ -135,7 +136,8 @@ def test_copy_file_and_unlink_post_app_label(tmp_path):
     src.write_text("hello")
 
     with patch("ftio.api.gekkoFs.posix_control.preloaded_call") as mock_call:
-        mock_call.return_value = ""
+        # Same count either side of the copy, so the copy verifies as complete.
+        mock_call.side_effect = lambda a, c: "1" if c.endswith("| wc -c") else ""
         copy_file_and_unlink(args, str(src), triggered_by="post_app")
 
     with open(args.flush_log) as f:
