@@ -1,7 +1,11 @@
 """
-AutomatonLibrary: directory-based store for compiled reference automata.
+AutomatonLibrary: directory-based store for AutomatonProfile files.
 
-Files are stored as:  <library_dir>/<app_name>/ranks_<rank_key>.json
+Files are stored as:  <library_dir>/<app_name>/ranks_<rank_key>.json — each file
+is one AutomatonProfile's to_dict(). This module owns no statistics: load()/save()
+dispatch to AutomatonProfile.merge() for the actual pooling; what it adds is
+directory layout, JSON I/O, and listing many profiles (available_apps(),
+available_rank_keys()) that a single profile has no way to do for itself.
 
 The rank_key encodes the application's rank configuration:
   - Fixed ranks: "128"
@@ -18,15 +22,15 @@ import glob
 import json
 import os
 
-from ftio.modeling.reference_automaton import NodeBehavior, ReferenceAutomaton
+from ftio.modeling.automaton_profile import AutomatonProfile, NodeBehavior
 
 
 class AutomatonLibrary:
     """
-    Directory-based library of compiled reference automata, one file per
+    Directory-based collection of AutomatonProfile files, one per
     (app_name, rank_key) pair.
 
-    On the first run for an app+config, the automaton is saved as-is (std = 0).
+    On the first run for an app+config, the profile is saved as-is (std = 0).
     On each subsequent run with matching topology, distributions are updated
     using pooled statistics so timing estimates improve over time.
     """
@@ -74,7 +78,7 @@ class AutomatonLibrary:
     # Load
     # ------------------------------------------------------------------
 
-    def load(self, app_name: str, rank_key: str) -> ReferenceAutomaton | None:
+    def load(self, app_name: str, rank_key: str) -> AutomatonProfile | None:
         """Load reference for app + rank_key.
 
         Falls back to the nearest available rank configuration (by initial
@@ -109,7 +113,7 @@ class AutomatonLibrary:
             )
         return ref
 
-    def _load_file(self, path: str) -> ReferenceAutomaton | None:
+    def _load_file(self, path: str) -> AutomatonProfile | None:
         try:
             with open(path) as fh:
                 data = json.load(fh)
@@ -124,19 +128,19 @@ class AutomatonLibrary:
         # The compact format stores "period_mean" at the state level.
         first_state = (data.get("states") or [{}])[0]
         if "period_mean" in first_state:
-            return ReferenceAutomaton.from_dict(data)
+            return AutomatonProfile.from_dict(data)
 
         # Raw PhaseAutomaton export — derive app_name and rank_key from the path
         parts = path.replace("\\", "/").split("/")
         app_name = parts[-2] if len(parts) >= 2 else "unknown"
         rank_key = parts[-1][len("ranks_") : -len(".json")]
-        return ReferenceAutomaton.from_automaton_dict(data, app_name, rank_key)
+        return AutomatonProfile.from_automaton_dict(data, app_name, rank_key)
 
     # ------------------------------------------------------------------
     # Save
     # ------------------------------------------------------------------
 
-    def _write(self, app_name: str, rank_key: str, ref: ReferenceAutomaton) -> None:
+    def _write(self, app_name: str, rank_key: str, ref: AutomatonProfile) -> None:
         app_dir = self._app_dir(app_name)
         os.makedirs(app_dir, exist_ok=True)
         path = self._path(app_name, rank_key)
@@ -150,11 +154,11 @@ class AutomatonLibrary:
         matches (same number of states), the new run is merged into the
         existing distributions.  Otherwise the new run's own path is saved
         under a timestamped name to avoid accidental data loss -- but
-        ReferenceAutomaton.merge still pools any configuration the two paths
+        AutomatonProfile.merge still pools any configuration the two paths
         have in common into the existing reference's node table, so that
         knowledge is written back too instead of being discarded.
         """
-        new_ref = ReferenceAutomaton.from_automaton_dict(
+        new_ref = AutomatonProfile.from_automaton_dict(
             automaton.to_dict(), app_name, rank_key
         )
 
@@ -195,12 +199,12 @@ class AutomatonLibrary:
         No profiling run is required. A real save() that touches a matching
         configuration *within k-sigma of the guess* pools into this and the
         seed is diluted away. A guess far off is NOT silently corrected --
-        see ReferenceAutomaton.from_node_seed for why.
+        see AutomatonProfile.from_node_seed for why.
 
         Does nothing if a reference already exists for the derived rank_key,
         so a seed never clobbers real profiling data.
         """
-        ref = ReferenceAutomaton.from_node_seed(app_name, node_estimates)
+        ref = AutomatonProfile.from_node_seed(app_name, node_estimates)
         if self.load(app_name, ref.rank_key) is not None:
             print(
                 f"[AutomatonLibrary] Seed skipped — {app_name}/ranks_{ref.rank_key} "
@@ -231,12 +235,12 @@ class AutomatonLibrary:
         saved rank_key file for the app -- so a configuration seen via one
         malleability path (or a hand-authored seed) benefits a run that
         reaches it by a different path. Folding uses the same overlap +
-        k-sigma rule as within a single reference (ReferenceAutomaton._fold_behavior),
+        k-sigma rule as within a single reference (AutomatonProfile._fold_behavior),
         so distinct behaviors from different paths stay distinct rather than
         being blended into one average.
 
         at_time / at_cycle: either, both, or neither may be given -- see
-        ReferenceAutomaton.get_rank_behavior() for exact matching semantics.
+        AutomatonProfile.get_rank_behavior() for exact matching semantics.
         """
         nodes: dict[int, list[NodeBehavior]] = {}
         for key in self.available_rank_keys(app_name):
@@ -244,9 +248,9 @@ class AutomatonLibrary:
             if ref is None:
                 continue
             for behavior in ref.get_rank_behavior(ranks):
-                ReferenceAutomaton._fold_behavior(nodes, ranks, behavior)
+                AutomatonProfile._fold_behavior(nodes, ranks, behavior)
 
-        merged_ref = ReferenceAutomaton(
+        merged_ref = AutomatonProfile(
             app_name=app_name,
             rank_key=str(ranks),
             n_states=0,

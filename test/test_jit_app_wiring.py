@@ -33,7 +33,7 @@ MNT = "/mnt/gkfs"
 
 # The patterns jitsettings assigns per app, and a path each one must select.
 APP_PATTERNS = {
-    "lammps": (r".*/ckpt\.restart\.\d+$", f"{MNT}/ckpt.restart.80"),
+    "lammps": (r".*/ckpt\.restart\.\d+(\.(\d+|base))?$", f"{MNT}/ckpt.restart.80"),
     "castro": (r".*/sedov_3d_sph_chk\d+(?=/)", f"{MNT}/sedov_3d_sph_chk00010/Header"),
     "warpx": (r".*/chk\d+(?=/)", f"{MNT}/chk000010/WarpXHeader"),
     "qmcpack": (r".*/glass_heg\.s\d+\.config\.h5$", f"{MNT}/glass_heg.s000.config.h5"),
@@ -54,6 +54,21 @@ def test_wrf_regex_matches_restarts_not_history_or_logs():
     assert wrf.match(f"{MNT}/wrfrst_d01_0001-01-01_02:00:00")
     for never in ("wrfout_d01_0001-01-01_00:00:00", "rsl.error.0000", "namelist.input"):
         assert not wrf.match(f"{MNT}/{never}"), f"{never} must never be staged out"
+
+
+def test_lammps_regex_matches_both_writer_counts():
+    # in.ckpt's -v mp knob switches between single-writer restarts
+    # (ckpt.restart.<step>) and multi-file "%" ones (ckpt.restart.<step>.<idx>
+    # plus a .base metadata file). Flipping it once without updating this regex
+    # meant nothing matched and every FTIO trigger staged 0 items for a whole
+    # run (BSC 43752428). One pattern covers both so that cannot recur.
+    lammps = re.compile(APP_PATTERNS["lammps"][0])
+    assert lammps.match(f"{MNT}/ckpt.restart.80")
+    assert lammps.match(f"{MNT}/ckpt.restart.80.base")
+    assert lammps.match(f"{MNT}/ckpt.restart.80.5")
+    # but it must still not sweep up unrelated files next to the mount
+    assert not lammps.match(f"{MNT}/ckpt.restart.80.tmp")
+    assert not lammps.match(f"{MNT}/log.lammps")
 
 
 def test_amrex_regexes_exclude_the_temp_rename_artifacts():

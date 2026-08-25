@@ -16,6 +16,7 @@ https://github.com/tuda-parallel/FTIO/blob/main/LICENSE
 import math
 import os
 import re
+import signal
 
 # import multiprocessing
 import subprocess
@@ -39,7 +40,6 @@ from ftio.api.gekkoFs.jit.setup_check import check_setup
 from ftio.api.gekkoFs.jit.setup_helper import (
     adjust_regex,
     check,
-    check_port,
     elapsed_time,
     exit_routine,
     extract_accurate_time,
@@ -48,6 +48,7 @@ from ftio.api.gekkoFs.jit.setup_helper import (
     get_executable_realpath,
     handle_sigint,
     jit_print,
+    kill_process_tree,
     mpiexec_call,
     relevant_files,
     remove_hostfile,
@@ -81,6 +82,8 @@ _GEKKO_CONN_PATTERNS = (
     "transport endpoint is not connected",
     "stale file handle",
     "device or resource busy",  # EBUSY (errno 16) — GekkoFS mount unresponsive
+    "failed to load hosts addresses",  # hostfile written on one node, not yet
+    "failed to open hosts file",  # visible from another — GPFS metadata lag
 )
 
 
@@ -137,14 +140,31 @@ def start_gekko_daemon(settings: JitSettings) -> None:
         f"[bold green]############## Starting Gkfs Demon [/][black][{get_time()}][/]"
     )
 
+    # Every daemon crash so far left a 0-byte internal log (castro 44344007),
+    # because "err" only catches what the daemon manages to report before it
+    # aborts on an uncaught exception. debug_lvl > 1 jumps straight to "trace",
+    # which is unusable across 64 daemons. JIT_DAEMON_LOG_LEVEL picks the level
+    # directly. Use "debug", not "info": the write handler logs total_chunk_size
+    # and bulk_size at debug, and that is what the abort needs.
+    level = os.getenv("JIT_DAEMON_LOG_LEVEL", "")
     if settings.use_mpirun:
-        debug_flag = f"-x GKFS_DAEMON_LOG_LEVEL=off -x GKFS_DAEMON_LOG_PATH={settings.gkfs_daemon_log}_intern"
-        if settings.debug_lvl > 1:
-            debug_flag = debug_flag.replace("=none", "=err")
+        level = level or ("err" if settings.debug_lvl > 1 else "off")
+        debug_flag = f"-x GKFS_DAEMON_LOG_LEVEL={level} -x GKFS_DAEMON_LOG_PATH={settings.gkfs_daemon_log}_intern"
     else:
-        debug_flag = f"--export=ALL,GKFS_DAEMON_LOG_LEVEL=err,GKFS_DAEMON_LOG_PATH={settings.gkfs_daemon_log}_intern"
-        if settings.debug_lvl > 1:
-            debug_flag = debug_flag.replace("=err", "=trace")
+        level = level or ("trace" if settings.debug_lvl > 1 else "err")
+        debug_flag = f"--export=ALL,GKFS_DAEMON_LOG_LEVEL={level},GKFS_DAEMON_LOG_PATH={settings.gkfs_daemon_log}_intern"
+        # LIBGKFS_METRICS_IP_PORT is only ever interpolated into the client's
+        # own bash -c string (see get_env/client call below), never a real
+        # exported env var -- so --export=ALL here never carries it to the
+        # daemon process no matter what. The opt-in LIBGKFS_METRICS_AGGREGATOR
+        # test feature (GekkoFS daemon.cpp: start_metrics_relay()) needs the
+        # daemon to actually know FTIO's address, so pass both through
+        # explicitly when relay mode is requested.
+        if not settings.exclude_ftio and os.environ.get("LIBGKFS_METRICS_AGGREGATOR"):
+            debug_flag += (
+                f",LIBGKFS_METRICS_IP_PORT={settings.address_ftio}:{settings.port_ftio}"
+                f",LIBGKFS_METRICS_AGGREGATOR=on"
+            )
 
     if settings.cluster:
         if settings.use_mpirun:
@@ -585,7 +605,6 @@ def start_ftio(settings: JitSettings) -> None:
                 f"{settings.ftio_bin_location}/predictor_jit {ftio_data_staget_args} --  --zmq_address {settings.address_ftio} --zmq_port {settings.port_ftio} {settings.ftio_args} "
             )
         else:
-            check_port(settings)
             call = f"cd {settings.log_dir} && {settings.ftio_bin_location}/predictor_jit {ftio_data_staget_args} --  --zmq_address {settings.address_ftio} --zmq_port {settings.port_ftio} {settings.ftio_args} "
 
         jit_print("[cyan]Starting FTIO[/]")
@@ -624,7 +643,7 @@ def stage_in(settings: JitSettings, runtime: JitTime) -> None:
         settings (JitSettings): jit settings
         runtime (JitTime): runtime object to track elapsed time
     """
-    if settings.exclude_all:
+    if settings.exclude_all or settings.exclude_stage_in:
         jit_print(
             f"[bold yellow]############## Skipping Stage in [/][black][{get_time()}][/]"
         )
@@ -688,7 +707,29 @@ def stage_in(settings: JitSettings, runtime: JitTime) -> None:
 
             start = time.time()
             if call:
-                _ = execute_block(call, dry_run=settings.dry_run)
+                # The hosts file the daemon just wrote can lag behind on GPFS's
+                # per-node metadata cache: stage_in's srun step reads it from an
+                # app node moments later and sees "no such file" even though
+                # wait_for_file() already confirmed it exists (from the node
+                # running jit itself). Retry through that window instead of
+                # aborting the whole run (43646952, LAMMPS/GLASS, 2026-07-22).
+                for attempt in range(_MAX_RETRIES):
+                    try:
+                        _ = execute_block(call, dry_run=settings.dry_run)
+                        break
+                    except subprocess.CalledProcessError as e:
+                        text = f"{e.stdout or ''}\n{e.stderr or ''}"
+                        if (
+                            attempt == _MAX_RETRIES - 1
+                            or not _has_gekko_connection_error(text)
+                        ):
+                            raise
+                        jit_print(
+                            f"[bold yellow]Stage-in hit a transient GekkoFS/GPFS "
+                            f"error (attempt {attempt + 1}/{_MAX_RETRIES}), "
+                            f"retrying...[/]"
+                        )
+                        time.sleep(5)
         # TODO: fix cpp cargo
         else:
             if settings.cluster:
@@ -1061,7 +1102,23 @@ def start_application(settings: JitSettings, runtime: JitTime):
                     )
                     if settings.gkfs_intercept:
                         gkfs_env = f"LD_PRELOAD={settings.gkfs_intercept} " + gkfs_env
-                app_invocation = f'bash -c "{gkfs_env}{app_call} {settings.app_flags}"'
+                # ponytail: JIT_STRACE=1 is a one-off diagnostic knob (WarpX
+                # zero-flush investigation) wrapping every rank in strace to
+                # see whether checkpoint writes ever hit write()/pwrite64()
+                # vs. going through mmap()/msync(). No effect unless set.
+                # Output goes to log_dir (persistent, $HOME/jit/<jobid>/...),
+                # not run_dir (scratch) -- the scratch tree gets rm -rf'd by
+                # sbatch_apps.sh's teardown before results can be pulled off,
+                # which silently lost the first run of this diagnostic.
+                strace_prefix = (
+                    f"strace -f -tt -e trace=write,pwrite64,mmap,msync,munmap "
+                    f"-o {settings.log_dir}/strace_r%p.log "
+                    if os.environ.get("JIT_STRACE") == "1"
+                    else ""
+                )
+                app_invocation = (
+                    f'bash -c "{gkfs_env}{strace_prefix}{app_call} {settings.app_flags}"'
+                )
             else:
                 # Legacy / FUSE mode: pass GekkoFS vars via srun --export
                 if not settings.exclude_ftio:
@@ -1150,7 +1207,7 @@ def start_application(settings: JitSettings, runtime: JitTime):
         try:
             _, stderr = process.communicate(timeout=app_timeout)
         except subprocess.TimeoutExpired:
-            process.kill()
+            kill_process_tree(process.pid, signal.SIGTERM)
             process.communicate()
             timed_out = True
             jit_print(

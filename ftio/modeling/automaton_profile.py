@@ -1,10 +1,11 @@
 """
-ReferenceAutomaton: compiled reference built from one or more profiling runs.
+AutomatonProfile: aggregated statistics pooled from one or more profiling runs.
 
-Unlike PhaseAutomaton (which records a single live run), ReferenceAutomaton
-stores per-state distribution statistics and merges new runs using pooled
-variance — the topology (number of states, rank sequence) is the stable part;
-timing distributions improve with each additional run.
+Unlike PhaseAutomaton (which records a single live run's actual trajectory),
+AutomatonProfile stores per-state distribution statistics (mean +/- std) and
+merges new runs in using pooled variance — the topology (number of states,
+rank sequence) is the stable part; timing distributions improve with each
+additional run pooled in.
 
 Author: Ahmad Tarraf
 Copyright (c) 2024-2026 TU Darmstadt, Germany
@@ -123,7 +124,7 @@ class NodeBehavior:
         return a_lo <= b_hi and b_lo <= a_hi
 
 
-class ReferenceAutomaton:
+class AutomatonProfile:
     """
     Compiled reference automaton built from one or more PhaseAutomaton exports.
 
@@ -203,7 +204,7 @@ class ReferenceAutomaton:
                     ranks=s.ranks,
                     n_samples=s.n_samples,
                 )
-                ReferenceAutomaton._fold_behavior(nodes, s.ranks, behavior)
+                AutomatonProfile._fold_behavior(nodes, s.ranks, behavior)
             occurrence_elapsed += dwell
             prev_ranks = s.ranks
         return nodes
@@ -291,7 +292,7 @@ class ReferenceAutomaton:
                 existing.period_std, sigma_rel_floor * existing.period_mean, 1e-9
             )
             if abs(new_behavior.period_mean - existing.period_mean) <= k * sigma_eff:
-                lst[i] = ReferenceAutomaton.pool_behavior(existing, new_behavior)
+                lst[i] = AutomatonProfile.pool_behavior(existing, new_behavior)
                 return
         lst.append(new_behavior)
 
@@ -347,7 +348,7 @@ class ReferenceAutomaton:
     @classmethod
     def from_node_seed(
         cls, app_name: str, node_estimates: dict[int, dict]
-    ) -> ReferenceAutomaton:
+    ) -> AutomatonProfile:
         """Build a reference purely from user-supplied per-configuration guesses.
 
         ``node_estimates`` maps rank count -> {"period": seconds, "dwell": seconds}.
@@ -427,7 +428,7 @@ class ReferenceAutomaton:
         data: dict,
         app_name: str,
         rank_key: str,
-    ) -> ReferenceAutomaton:
+    ) -> AutomatonProfile:
         """Build from a single PhaseAutomaton.to_dict() export (one run, std = 0).
 
         Builds ``nodes`` directly from the raw states here (rather than
@@ -538,7 +539,7 @@ class ReferenceAutomaton:
         )
 
     @classmethod
-    def from_dict(cls, data: dict) -> ReferenceAutomaton:
+    def from_dict(cls, data: dict) -> AutomatonProfile:
         """Load from a previously saved reference JSON (our own compact format)."""
         raw = data.get("states", [])
         stats = [cls._stats_from_dict(s) for s in raw]
@@ -575,7 +576,7 @@ class ReferenceAutomaton:
             for behavior in behaviors:
                 self._fold_behavior(self.nodes, ranks, behavior)
 
-    def merge(self, other: ReferenceAutomaton) -> ReferenceAutomaton:
+    def merge(self, other: AutomatonProfile) -> AutomatonProfile:
         """Merge another run into this reference using pooled statistics.
 
         The ordered path only pools when both automata have the same number
@@ -625,7 +626,7 @@ class ReferenceAutomaton:
                 )
             )
 
-        result = ReferenceAutomaton(
+        result = AutomatonProfile(
             app_name=self.app_name,
             rank_key=self.rank_key,
             n_states=self.n_states,

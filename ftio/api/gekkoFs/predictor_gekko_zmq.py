@@ -46,7 +46,11 @@ from ftio.prediction.online_analysis import (
     window_adaptation,
 )
 from ftio.prediction.probability_analysis import find_probability
-from ftio.prediction.processes_zmq import receive_messages, setup_socket
+from ftio.prediction.processes_zmq import (
+    receive_messages,
+    setup_socket,
+    unbatch_messages,
+)
 from ftio.prediction.shared_resources import SharedResources
 
 # T_S = time.time()
@@ -102,12 +106,23 @@ def main(args: list[str] = sys.argv[1:]) -> None:
                 procs = join_procs(procs, False)
 
                 # get all messages
-                msgs, ranks = receive_messages(socket, poller)
+                msgs, ranks, recv_time = receive_messages(socket, poller)
+                if msgs:
+                    msgs = unbatch_messages(msgs)
+                    ranks = len(msgs)
 
                 if not msgs:
                     # CONSOLE.print('[red]No messages[/]')
                     status.update("[cyan]Waiting for messages\n", spinner="dots")
                     continue
+
+                # LATENCY line is greppable from job.log: batch size (ranks) vs.
+                # wall-clock FTIO spent draining that batch as a single ZMQ PULL
+                # sink -- the direct signal for whether rank density degrades
+                # FTIO's own response time, independent of prediction cost.
+                CONSOLE.print(
+                    f"[magenta]LATENCY ranks={ranks} recv_ms={recv_time * 1000:.3f}[/]"
+                )
 
                 # Hold predictions until the application has started
                 if data_stager_args.app_start_file and not os.path.isfile(
@@ -142,6 +157,22 @@ def main(args: list[str] = sys.argv[1:]) -> None:
                             args=(shared_resources, ftio_args, msgs),
                         )
                     )
+
+                # INFLIGHT line: how many prediction processes are alive right
+                # after this dispatch. max_predictions=0 (the default) means no
+                # cap -- this is the number that would grow unbounded under
+                # sustained high message rate, the real risk once "never block
+                # the socket" removes all backpressure on prediction spawning.
+                CONSOLE.print(f"[magenta]INFLIGHT procs={len(procs)}[/]")
+                # NODE_LOAD: whole-node load average on FTIO's own dedicated
+                # node (captures the parent loop AND every in-flight prediction
+                # subprocess, unlike per-process CPU time) -- the direct signal
+                # for whether FTIO itself, not the app, is the thing under load.
+                load1, load5, load15 = os.getloadavg()
+                CONSOLE.print(
+                    f"[magenta]NODE_LOAD load1={load1:.2f} load5={load5:.2f} "
+                    f"load15={load15:.2f}[/]"
+                )
 
     except KeyboardInterrupt:
         trigger.join()

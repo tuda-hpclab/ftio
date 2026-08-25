@@ -1,5 +1,5 @@
 """
-ReferenceAutomaton / node-model demo — malleability across runs.
+AutomatonProfile / node-model demo — malleability across runs.
 
 Where phase_automaton_demo.py shows a single live run's state machine, this
 demo shows what gets learned ACROSS runs: the configuration table (`nodes`)
@@ -24,7 +24,7 @@ See docs/phase_automaton.md ("Configuration table (nodes)") for the full
 design writeup this demo backs.
 
 Run:
-    python examples/API/reference_automaton_demo.py
+    python examples/API/automaton_profile_demo.py
 """
 
 from pathlib import Path
@@ -33,8 +33,8 @@ import numpy as np
 
 from ftio.freq.prediction import Prediction
 from ftio.modeling.automaton_library import AutomatonLibrary
+from ftio.modeling.automaton_profile import AutomatonProfile
 from ftio.modeling.phase_automaton import PhaseAutomaton
-from ftio.modeling.reference_automaton import ReferenceAutomaton
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
@@ -92,7 +92,7 @@ def demo_malleability():
     )
     aut.print_graph()
 
-    ref = ReferenceAutomaton.from_automaton_dict(aut.to_dict(), "app_A", "8_16_32_64")
+    ref = AutomatonProfile.from_automaton_dict(aut.to_dict(), "app_A", "8_16_32_64")
     print("\n  node table (one behavior per rank count, as expected):")
     for ranks in (8, 16, 32, 64):
         b = ref.get_rank_behavior(ranks)[0]
@@ -115,10 +115,10 @@ def demo_speed_confound():
         "  switch behavior, but contention stretches every burst by 20%.\n"
     )
 
-    ref_fast = ReferenceAutomaton.from_automaton_dict(
+    ref_fast = AutomatonProfile.from_automaton_dict(
         automaton([(32, 3.0, 4), (32, 8.0, 4)]).to_dict(), "run", "32"
     )
-    ref_slow = ReferenceAutomaton.from_automaton_dict(
+    ref_slow = AutomatonProfile.from_automaton_dict(
         automaton([(32, 3.0 * 1.2, 4), (32, 8.0 * 1.2, 4)]).to_dict(), "run", "32"
     )
 

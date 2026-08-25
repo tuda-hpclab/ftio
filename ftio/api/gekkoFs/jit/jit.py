@@ -35,6 +35,7 @@ from ftio.api.gekkoFs.jit.setup_core import (
 from ftio.api.gekkoFs.jit.setup_helper import (  # set_env,
     allocate,
     cancel_jit_jobs,
+    check_port,
     clear_bandwidth,
     get_address_cargo,
     get_address_ftio,
@@ -93,6 +94,9 @@ def main() -> None:
         log_execution(settings)
 
         get_address_ftio(settings)
+        # Before any service is launched: the daemon, FUSE and the app are all
+        # handed address_ftio:port_ftio, so the port has to be settled first.
+        check_port(settings)
         get_address_cargo(settings)
         set_dir_gekko(settings)
 
