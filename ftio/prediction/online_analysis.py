@@ -238,7 +238,7 @@ def ftio_process(shared_resources: SharedResources, args: Namespace, msgs=None) 
     if getattr(parsed_args, "phase_automaton", False):
         automaton_text = _automaton_step(prediction, parsed_args, shared_resources)
 
-    # Reference library: position tracking + transition forecast
+    # Automaton profile: position tracking + transition forecast
     model_text = ""
     if getattr(parsed_args, "pa_library", None):
         model_text = _model_manager_step(prediction, parsed_args, shared_resources)
