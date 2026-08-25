@@ -22,7 +22,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from ftio.modeling.reference_automaton import ReferenceAutomaton
+from ftio.modeling.automaton_profile import AutomatonProfile
 from ftio.modeling.state_tracker import StateTracker
 
 
@@ -59,7 +59,7 @@ class TransitionPredictor:
         forecast = predictor.predict(current_freq, current_ranks)
     """
 
-    def __init__(self, reference: ReferenceAutomaton, tracker: StateTracker):
+    def __init__(self, reference: AutomatonProfile, tracker: StateTracker):
         self.reference = reference
         self.tracker = tracker
 

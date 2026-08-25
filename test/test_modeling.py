@@ -1,5 +1,5 @@
 """
-Tests for ftio.modeling: ReferenceAutomaton, AutomatonLibrary,
+Tests for ftio.modeling: AutomatonProfile, AutomatonLibrary,
 StateTracker, TransitionPredictor, ModelManager.
 
 Author: Ahmad Tarraf
@@ -17,10 +17,10 @@ import pytest
 from ftio.freq.prediction import Prediction
 from ftio.modeling import (
     AutomatonLibrary,
+    AutomatonProfile,
     MatchStrategy,
     ModelManager,
     PhaseAutomaton,
-    ReferenceAutomaton,
     StateTracker,
     TransitionForecast,
     TransitionPredictor,
@@ -54,21 +54,21 @@ def _build_automaton(freqs_and_counts: list[tuple[float, int, int]]) -> PhaseAut
     return aut
 
 
-def _simple_ref(n_states: int = 2) -> ReferenceAutomaton:
+def _simple_ref(n_states: int = 2) -> AutomatonProfile:
     """Two-state reference: 0.5 Hz → 1.5 Hz, both at ranks=128."""
     aut = _build_automaton([(0.5, 8, 128), (1.5, 8, 128)])
-    return ReferenceAutomaton.from_automaton_dict(aut.to_dict(), "app", "128")
+    return AutomatonProfile.from_automaton_dict(aut.to_dict(), "app", "128")
 
 
 # ---------------------------------------------------------------------------
-# ReferenceAutomaton
+# AutomatonProfile
 # ---------------------------------------------------------------------------
 
 
-class TestReferenceAutomaton:
+class TestAutomatonProfile:
     def test_from_automaton_dict_basic(self):
         aut = _build_automaton([(0.5, 8, 128), (1.5, 8, 128)])
-        ref = ReferenceAutomaton.from_automaton_dict(aut.to_dict(), "app", "128")
+        ref = AutomatonProfile.from_automaton_dict(aut.to_dict(), "app", "128")
         assert ref.n_states == 2
         assert ref.app_name == "app"
         assert ref.rank_key == "128"
@@ -87,16 +87,15 @@ class TestReferenceAutomaton:
         assert ref.rank_sequence == [128, 128]
 
     def test_rank_key_from_sequence_fixed(self):
-        assert ReferenceAutomaton.rank_key_from_sequence([128, 128, 128]) == "128"
+        assert AutomatonProfile.rank_key_from_sequence([128, 128, 128]) == "128"
 
     def test_rank_key_from_sequence_malleable(self):
         assert (
-            ReferenceAutomaton.rank_key_from_sequence([16, 16, 32, 32, 128])
-            == "16_32_128"
+            AutomatonProfile.rank_key_from_sequence([16, 16, 32, 32, 128]) == "16_32_128"
         )
 
     def test_rank_key_empty(self):
-        assert ReferenceAutomaton.rank_key_from_sequence([]) == "0"
+        assert AutomatonProfile.rank_key_from_sequence([]) == "0"
 
     def test_merge_updates_run_count(self):
         ref1 = _simple_ref()
@@ -118,14 +117,14 @@ class TestReferenceAutomaton:
     def test_merge_topology_mismatch_returns_self(self):
         ref1 = _simple_ref()
         aut3 = _build_automaton([(0.5, 8, 128), (1.5, 8, 128), (0.5, 8, 128)])
-        ref3 = ReferenceAutomaton.from_automaton_dict(aut3.to_dict(), "app", "128")
+        ref3 = AutomatonProfile.from_automaton_dict(aut3.to_dict(), "app", "128")
         result = ref1.merge(ref3)
         assert result is ref1  # unchanged
 
     def test_round_trip_serialization(self):
         ref = _simple_ref()
         d = ref.to_dict()
-        ref2 = ReferenceAutomaton.from_dict(d)
+        ref2 = AutomatonProfile.from_dict(d)
         assert ref2.n_states == ref.n_states
         assert ref2.run_count == ref.run_count
         assert (
@@ -133,14 +132,14 @@ class TestReferenceAutomaton:
         )
 
 
-class TestReferenceAutomatonNodes:
+class TestAutomatonProfileNodes:
     """The configuration table: node lookup, seeding, cross-path merging."""
 
     def test_single_mode_config_returns_one_behavior(self):
         """A configuration seen with only one stable period gets a
         single-element behavior list -- no special-casing needed for the
         common, unambiguous case."""
-        ref = ReferenceAutomaton.from_automaton_dict(
+        ref = AutomatonProfile.from_automaton_dict(
             _build_automaton([(0.5, 8, 128)]).to_dict(), "app", "128"
         )
         behaviors = ref.get_rank_behavior(128)
@@ -217,7 +216,7 @@ class TestReferenceAutomatonNodes:
     def test_seed_has_no_cycle_window(self):
         """A user can't guess a burst count they've never observed -- a
         seed's cycle window is unknown (NaN), not a fabricated zero."""
-        ref = ReferenceAutomaton.from_node_seed(
+        ref = AutomatonProfile.from_node_seed(
             "demo", {32: {"period": 3.0, "dwell": 20.0}}
         )
         b = ref.get_rank_behavior(32)[0]
@@ -227,7 +226,7 @@ class TestReferenceAutomatonNodes:
         """ranks=16 appears twice (shrink then regrow) with the SAME period
         both times -> folds into one behavior, not two."""
         aut = _build_automaton([(0.5, 8, 16), (1.5, 8, 128), (0.5, 8, 16)])
-        ref = ReferenceAutomaton.from_automaton_dict(aut.to_dict(), "app", "16_128_16")
+        ref = AutomatonProfile.from_automaton_dict(aut.to_dict(), "app", "16_128_16")
         behaviors = ref.get_rank_behavior(16)
         assert len(behaviors) == 1
         assert behaviors[0].n_samples == 2
@@ -242,11 +241,11 @@ class TestReferenceAutomatonNodes:
 
     def test_edges_across_rank_change(self):
         aut = _build_automaton([(0.5, 8, 16), (1.5, 8, 128)])
-        ref = ReferenceAutomaton.from_automaton_dict(aut.to_dict(), "app", "16_128")
+        ref = AutomatonProfile.from_automaton_dict(aut.to_dict(), "app", "16_128")
         assert ref.edges == {(16, 128): {"cause": "rank_change", "count": 1}}
 
     def test_from_node_seed_builds_usable_reference(self):
-        ref = ReferenceAutomaton.from_node_seed(
+        ref = AutomatonProfile.from_node_seed(
             "demo",
             {64: {"period": 20.0, "dwell": 100.0}, 8: {"period": 5.0, "dwell": 40.0}},
         )
@@ -261,10 +260,10 @@ class TestReferenceAutomatonNodes:
         """Two runs with different paths that both touch ranks=128 at the
         SAME period should share that node's stats (one pooled behavior)
         even though the paths can't merge."""
-        ref_a = ReferenceAutomaton.from_automaton_dict(
+        ref_a = AutomatonProfile.from_automaton_dict(
             _build_automaton([(0.5, 8, 128)]).to_dict(), "app", "128"
         )
-        ref_b = ReferenceAutomaton.from_automaton_dict(
+        ref_b = AutomatonProfile.from_automaton_dict(
             _build_automaton([(0.2, 8, 16), (0.5, 8, 128)]).to_dict(), "app", "16_128"
         )
         result = ref_a.merge(ref_b)
@@ -278,10 +277,10 @@ class TestReferenceAutomatonNodes:
     def test_merge_keeps_genuinely_different_behaviors_separate(self):
         """If the two paths reach ranks=128 with DIFFERENT periods, the merge
         must not average them into a meaningless midpoint."""
-        ref_a = ReferenceAutomaton.from_automaton_dict(
+        ref_a = AutomatonProfile.from_automaton_dict(
             _build_automaton([(0.5, 8, 128)]).to_dict(), "app", "128"  # period 2.0s
         )
-        ref_b = ReferenceAutomaton.from_automaton_dict(
+        ref_b = AutomatonProfile.from_automaton_dict(
             _build_automaton([(0.2, 8, 16), (0.1, 8, 128)]).to_dict(),
             "app",
             "16_128",  # period 10s
@@ -295,7 +294,7 @@ class TestReferenceAutomatonNodes:
 
     def test_nodes_survive_dict_round_trip(self):
         ref = _simple_ref()
-        ref2 = ReferenceAutomaton.from_dict(ref.to_dict())
+        ref2 = AutomatonProfile.from_dict(ref.to_dict())
         assert set(ref2.nodes) == set(ref.nodes)
         assert len(ref2.get_rank_behavior(128)) == len(ref.get_rank_behavior(128))
         p1 = sorted(b.period_mean for b in ref.get_rank_behavior(128))
@@ -531,7 +530,7 @@ class TestStateTracker:
     def test_malleable_rank_sequence(self):
         """Tracker should handle predictions with changing rank counts."""
         aut = _build_automaton([(0.5, 8, 16), (1.5, 8, 128)])
-        ref = ReferenceAutomaton.from_automaton_dict(aut.to_dict(), "app", "16_128")
+        ref = AutomatonProfile.from_automaton_dict(aut.to_dict(), "app", "16_128")
         t = StateTracker(ref, MatchStrategy.GREEDY)
         t.update(0.5, 0.0, ranks=16)
         t.update(1.5, 16.0, ranks=128)

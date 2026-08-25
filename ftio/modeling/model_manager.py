@@ -24,7 +24,7 @@ import numpy as np
 
 from ftio.freq.prediction import Prediction
 from ftio.modeling.automaton_library import AutomatonLibrary
-from ftio.modeling.reference_automaton import NodeBehavior, ReferenceAutomaton
+from ftio.modeling.automaton_profile import AutomatonProfile, NodeBehavior
 from ftio.modeling.state_tracker import MatchStrategy, StateTracker
 from ftio.modeling.transition_predictor import TransitionForecast, TransitionPredictor
 
@@ -55,7 +55,7 @@ class ModelManager:
         self._app_name = app_name
         self._strategy = MatchStrategy(strategy)
 
-        self._reference: ReferenceAutomaton | None = None
+        self._reference: AutomatonProfile | None = None
         self._tracker: StateTracker | None = None
         self._predictor: TransitionPredictor | None = None
         self._cold_start = True
@@ -100,7 +100,7 @@ class ModelManager:
         if not self._observed_ranks or self._observed_ranks[-1] != ranks:
             self._observed_ranks.append(ranks)
 
-        rank_key = ReferenceAutomaton.rank_key_from_sequence(self._observed_ranks)
+        rank_key = AutomatonProfile.rank_key_from_sequence(self._observed_ranks)
 
         # Load (or reload) the reference when the rank configuration changes.
         # This handles both the first call and mid-run rank changes (malleability).
@@ -155,7 +155,7 @@ class ModelManager:
         behind it yet -- check ``n_samples`` if that distinction matters.
 
         at_time / at_cycle: either, both, or neither may be given -- see
-        ReferenceAutomaton.get_rank_behavior() for exact matching semantics.
+        AutomatonProfile.get_rank_behavior() for exact matching semantics.
         at_cycle (bursts since entering this configuration) is the axis that
         stays valid across runs of different speed; at_time (wall-clock
         seconds) can drift for reasons unrelated to which behavior is active.
@@ -175,5 +175,5 @@ class ModelManager:
         if automaton is None or not automaton.states:
             return
         rank_seq = [s.ranks for s in automaton.states]
-        rank_key = ReferenceAutomaton.rank_key_from_sequence(rank_seq)
+        rank_key = AutomatonProfile.rank_key_from_sequence(rank_seq)
         self._library.save(automaton, self._app_name, rank_key)
