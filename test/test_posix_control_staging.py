@@ -13,8 +13,10 @@ For more information, see the LICENSE file in the project root:
 https://github.com/tuda-parallel/FTIO/blob/main/LICENSE
 """
 
+import os
 import time
 from argparse import Namespace
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -291,13 +293,19 @@ def test_move_item_does_not_recopy_an_already_staged_checkpoint(tmp_path, monkey
 # ── copy/delete commands work for both files and AMReX directories ───────────
 
 
+def _is_count(call: str) -> bool:
+    """The pre/post-copy file count copy_file_and_unlink uses to verify the copy."""
+    return call.endswith("| wc -c")
+
+
 def _capture_calls(monkeypatch) -> list[str]:
     """Record the shell commands copy_file_and_unlink issues."""
     calls: list[str] = []
 
     def fake_call(args, call):
         calls.append(call)
-        return ""
+        # Same count either side of the copy, so the copy verifies as complete.
+        return "2" if _is_count(call) else ""
 
     monkeypatch.setattr(posix_control, "preloaded_call", fake_call)
     return calls
@@ -361,7 +369,11 @@ def test_delete_never_forks_per_file(tmp_path, monkeypatch):
     # itself, so it must not degrade into a per-file `-exec`.
     calls = _capture_calls(monkeypatch)
     posix_control.copy_file_and_unlink(_copy_args(tmp_path), CASTRO_CHK)
-    removes = [c for c in calls if c.startswith("find") and c != f"find {CASTRO_CHK}"]
+    removes = [
+        c
+        for c in calls
+        if c.startswith("find") and not _is_count(c) and c != f"find {CASTRO_CHK}"
+    ]
     assert removes, "no delete command issued"
     assert removes[0] == f"find {CASTRO_CHK} -type f -delete"
     assert r"\;" not in removes[0], "must never fork once per file"
@@ -375,7 +387,7 @@ def test_delete_falls_back_to_a_batched_rm(tmp_path, monkeypatch):
         calls.append(call)
         if call.endswith("-delete"):
             raise RuntimeError("find: unknown predicate `-delete'")
-        return ""
+        return "2" if _is_count(call) else ""
 
     monkeypatch.setattr(posix_control, "preloaded_call", fake_call)
     monkeypatch.setattr(
@@ -411,12 +423,16 @@ def test_listing_gives_up_after_the_retries_are_exhausted(monkeypatch):
         raise RuntimeError("Device or resource busy")
 
     monkeypatch.setattr(posix_control, "preloaded_call", always_busy)
-    with pytest.raises(RuntimeError, match="busy"):
-        get_files(_files_args())
+    # Both find and the ls -R fallback exhausting their retries used to raise
+    # and kill the whole flush (losing everything still in the mount); it now
+    # degrades to "nothing to move this cycle" instead.
+    assert get_files(_files_args()) == []
 
 
 def test_item_is_ignore_queued_only_when_both_deletes_fail(tmp_path, monkeypatch):
     def fake_call(args, call):
+        if _is_count(call):
+            return "2"
         if call.startswith("find"):
             raise RuntimeError("gekko is wedged")
         return ""
@@ -430,3 +446,98 @@ def test_item_is_ignore_queued_only_when_both_deletes_fail(tmp_path, monkeypatch
     )
     posix_control.copy_file_and_unlink(_copy_args(tmp_path), CASTRO_CHK)
     assert ignored == [CASTRO_CHK]
+
+
+def test_renamed_dir_is_copied_from_the_pre_rename_prefix(tmp_path, monkeypatch):
+    # GekkoFS renames only the directory entry: after AMReX moves <chk>.temp/ to
+    # <chk>/, `cp -rL <chk>` cannot stat a single child, but `find <chk>` still
+    # walks the tree and the data reads back under <chk>.temp/.
+    calls: list[str] = []
+
+    def fake_call(args, call):
+        calls.append(call)
+        if _is_count(call):
+            # The orphaned source counts 0 through `find -type f`; the fix must
+            # take n_src from the recovered listing, not from this.
+            return "0" if MNT in call else "3"
+        if call.startswith(f"cp -rL {CASTRO_CHK} "):
+            raise RuntimeError("cp: cannot stat 'Level_0': No such file or directory")
+        if call == f"find {CASTRO_CHK}":
+            return "\n".join([CASTRO_CHK, f"{CASTRO_CHK}/Level_0", *CASTRO_FILES])
+        return ""
+
+    monkeypatch.setattr(posix_control, "preloaded_call", fake_call)
+    posix_control.copy_file_and_unlink(_copy_args(tmp_path), CASTRO_CHK)
+
+    dst = f"{tmp_path}/sedov_3d_sph_chk00010"
+    copies = [c for c in calls if c.startswith("cp -L ")]
+    assert len(copies) == 1
+    for rel in ("Header", "Level_0/Cell_D_00000", "Level_0/Cell_H"):
+        assert f"cp -L {CASTRO_CHK}.temp/{rel} {dst}/{rel}" in copies[0]
+        assert os.path.isdir(os.path.dirname(f"{dst}/{rel}"))
+    # Level_0 is a directory in the listing and must not be copied as a file.
+    assert f"{CASTRO_CHK}.temp/Level_0 " not in copies[0]
+    # `find -delete` cannot reach the orphans; they go by explicit path.
+    removes = [c for c in calls if c.startswith("rm -f ")]
+    assert removes and f"{CASTRO_CHK}.temp/Header" in removes[0]
+
+
+def test_a_copy_failure_that_is_not_a_rename_still_raises(tmp_path, monkeypatch):
+    def fake_call(args, call):
+        if _is_count(call):
+            return "2"
+        if call.startswith("cp -rL "):
+            raise RuntimeError("gekko is wedged")
+        if call.startswith("find "):
+            return CASTRO_CHK  # listing has no children to recover
+        return ""
+
+    monkeypatch.setattr(posix_control, "preloaded_call", fake_call)
+    with pytest.raises(RuntimeError, match="wedged"):
+        posix_control.copy_file_and_unlink(_copy_args(tmp_path), CASTRO_CHK)
+
+
+def _flush_args() -> Namespace:
+    return Namespace(parallel_move_threads=2, debug=False)
+
+
+def test_post_app_flush_waits_out_a_slow_item_instead_of_timing_out(monkeypatch):
+    # STAGE_OUT_FLUSH_TIMEOUT exists to stop a *live* trigger from hanging against
+    # a wedged daemon. Applying it to post_app too made the final, must-complete
+    # stage-out give up early and silently report a fast time with checkpoints
+    # still missing (caught on WRF 9N: 209/512 files "STAGE-OUT INCOMPLETE").
+    monkeypatch.setattr(posix_control, "ProcessPoolExecutor", ThreadPoolExecutor)
+    monkeypatch.setattr(posix_control, "STAGE_OUT_FLUSH_TIMEOUT", 0.05)
+    monkeypatch.setattr(posix_control, "_daemon_degraded", False)
+    monkeypatch.setattr(posix_control, "_consecutive_full_failures", 0)
+
+    done: list[str] = []
+    monkeypatch.setattr(
+        posix_control, "move_item", lambda a, i, p, t: (time.sleep(0.2), done.append(i))
+    )
+    critical: list[str] = []
+    monkeypatch.setattr(posix_control.TRIGGER_LOGGER, "critical", critical.append)
+
+    posix_control.flush_using_cp(
+        _flush_args(), ["/mnt/gkfs/final_ckpt"], 1.0, triggered_by="post_app"
+    )
+
+    assert not any("STAGE-OUT TIMEOUT" in m for m in critical)
+    assert done == ["/mnt/gkfs/final_ckpt"], "post_app must wait for the slow copy"
+
+
+def test_live_flush_gives_up_on_a_slow_item_instead_of_hanging(monkeypatch):
+    monkeypatch.setattr(posix_control, "ProcessPoolExecutor", ThreadPoolExecutor)
+    monkeypatch.setattr(posix_control, "STAGE_OUT_FLUSH_TIMEOUT", 0.05)
+    monkeypatch.setattr(posix_control, "_daemon_degraded", False)
+    monkeypatch.setattr(posix_control, "_consecutive_full_failures", 0)
+
+    monkeypatch.setattr(posix_control, "move_item", lambda a, i, p, t: time.sleep(0.5))
+    critical: list[str] = []
+    monkeypatch.setattr(posix_control.TRIGGER_LOGGER, "critical", critical.append)
+
+    posix_control.flush_using_cp(
+        _flush_args(), ["/mnt/gkfs/live_ckpt"], 1.0, triggered_by="ftio"
+    )
+
+    assert any("STAGE-OUT TIMEOUT" in m for m in critical)

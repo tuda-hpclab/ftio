@@ -199,8 +199,16 @@ def ftio_process(shared_resources: SharedResources, args: Namespace, msgs=None) 
     # Modify the arguments
     args.extend(["-e", "no"])
     args.extend(["-ts", f"{shared_resources.start_time.value:.2f}"])
-    # perform prediction
+    # perform prediction -- this is FTIO's own compute cost (DFT/wavelet +
+    # outlier detection), independent of app runtime or message-queue delay.
+    n_msgs = len(msgs) if msgs else 0
+    predict_start = time.time()
     prediction_list, parsed_args = ftio_core.main(args, msgs, shared_resources)
+    predict_time = time.time() - predict_start
+    console.print(
+        f"[magenta]PREDICT_TIME id={pred_id} msgs={n_msgs} "
+        f"compute_ms={predict_time * 1000:.3f}[/]"
+    )
     if not prediction_list:
         log_to_gui_and_console(
             gui_enabled,
