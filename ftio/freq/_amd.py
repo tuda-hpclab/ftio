@@ -131,13 +131,13 @@ def efd(signal, t, fs, args, b_orig=None, t_orig=None):
         signal_hat = signal
         for _ in range(0, args.tfpf):
             signal_hat = tfpf_wvd(signal_hat, fs, t)
-        imfs, cerf = efd_model.fit_transform(signal_hat, return_all=True)
+        imfs, cerf, _bounds = efd_model.fit_transform(signal_hat, return_all=True)
         if any(x in args.engine for x in ["mat", "plot"]):
             fig = plot_imfs(args, signal, t, imfs, title="EFD modes")
             if fig:
                 figs.append(fig)
     else:
-        imfs, cerf = efd_model.fit_transform(signal, return_all=True)
+        imfs, cerf, _bounds = efd_model.fit_transform(signal, return_all=True)
         if any(x in args.engine for x in ["mat", "plot"]):
             fig = plot_imfs(args, signal, t, imfs, title="EFD modes")
             if fig:
