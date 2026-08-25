@@ -15,7 +15,7 @@ exit) around that critical section.
 Key layout (all under one `redis_prefix`, default "ftio:models"):
     <prefix>:apps                    Set of app names.
     <prefix>:<app_name>:keys         Set of rank_keys for that app.
-    <prefix>:<app_name>:<rank_key>   JSON blob (ReferenceAutomaton.to_dict()).
+    <prefix>:<app_name>:<rank_key>   JSON blob (AutomatonProfile.to_dict()).
     <prefix>:<app_name>:<rank_key>:lock   Distributed lock for save()/seed().
 
 Requires the optional `redis` package (`pip install redis`, or
@@ -34,12 +34,12 @@ import importlib.util
 import json
 import time
 
-from ftio.modeling.reference_automaton import NodeBehavior, ReferenceAutomaton
+from ftio.modeling.automaton_profile import AutomatonProfile, NodeBehavior
 
 
 class RedisAutomatonLibrary:
     """
-    Redis-backed library of compiled reference automata.
+    Redis-backed collection of AutomatonProfile records.
 
     Parameters
     ----------
@@ -108,7 +108,7 @@ class RedisAutomatonLibrary:
     # Load
     # ------------------------------------------------------------------
 
-    def load(self, app_name: str, rank_key: str) -> ReferenceAutomaton | None:
+    def load(self, app_name: str, rank_key: str) -> AutomatonProfile | None:
         """Load reference for app + rank_key.
 
         Falls back to the nearest available rank configuration (by initial
@@ -143,7 +143,7 @@ class RedisAutomatonLibrary:
             )
         return ref
 
-    def _load_key(self, app_name: str, rank_key: str) -> ReferenceAutomaton | None:
+    def _load_key(self, app_name: str, rank_key: str) -> AutomatonProfile | None:
         raw = self._redis.get(self._ref_key(app_name, rank_key))
         if raw is None:
             return None
@@ -158,14 +158,14 @@ class RedisAutomatonLibrary:
         # Detect format: our compact reference dict vs a raw PhaseAutomaton export.
         first_state = (data.get("states") or [{}])[0]
         if "period_mean" in first_state:
-            return ReferenceAutomaton.from_dict(data)
-        return ReferenceAutomaton.from_automaton_dict(data, app_name, rank_key)
+            return AutomatonProfile.from_dict(data)
+        return AutomatonProfile.from_automaton_dict(data, app_name, rank_key)
 
     # ------------------------------------------------------------------
     # Save
     # ------------------------------------------------------------------
 
-    def _write(self, app_name: str, rank_key: str, ref: ReferenceAutomaton) -> None:
+    def _write(self, app_name: str, rank_key: str, ref: AutomatonProfile) -> None:
         pipe = self._redis.pipeline()
         pipe.set(self._ref_key(app_name, rank_key), json.dumps(ref.to_dict()))
         pipe.sadd(self._apps_key(), app_name)
@@ -185,7 +185,7 @@ class RedisAutomatonLibrary:
         with self._redis.lock(
             self._lock_key(app_name, rank_key), timeout=self._lock_timeout
         ):
-            new_ref = ReferenceAutomaton.from_automaton_dict(
+            new_ref = AutomatonProfile.from_automaton_dict(
                 automaton.to_dict(), app_name, rank_key
             )
 
@@ -219,13 +219,13 @@ class RedisAutomatonLibrary:
         """Write a user-supplied early estimate as a starting reference.
 
         Same semantics as AutomatonLibrary.seed() -- see
-        ReferenceAutomaton.from_node_seed for the dilution/survival rule.
+        AutomatonProfile.from_node_seed for the dilution/survival rule.
         Does nothing if a reference already exists for the derived
         rank_key, so a seed never clobbers real profiling data; the
         existence check and the write happen under the same lock as
         save() to avoid racing a concurrent save().
         """
-        ref = ReferenceAutomaton.from_node_seed(app_name, node_estimates)
+        ref = AutomatonProfile.from_node_seed(app_name, node_estimates)
         with self._redis.lock(
             self._lock_key(app_name, ref.rank_key), timeout=self._lock_timeout
         ):
@@ -260,9 +260,9 @@ class RedisAutomatonLibrary:
             if ref is None:
                 continue
             for behavior in ref.get_rank_behavior(ranks):
-                ReferenceAutomaton._fold_behavior(nodes, ranks, behavior)
+                AutomatonProfile._fold_behavior(nodes, ranks, behavior)
 
-        merged_ref = ReferenceAutomaton(
+        merged_ref = AutomatonProfile(
             app_name=app_name,
             rank_key=str(ranks),
             n_states=0,

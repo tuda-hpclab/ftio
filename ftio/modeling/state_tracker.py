@@ -20,7 +20,7 @@ from enum import StrEnum
 
 import numpy as np
 
-from ftio.modeling.reference_automaton import ReferenceAutomaton
+from ftio.modeling.automaton_profile import AutomatonProfile
 
 
 class MatchStrategy(StrEnum):
@@ -39,7 +39,7 @@ class StateTracker:
 
     Parameters
     ----------
-    reference : ReferenceAutomaton
+    reference : AutomatonProfile
         Loaded reference to match against.
     strategy : MatchStrategy
         greedy (default), dtw, or viterbi.
@@ -50,7 +50,7 @@ class StateTracker:
 
     def __init__(
         self,
-        reference: ReferenceAutomaton,
+        reference: AutomatonProfile,
         strategy: MatchStrategy = MatchStrategy.GREEDY,
         rank_mismatch_weight: float = 0.3,
     ):

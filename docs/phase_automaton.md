@@ -411,7 +411,7 @@ The exported file contains:
 
 ## Reference Library
 
-The reference library extends the phase automaton with a second purpose: **predicting future transitions** by comparing a live run against compiled references from past runs of the same application.
+The reference library extends the phase automaton with a second purpose: **predicting future transitions** by comparing a live run against statistics pooled from past runs of the same application.
 
 Two kinds of prediction remain explicitly separate:
 
@@ -427,6 +427,45 @@ predictor live.jsonl -f 100 --pa-library ./ftio_models --pa-app-name ior
 ```
 
 `--pa-library` implies `--phase-automaton`; you do not need to pass both.
+
+---
+
+### What each piece does
+
+Three objects are involved:
+
+| Object | One instance per... | Holds | Predicts anything itself? |
+|---|---|---|---|
+| `PhaseAutomaton` | one live run | that run's actual states/transitions — real, observed data points | no — this is the raw trace |
+| `AutomatonProfile` | one `(app, rank_key)` | statistics *pooled* across every `PhaseAutomaton` run seen for that config (mean ± std per state, `run_count`) | no — the aggregated baseline other things compare against |
+| `AutomatonLibrary` | one library directory | zero statistics of its own — a directory of `AutomatonProfile` files, one per `(app_name, rank_key)` | no — pure storage + dispatch |
+
+Concretely: `AutomatonProfile` **is** the deserialized content of one file, e.g. `./ftio_models/ior/ranks_128.json`. `AutomatonLibrary` **is** the folder `./ftio_models/`, plus the code that lists, loads, and writes those files. If you only ever cared about one app at one rank count, `AutomatonProfile` alone would be enough — `AutomatonLibrary` exists because a real deployment has many apps × many rank configs, each its own file, and something has to find the right one and merge into it correctly.
+
+The actual prediction step — "where is the live run positioned in its profile, and when will it transition" — happens in a fourth pair of objects, `StateTracker` / `TransitionPredictor`, which take an `AutomatonProfile` as input rather than being one:
+
+```
+PhaseAutomaton (this run, live)  ──────────────┐
+                                                 ├──> StateTracker + TransitionPredictor ──> forecast
+AutomatonProfile (past runs) ◀── AutomatonLibrary.load()
+```
+
+And what happens when a run *ends*, saving what was learned:
+
+```
+PhaseAutomaton (this run, just finished)
+        │
+        ▼
+AutomatonLibrary.save()   loads the existing AutomatonProfile (if any) and
+        │                 calls AutomatonProfile.merge() — the pooling math
+        ▼                 lives there, not in the library
+AutomatonProfile (updated)
+        │
+        ▼
+written to <library>/<app_name>/ranks_<key>.json
+```
+
+`AutomatonLibrary.save()` does no statistics itself — in `ftio/modeling/automaton_library.py`, `save()` is a `load` → `AutomatonProfile.merge()` → `write` sequence; every number in the result comes out of `merge()`. What the library adds is exactly what a single profile object has no way to do for itself: know that sibling files exist (`available_apps()`, `available_rank_keys()`), find one on disk, fall back to the nearest rank config when the exact one requested doesn't exist yet, and write the result back.
 
 ---
 
@@ -657,9 +696,67 @@ Library files are compact JSON containing per-state distribution statistics (the
 
 ---
 
+### AutomatonLibrary walkthrough
+
+A minimal, non-CLI walkthrough of what `AutomatonLibrary.save()` actually does across three runs of the same app — the object model from [What each piece does](#what-each-piece-does), made concrete.
+
+**Run 1 — no file exists yet for `ior/ranks_128`:**
+
+```python
+from ftio.modeling import AutomatonLibrary
+
+lib = AutomatonLibrary("./ftio_models")
+lib.save(automaton_run_1, "ior", "128")
+```
+
+FTIO prints one line:
+
+```
+[AutomatonLibrary] Saved ior/ranks_128 → ./ftio_models/ior/ranks_128.json (1 run(s), 3 states)
+```
+
+That single line doesn't say *what* landed in the file. Annotated below — this diff block is added here for this walkthrough, it is not something FTIO prints — using git-diff-style markers: `+` for something that did not exist before this save, `~` for something that existed and changed:
+
+```diff
++ state 0   period=1.930s  dwell=12.00s  ranks=128   (new — no prior file)
++ state 1   period=0.960s  dwell=31.20s  ranks=128   (new)
++ state 2   period=1.930s  dwell=47.00s  ranks=128   (new)
+```
+
+**Run 2 — same config, timings differ slightly:**
+
+```python
+lib.save(automaton_run_2, "ior", "128")
+```
+```
+[AutomatonLibrary] Saved ior/ranks_128 → ./ftio_models/ior/ranks_128.json (2 run(s), 3 states)
+```
+```diff
+~ state 0   period 1.930s → 1.929s   dwell 12.00s → 12.15s   n_samples 1 → 2
+~ state 1   period 0.960s → 0.960s   dwell 31.20s → 31.10s   n_samples 1 → 2
+~ state 2   period 1.930s → 1.929s   dwell 47.00s → 46.90s   n_samples 1 → 2
+```
+
+Every state is `~` this time, not `+`: `save()` loaded the existing file, called `AutomatonProfile.merge()` (the pooled-variance math lives there, not in `AutomatonLibrary`), and wrote the result back. The file's *shape* didn't change — still 3 states — only the pooled distributions moved and `n_samples` / `run_count` incremented.
+
+**Run 3 — a `PhaseAutomaton` with a *different* number of states (say 4, not 3):**
+
+This hits the topology-mismatch path: the existing 3-state path is left untouched, the new run is saved under a versioned key so nothing is lost, and only whatever rank configuration the two runs happen to share still gets pooled into the node table (see [Configuration table (nodes)](#configuration-table-nodes)):
+
+```
+[AutomatonLibrary] Topology mismatch for ior/ranks_128; saved new run as ranks_128_v1735142400 (shared configurations pooled into ranks_128)
+```
+```diff
+! ranks_128.json        : untouched (3 states) — different topology, path not merged
++ ranks_128_v1735142400 : new file (4 states) — this run's own path, saved separately
+~ config ranks=128      : node-table entry still pooled from both, despite the path split
+```
+
+---
+
 ### Configuration table (nodes)
 
-Everything above (the `states` path, `--pa-match` tracking, ETA forecasts) answers questions about *one specific rank sequence*. The **configuration table** (`nodes` in the library file, `ReferenceAutomaton.nodes` in Python) answers a narrower but more reusable question: *"what do we know about `ranks=32`, regardless of how the run got there?"*
+Everything above (the `states` path, `--pa-match` tracking, ETA forecasts) answers questions about *one specific rank sequence*. The **configuration table** (`nodes` in the library file, `AutomatonProfile.nodes` in Python) answers a narrower but more reusable question: *"what do we know about `ranks=32`, regardless of how the run got there?"*
 
 It is reached through two Python APIs, not (yet) a CLI flag:
 
@@ -716,7 +813,7 @@ A configuration does not have to mean one fixed period for its whole dwell. If t
  NodeBehavior(period_mean=8.0, ...)]   # after that
 ```
 
-Calling `get_rank_behavior()` (on `ReferenceAutomaton`, `AutomatonLibrary`, or `ModelManager` — same method name on all three) with no further arguments returns every behavior ever seen for that configuration. Give a specific point (see below) and it narrows to whichever behavior(s) actually apply there — one if unambiguous, several if the query falls in a genuine overlap between two behaviors, zero if nothing has ever been observed to cover it.
+Calling `get_rank_behavior()` (on `AutomatonProfile`, `AutomatonLibrary`, or `ModelManager` — same method name on all three) with no further arguments returns every behavior ever seen for that configuration. Give a specific point (see below) and it narrows to whichever behavior(s) actually apply there — one if unambiguous, several if the query falls in a genuine overlap between two behaviors, zero if nothing has ever been observed to cover it.
 
 #### Two axes: wall-clock time vs. cycle count
 
