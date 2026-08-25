@@ -3,8 +3,8 @@ RedisAutomatonLibrary: Redis-backed alternative to AutomatonLibrary.
 
 Same interface and merge semantics as AutomatonLibrary (load, save, seed,
 get_rank_behavior, available_apps, available_rank_keys), but backed by a Redis
-server instead of the filesystem -- for sharing one reference library
-across multiple processes or nodes without a shared filesystem.
+server instead of the filesystem -- for sharing one profile library across
+multiple processes or nodes without a shared filesystem.
 
 It also closes a race AutomatonLibrary has: its save() does a plain
 load -> merge -> write with no locking, so two concurrent writers to the
