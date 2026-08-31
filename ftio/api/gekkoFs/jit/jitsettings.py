@@ -505,8 +505,8 @@ class JitSettings:
             # dominates predictably. Per glass-rarely-beats-pfs, growing the
             # checkpoint until pfs is the bottleneck is what turned 168 -> 221 from
             # a loss into a win in the first place; probe whether a bigger
-            # atoms/rank (default 84_672) makes the pfs win band-independent.
-            atoms_per_rank = int(os.getenv("LAMMPS_ATOMS_PER_RANK", "84672"))
+            # atoms/rank (default 169_344) makes the pfs win band-independent.
+            atoms_per_rank = int(os.getenv("LAMMPS_ATOMS_PER_RANK", "169344"))
             n = self.weak_scale_lattice((self.nodes - 1) * self.procs_app, atoms_per_rank)
             self.app_flags = self.resolve_app_flags(
                 f"-in {self.run_dir}/in.ckpt -v ckptdir {ckptdir} "
@@ -516,14 +516,11 @@ class JitSettings:
                 # by the weak scaling, so wall time stays flat as nodes grow, but
                 # the restart does not: drop phases for very large node counts or
                 # the sweep will outrun stage-out (a past run hit 6.9 TB).
-                # 2x checkpoint frequency (every 15/phases 54 -> every 8/phases 101,
-                # same ~816 steps) confirmed a full win (44585615: 1.76x gekko/1.02x
-                # pfs) -- kept as the new default. LAMMPS_EVERY/LAMMPS_PHASES let a
-                # single submission probe further (e.g. another 2x) without moving
-                # the default every concurrently-queued job reads.
+                # LAMMPS_EVERY/LAMMPS_PHASES let a single submission probe further
+                # without moving the default every concurrently-queued job reads.
                 f"-v every {os.getenv('LAMMPS_EVERY', '8')} "
                 f"-v nb {os.getenv('LAMMPS_EVERY', '8')} "
-                f"-v phases {os.getenv('LAMMPS_PHASES', '101')} -v tail 8",
+                f"-v phases {os.getenv('LAMMPS_PHASES', '30')} -v tail 8",
                 ckptdir,
             )
         #  ├─ DLIO
@@ -1214,7 +1211,7 @@ class JitSettings:
         return flags
 
     @staticmethod
-    def weak_scale_lattice(ranks: int, atoms_per_rank: int = 84_672) -> int:
+    def weak_scale_lattice(ranks: int, atoms_per_rank: int = 169_344) -> int:
         """fcc lattice edge that gives each rank ~`atoms_per_rank` atoms.
 
         LAMMPS writes its restart from rank 0 only, one record per rank. GekkoFS
@@ -1224,9 +1221,6 @@ class JitSettings:
         ranks each record is 466 KB, under one chunk, so every write hits one
         daemon and GekkoFS loses to the PFS. Holding atoms/rank constant keeps
         each record many chunks wide at any scale.
-
-        The default is the value measured at 4 compute nodes (7.45 MB/record),
-        where GLASS beat the PFS by 2.2x.
 
         Args:
             ranks (int): Total application ranks.
