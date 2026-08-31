@@ -510,21 +510,9 @@ def save_data(prediction: Prediction, shared_resources) -> None:
     # safe total transferred bytes
     shared_resources.aggregated_bytes.value += prediction.total_bytes
 
-    # save data
+    # save data: the window index plus every Prediction field
     shared_resources.queue.put(
-        {
-            "phase": shared_resources.count.value,
-            "dominant_freq": prediction.dominant_freq,
-            "conf": prediction.conf,
-            "amp": prediction.amp,
-            "phi": prediction.phi,
-            "t_start": prediction.t_start,
-            "t_end": prediction.t_end,
-            "total_bytes": prediction.total_bytes,
-            "ranks": prediction.ranks,
-            "freq": prediction.freq,
-            # 'hits': shared_resources.hits.value,
-        }
+        {"phase": shared_resources.count.value, **prediction.to_dict()}
     )
 
 

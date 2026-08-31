@@ -136,7 +136,7 @@ print(json.loads(json_str)["dominant_freq"])
 print(repr(p))   # same as to_dict().__repr__()
 ```
 
-`to_dict()` keys: `source`, `dominant_freq`, `conf`, `periodicity`, `amp`, `phi`, `t_start`, `t_end`, `total_bytes`, `freq`, `ranks`, `n_samples`, `top_freqs`, `candidates`, `burst_widths`.
+`to_dict()` keys: `metric`, `source`, `dominant_freq`, `conf`, `periodicity`, `amp`, `phi`, `t_start`, `t_end`, `total_bytes`, `freq`, `ranks`, `n_samples`, `top_freqs`, `candidates`, `burst_widths`, `duty_cycle`.
 
 ---
 

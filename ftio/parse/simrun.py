@@ -273,9 +273,12 @@ class Simrun:
                 )
             else:
                 if isinstance(data_array[0][field], list):
+                    # a later part may not carry every list field (e.g. a ZMQ
+                    # stream mixing rank-level and application-level messages) --
+                    # a missing one just contributes nothing
                     my_dict[field] = []
-                    for i, _ in enumerate(data_array):
-                        my_dict[field].extend(data_array[i][field])
+                    for part in data_array:
+                        my_dict[field].extend(part.get(field, []))
                 else:
                     if field in ("number_of_ranks", "total_number_of_ranks"):
                         values = [x[field] for x in data_array]

@@ -13,6 +13,8 @@ https://github.com/tuda-parallel/FTIO/blob/main/LICENSE
 
 from __future__ import annotations
 
+from argparse import Namespace
+
 import ftio.prediction.monitor as pm
 from ftio.multiprocessing.async_process import handle_in_process
 from ftio.prediction.helper import export_extrap, print_data
@@ -96,7 +98,7 @@ def _export_phase_automaton(shared_resources) -> None:
             print(f"[ModelManager] Could not save to library: {exc}")
 
 
-def prediction_process(shared_resources, args: list[str], msgs=None) -> None:
+def prediction_process(shared_resources, args: Namespace, msgs=None) -> None:
     """Performs prediction made up of two parts: (1) Executes FTIO and (2) appends to data the value
 
     Args:
