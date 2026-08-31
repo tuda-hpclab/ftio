@@ -638,6 +638,7 @@ class Prediction:
             "top_freqs": self._top_freqs,
             "candidates": self._candidates,
             "burst_widths": self._burst_widths,
+            "duty_cycle": self.duty_cycle,
         }
 
     def to_json(self) -> str:

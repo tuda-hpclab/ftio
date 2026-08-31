@@ -1,5 +1,5 @@
 # File Formats and Tools
-Below, we describe the supported file formats. Aside from these formats, `ftio` and `predictor` support ZMQ as described [here](/docs/zmq.md), which avoids creating intermediate files. Furthermore, `ftio` also provides an API to different tools (e.g., [GekkoFS](/docs/api.md#gekkofs-with-zmq)) and allows easy and direct use of the Python functions as described and demonstrated [here](/docs/api.md#general).
+Below, we describe the supported file formats. Aside from these formats, `ftio` and `predictor` support ZMQ as described [here](/docs/zmq.md), which avoids creating intermediate files. Furthermore, `ftio` also provides an API to different tools (e.g., [online prediction over ZMQ](/docs/api.md#online-prediction-over-zmq)) and allows easy and direct use of the Python functions as described and demonstrated [here](/docs/api.md#general).
 
 The currently supported file Formats are:
 - [File Formats and Tools](#file-formats-and-tools)

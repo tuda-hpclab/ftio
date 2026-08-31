@@ -581,7 +581,15 @@ Full documentation:
             dest="zmq_port_reply",
             type=str,
             default="5556",
-            help="zmq port for communicating dominant frequency",
+            help="zmq port for sending predictions back (pass it to turn the reply on)",
+        )
+        group.add_argument(
+            "--zmq_reply_format",
+            "--zmq-reply-format",
+            dest="zmq_reply_format",
+            choices=["msgpack", "struct", "raw"],
+            default="msgpack",
+            help="reply encoding: msgpack map (default), struct pack('dd') for TMIO, or raw",
         )
 
         group = parser.add_argument_group("performance (predictor only)")
