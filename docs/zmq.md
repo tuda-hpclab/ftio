@@ -5,6 +5,7 @@ FTIO supports ZeroMQ (ZMQ) as a live data source, avoiding the need to write int
 - [Overview](#overview)
 - [Flags](#flags)
 - [Generic ZMQ format](#generic-zmq-format)
+- [Reply formats](#reply-formats)
 - [ZMQ with TMIO](#zmq-with-tmio)
 - [Returning frequency predictions to TMIO](#returning-frequency-predictions-to-tmio)
 
@@ -30,20 +31,35 @@ Use `predictor` for continuous online analysis (re-runs on every new message); u
 | `--zmq_format` | `direct` | Encoding of the ZMQ payload: `direct` (generic) or `tmio`. `--zmq_source` is a legacy alias of this flag. Not to be confused with `--source`, which selects the on-disk file format. |
 | `--zmq_address` | `*` | ZMQ bind address. `*` binds to all interfaces; use `127.0.0.1` for localhost only. |
 | `--zmq_port` | `5555` | ZMQ port for incoming data messages. |
-| `--zmq_port_reply` | `5556` | ZMQ port for outgoing frequency predictions (used with TMIO prefetcher). |
+| `--zmq_port_reply` | `5556` | ZMQ port for outgoing predictions. Passing this flag turns the reply on. |
+| `--zmq_reply_format` | `msgpack` | Encoding of the reply: `msgpack`, `struct`, or `raw`. See [Reply formats](#reply-formats). |
 
 ---
 
 ## Generic ZMQ format
 
-Any sender can push data to `predictor` using MessagePack-serialised messages.  The message must be a map (dictionary) with the following keys:
+A sender pushes MessagePack messages to `predictor`. Each message is a map. FTIO
+picks the shape from the keys that are present, there is no format field:
+
+| Keys | Meaning |
+|------|---------|
+| `b`, `ts`, `te`, `ranks?` | Per rank I/O intervals. FTIO overlaps concurrent ranks. |
+| `b`, `ts`, `ranks?` | Same, `te[i]` defaults to `ts[i+1]` (the last one keeps its start). |
+| `b`, `t`, `ranks?` | An already overlapped signal (`b` at times `t`), used as is. This is the `b`, `t` pair `ftio_core.core()` takes. |
 
 | Key | Type | Description |
 |-----|------|-------------|
-| `ranks` | int | Number of I/O ranks. |
-| `b` | float[] | Bandwidth values (bytes/s). |
-| `ts` | float[] | Start timestamps for each value (seconds). |
-| `te` | float[] | End timestamps for each value (seconds). |
+| `b` | float[] | Bandwidth (bytes/s), one value per rank interval or per sample. |
+| `ts`, `te` | float[] | Rank interval start and end (seconds). Rank level only. |
+| `t` | float[] | Sample times (seconds). App level only. |
+| `ranks` | int | Number of I/O ranks. Optional, defaults to 0. |
+
+Send one shape per run. A run that mixes shapes still works, but the merge takes
+its keys from the first message and can drop data of the other shape.
+
+For a send and receive example see
+[API, Online prediction over ZMQ](api.md#online-prediction-over-zmq)
+([`examples/API/zmq/predictor_zmq_api.py`](/examples/API/zmq/predictor_zmq_api.py)).
 
 **Start the receiver:**
 
@@ -139,6 +155,30 @@ Expect `predictor` to log a state at ~2.1s period for the first ~20s, then a `TR
 
 ---
 
+## Reply formats
+
+When `--zmq_port_reply` is set, `predictor` pushes one message back per
+prediction. `--zmq_reply_format` picks the encoding:
+
+| Format | Payload |
+|--------|---------|
+| `msgpack` (default) | The whole prediction as a map: every `Prediction.to_dict()` field with numpy arrays turned into lists, plus `period` (`1/dominant_freq`, s) and `duty_cycle`. `dominant_freq` and `conf` are the single strongest value. See [API, the message you get back](api.md#the-message-you-get-back) for the field list. |
+| `struct` or `raw` | `struct.pack("dd", freq, conf)`, 16 bytes, the format the TMIO prefetcher reads. |
+
+```python
+import zmq, msgpack
+
+ctx = zmq.Context()
+sock = ctx.socket(zmq.PULL)
+sock.bind("tcp://127.0.0.1:5556")          # predictor connects its reply socket here
+
+while True:
+    p = msgpack.unpackb(sock.recv())
+    print(f"period {p['period']:.2f}s  conf {p['conf']:.2f}")
+```
+
+---
+
 ## ZMQ with TMIO
 
 [TMIO](https://github.com/tuda-parallel/TMIO) can stream bandwidth data directly to `ftio` or `predictor` without writing trace files.
@@ -176,15 +216,17 @@ Expect `predictor` to log a state at ~2.1s period for the first ~20s, then a `TR
 
 ## Returning frequency predictions to TMIO
 
-`predictor` can send the detected dominant frequency back to TMIO's I/O prefetcher over a second ZMQ socket.
+`predictor` can send the detected dominant frequency back to TMIO's I/O prefetcher over a second ZMQ socket. TMIO reads the legacy 16-byte format, so pass `--zmq_reply_format struct`:
 
 ```bash
-predictor --zmq --zmq_source tmio --zmq_port_reply 5556 -m read_sync
+predictor --zmq --zmq_source tmio --zmq_port_reply 5556 --zmq_reply_format struct -m read_sync
 ```
 
 | Port | Direction | Purpose |
 |------|-----------|---------|
 | `--zmq_port` (5555) | TMIO → predictor | Incoming bandwidth data |
-| `--zmq_port_reply` (5556) | predictor → TMIO | Outgoing dominant frequency |
+| `--zmq_port_reply` (5556) | predictor → TMIO | Outgoing dominant frequency (`struct.pack("dd", freq, conf)`) |
+
+Any other consumer should use the default `msgpack` reply (see [Reply formats](#reply-formats)).
 
 <p align="right"><a href="#zmq-interface">⬆</a></p>

@@ -6,21 +6,19 @@ frequency (and the derived period). Transitions are triggered by one or
 more of the following mechanisms — listed from simplest to most complex:
 
   1. Rank change      — prediction.ranks differs from the current state's
-                        ranks for `rank_confirm_windows` consecutive
-                        predictions in a row.  A single differing window is
-                        not enough: online, `ranks` reflects however many
-                        ZMQ messages happened to arrive in that poll cycle,
-                        so a lagging straggler rank can make one window look
-                        like a rank change when nothing actually changed.
-                        Requiring the new count to persist filters that out
-                        while still catching real rank-only changes (e.g.
-                        malleability with no accompanying frequency shift).
-                        Exception: if period-ratio or the statistical
-                        detector fires on the very same window the rank
-                        first differs, that is corroborating evidence the
-                        change is real (a stray ZMQ blip would not also move
-                        the frequency estimate), so the transition fires
-                        immediately and is still labelled 'rank_change'.
+                        ranks.  Fires immediately (waiting for confirmation
+                        would mean a real change right before the trace
+                        ends never gets confirmed and is silently dropped).
+                        The state it replaces stays reachable for
+                        `rank_confirm_windows - 1` further predictions: if
+                        the count reverts to that state's ranks within that
+                        grace period, the transition is undone rather than
+                        left standing -- online, `ranks` reflects however
+                        many ZMQ messages happened to arrive in that poll
+                        cycle, so a lagging straggler rank can make one
+                        window look like a rank change when nothing actually
+                        changed, and this is what catches that case, without
+                        delaying detection of real changes to do it.
   2. Period-ratio     — new_period / current_period (or its reciprocal)
                         exceeds a threshold (e.g. 1.5).  No calibration
                         needed; robust for the I/O domain.
@@ -136,16 +134,19 @@ class PhaseAutomaton:
     Transition triggers (all optional, combinable):
 
       rank_changes_trigger : bool  (default True)
-          A prediction with a different rank count opens a new state once
-          that count has been seen for `rank_confirm_windows` consecutive
-          predictions.  This is the most explicit trigger — a persisted
-          rank change is always a configuration boundary.
+          A prediction with a different rank count opens a new state
+          immediately -- a rank change is always a configuration boundary.
+          The replaced state stays reachable for `rank_confirm_windows - 1`
+          further predictions; reverting to its rank count within that
+          window undoes the transition (see `rank_confirm_windows`).
 
       rank_confirm_windows : int  (default 2)
-          Number of consecutive predictions the new rank count must hold
-          before the rank-change trigger fires.  1 fires immediately (the
-          old behaviour); higher values are more robust to a single window
-          where not all ranks' ZMQ messages had arrived yet. Ignored when
+          Size of the grace period (in predictions) during which a rank
+          change can still be retracted if it reverts. 1 means no grace
+          period -- a rank change is permanent the instant it fires; higher
+          values are more robust to a single window where not all ranks'
+          ZMQ messages had arrived yet, at the cost of briefly tolerating a
+          wrong reading before it's corrected. Ignored when
           rank_changes_trigger is False.
 
       period_ratio_threshold : float | None  (default None)
@@ -185,6 +186,7 @@ class PhaseAutomaton:
         method: str | None = "cusum",
         rank_changes_trigger: bool = True,
         rank_confirm_windows: int = 2,
+        rank_change_strategy: str = "retract",
         period_ratio_threshold: float | None = None,
         min_cycles: float = 1.0,
     ):
@@ -192,9 +194,14 @@ class PhaseAutomaton:
             raise ValueError(
                 f"method must be 'cusum', 'ph', 'adwin', 'ksigma', or None, got {method!r}"
             )
+        if rank_change_strategy not in ("retract", "confirm"):
+            raise ValueError(
+                f"rank_change_strategy must be 'retract' or 'confirm', got {rank_change_strategy!r}"
+            )
         self.method = method
         self.rank_changes_trigger = rank_changes_trigger
         self.rank_confirm_windows = max(1, int(rank_confirm_windows))
+        self.rank_change_strategy = rank_change_strategy
         self.period_ratio_threshold = period_ratio_threshold
         self.min_cycles = min_cycles
         self.states: list[PhaseState] = []
@@ -202,8 +209,23 @@ class PhaseAutomaton:
         self._detector_state: dict[str, Any] = {}
         self._current_state: PhaseState | None = None
         self._pred_index: int = 0
+        # "confirm" strategy: wait for rank_confirm_windows consecutive
+        # agreeing predictions before trusting a rank change (see
+        # _rank_check_confirm).
         self._pending_rank: int | None = None
         self._pending_rank_count: int = 0
+        self._pending_predictions: list[Prediction] = []
+        # "retract" strategy: a rank-change transition is tentative for
+        # `rank_confirm_windows - 1` predictions after it fires (see
+        # _rank_check_retract). `_tentative_prior` is the state it replaced
+        # (None once the grace period has passed, or there is no tentative
+        # transition), `_tentative_deadline` counts down the remaining grace
+        # predictions, and `_tentative_detector_backup` is the statistical
+        # detector's state from just before it was reset, in case retraction
+        # needs to restore it.
+        self._tentative_prior: PhaseState | None = None
+        self._tentative_deadline: int = 0
+        self._tentative_detector_backup: dict[str, Any] = {}
 
     @classmethod
     def from_args(cls, args: Any) -> PhaseAutomaton:
@@ -219,6 +241,7 @@ class PhaseAutomaton:
             method=method,
             rank_changes_trigger=getattr(args, "pa_rank_trigger", True),
             rank_confirm_windows=getattr(args, "pa_rank_confirm", 2),
+            rank_change_strategy=getattr(args, "pa_rank_strategy", "retract"),
             period_ratio_threshold=getattr(args, "pa_period_ratio", None),
             min_cycles=getattr(args, "pa_min_cycles", 2.0),
         )
@@ -262,36 +285,29 @@ class PhaseAutomaton:
 
         ranks = max(0, int(prediction.ranks))
         cause: str | None = None
+        # Only a rank-change cause overrides the boundary time (both
+        # strategies can place it earlier than this window's own end); every
+        # other cause keeps using prediction.t_end, as before. `carryover`
+        # (confirm strategy only) lists earlier windows to move to the new
+        # state -- see _rank_check_confirm.
+        rank_boundary: float | None = None
+        carryover: list[Prediction] = []
 
-        # --- Rank-change check (highest priority) --------------------
-        # A single differing window is not trusted on its own: online, `ranks`
-        # can reflect an incomplete ZMQ poll cycle (not every rank's message had
-        # arrived yet), which looks identical to a real rank change for one
-        # window. The new count must repeat for `rank_confirm_windows` windows
-        # in a row before it is accepted; a reading that reverts to the current
-        # state's rank count forgets the pending candidate.
         rank_differs = (
             self.rank_changes_trigger
             and self._current_state is not None
             and ranks > 0
             and ranks != self._current_state.ranks
         )
-        if rank_differs:
-            if ranks == self._pending_rank:
-                self._pending_rank_count += 1
-            else:
-                self._pending_rank = ranks
-                self._pending_rank_count = 1
-        else:
-            self._pending_rank = None
-            self._pending_rank_count = 0
 
-        rank_confirmed = (
-            rank_differs and self._pending_rank_count >= self.rank_confirm_windows
-        )
-        if rank_confirmed:
-            cause = "rank_change"
-            self._detector_state = {}  # reset statistical detector
+        if self.rank_change_strategy == "retract":
+            cause, rank_boundary, rank_differs = self._rank_check_retract(
+                prediction, ranks, rank_differs
+            )
+        else:
+            cause, rank_boundary, carryover, rank_differs = self._rank_check_confirm(
+                prediction, ranks, rank_differs
+            )
 
         # --- Period-ratio check -------------------------------------
         if (
@@ -311,41 +327,153 @@ class PhaseAutomaton:
             if detected:
                 cause = "frequency"
 
-        # --- Corroboration -------------------------------------------
+        # --- Corroboration (confirm strategy only) -------------------
         # An unconfirmed rank difference that coincides with an independently
         # detected frequency/period shift is strong evidence the rank change is
         # real (a stray ZMQ blip would not also move the frequency estimate) --
         # attribute the transition to the rank change rather than the shift.
-        if cause is not None and rank_differs and not rank_confirmed:
+        # The retract strategy never leaves a rank change "unconfirmed" in the
+        # first place (it always fires immediately), so this never applies to it.
+        if (
+            self.rank_change_strategy == "confirm"
+            and cause not in (None, "rank_change")
+            and rank_differs
+        ):
             cause = "rank_change"
+            rank_boundary = prediction.t_end
+            carryover = []
             self._pending_rank = None
             self._pending_rank_count = 0
+            self._pending_predictions = []
 
         # --- Bootstrap first state ----------------------------------
         if self._current_state is None:
             self._current_state = self._open_state(freq, conf, prediction.t_start, ranks)
 
-        self._current_state.predictions.append(prediction)
         self._pred_index += 1
 
         # --- Fire transition ----------------------------------------
         if cause is not None:
-            self._current_state.exit_time = prediction.t_end
             old = self._current_state
-            self._current_state = self._open_state(freq, conf, prediction.t_end, ranks)
+            if carryover:
+                del old.predictions[-len(carryover) :]
+            boundary_time = (
+                rank_boundary if rank_boundary is not None else prediction.t_end
+            )
+            old.exit_time = boundary_time
+            self._current_state = self._open_state(freq, conf, boundary_time, ranks)
+            self._current_state.predictions.extend(carryover)
             self.transitions.append(
                 Transition(
                     from_state=old.state_id,
                     to_state=self._current_state.state_id,
-                    timestamp=prediction.t_end,
+                    timestamp=boundary_time,
                     prediction_index=self._pred_index,
                     old_freq=old.dominant_freq,
                     new_freq=freq,
                     cause=cause,
                 )
             )
+            # This prediction is the evidence that triggered/confirmed the
+            # transition -- it already reflects the new regime (that's why
+            # it fired), so it belongs to the state just opened, not the one
+            # just closed.
+            self._current_state.predictions.append(prediction)
+
+            if cause == "rank_change":
+                if self.rank_change_strategy == "retract":
+                    self._tentative_prior = old
+                    self._tentative_deadline = self.rank_confirm_windows - 1
+                    self._tentative_detector_backup = self._detector_state
+                    self._detector_state = {}
+                else:
+                    self._pending_rank = None
+                    self._pending_rank_count = 0
+                    self._pending_predictions = []
             return True
+
+        self._current_state.predictions.append(prediction)
         return False
+
+    def _rank_check_retract(
+        self, prediction: Prediction, ranks: int, rank_differs: bool
+    ) -> tuple[str | None, float | None, bool]:
+        """Fire immediately on a rank difference; retract within the grace period.
+
+        Returns (cause, boundary_time, rank_differs) -- rank_differs comes
+        back False if this call just retracted a tentative transition (the
+        window is now consistent with the restored state, and should not
+        also be treated as differing for this same step).
+        """
+        if (
+            rank_differs
+            and self._tentative_prior is not None
+            and self._tentative_deadline > 0
+            and ranks == self._tentative_prior.ranks
+        ):
+            # Reverts to the state the tentative one replaced -- undo it.
+            reverted = self._current_state
+            self.states.pop()
+            self.transitions.pop()
+            self._current_state = self._tentative_prior
+            self._current_state.exit_time = np.nan
+            self._current_state.predictions.extend(reverted.predictions)
+            self._detector_state = self._tentative_detector_backup
+            self._tentative_prior = None
+            self._tentative_deadline = 0
+            self._tentative_detector_backup = {}
+            return None, None, False
+
+        if self._tentative_deadline > 0:
+            self._tentative_deadline -= 1
+            if self._tentative_deadline == 0:
+                self._tentative_prior = None  # survived its grace period; now permanent
+
+        if rank_differs:
+            return "rank_change", prediction.t_start, rank_differs
+        return None, None, rank_differs
+
+    def _rank_check_confirm(
+        self, prediction: Prediction, ranks: int, rank_differs: bool
+    ) -> tuple[str | None, float | None, list[Prediction], bool]:
+        """Wait for `rank_confirm_windows` consecutive agreeing predictions.
+
+        A single differing window is not trusted on its own: online, `ranks`
+        can reflect an incomplete ZMQ poll cycle (not every rank's message had
+        arrived yet), which looks identical to a real rank change for one
+        window. Costs detecting a real change late if the input ends before
+        confirmation completes -- see the "retract" strategy for the
+        alternative that doesn't have that cost.
+
+        Returns (cause, boundary_time, carryover, rank_differs). `carryover`
+        lists every pending window before this one (e.g. with the default
+        rank_confirm_windows=2: just [window N-1], since window N is this
+        call) -- they were provisionally appended to the OLD state while
+        confirmation was pending, but genuinely belong to the new one, and
+        the boundary is where the FIRST of them starts, not where this
+        (confirming) window ends -- using this window's end makes the
+        transition look `rank_confirm_windows - 1` windows later than the
+        evidence supports.
+        """
+        if rank_differs:
+            if ranks == self._pending_rank:
+                self._pending_rank_count += 1
+                self._pending_predictions.append(prediction)
+            else:
+                self._pending_rank = ranks
+                self._pending_rank_count = 1
+                self._pending_predictions = [prediction]
+        else:
+            self._pending_rank = None
+            self._pending_rank_count = 0
+            self._pending_predictions = []
+
+        if rank_differs and self._pending_rank_count >= self.rank_confirm_windows:
+            self._detector_state = {}  # reset statistical detector
+            carryover = self._pending_predictions[:-1]
+            boundary = carryover[0].t_start if carryover else prediction.t_end
+            return "rank_change", boundary, carryover, rank_differs
+        return None, None, [], rank_differs
 
     def build(self, predictions: list[Prediction]) -> None:
         """Build automaton offline from a complete list of predictions."""
@@ -357,7 +485,7 @@ class PhaseAutomaton:
         print(
             f"PhaseAutomaton  method={self.method!r}  "
             f"rank_sensitive={self.rank_changes_trigger} "
-            f"(confirm={self.rank_confirm_windows})  "
+            f"({self.rank_change_strategy}, window={self.rank_confirm_windows})  "
             f"period_ratio={self.period_ratio_threshold}  "
             f"states={len(self.states)}  transitions={len(self.transitions)}"
         )

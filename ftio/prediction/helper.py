@@ -16,8 +16,10 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import struct
 import tempfile
 
+import msgpack
 import numpy as np
 
 from ftio.freq.prediction import Prediction
@@ -48,7 +50,7 @@ def get_dominant(prediction: Prediction) -> float:
         raise TypeError("prediction must be a Prediction or dict")
 
 
-def get_dominant_and_conf(prediction: Prediction) -> tuple[float, float]:
+def get_dominant_and_conf(prediction: Prediction | dict) -> tuple[float, float]:
     """Gets the dominant frequency and its confidence based on the confidence
 
     Args:
@@ -107,14 +109,14 @@ def export_extrap(data: list[dict], name: str = "./freq.jsonl"):
         file.write(extrap_string)
 
 
-def format_jsonl(data: list[dict]) -> tuple[str, str]:
+def format_jsonl(data: list[dict]) -> tuple[str, float]:
     """Formats the metric as in the JSONL format for Extra-P
 
     Args:
         data (list[dict]): List of predictions
 
     Returns:
-        tuple[str, str]: formatted string and number of ranks
+        tuple[str, float]: formatted string and number of ranks
 
     """
     string = ""
@@ -152,3 +154,27 @@ def dump_json(b: np.ndarray, t: np.ndarray, filename: str = "bandwidth.json") ->
         with contextlib.suppress(OSError):
             os.unlink(tmp_path)
         raise
+
+
+def build_reply(prediction: dict, reply_format: str = "msgpack") -> bytes:
+    """Serialise a prediction record for the ZMQ reply socket.
+
+    ``struct``/``raw`` give ``pack("dd", freq, conf)`` (the legacy TMIO bytes).
+    ``msgpack`` gives the whole record (every ``Prediction.to_dict()`` field,
+    numpy converted to lists) with ``dominant_freq``/``conf`` set to the single
+    dominant value and ``period``/``duty_cycle`` derived.
+    """
+    freq, conf = get_dominant_and_conf(prediction)
+    freq = 0.0 if np.isnan(freq) else float(freq)
+    conf = 0.0 if np.isnan(conf) else float(conf)
+
+    if reply_format in ("struct", "raw"):
+        return struct.pack("dd", freq, conf)
+
+    payload = Prediction().convert_json(prediction)
+    payload["dominant_freq"] = freq  # to_dict() stores the array; send the strongest
+    payload["conf"] = conf
+    payload["period"] = 1.0 / freq if freq > 0 else 0.0
+
+    result = msgpack.packb(payload)
+    return result if isinstance(result, bytes) else b""

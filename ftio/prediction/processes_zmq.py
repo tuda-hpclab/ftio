@@ -13,7 +13,6 @@ https://github.com/tuda-parallel/FTIO/blob/main/LICENSE
 
 from __future__ import annotations
 
-import struct
 import subprocess
 import time
 
@@ -26,7 +25,7 @@ from ftio.multiprocessing.async_process import (
     join_procs,
 )
 from ftio.parse.args import parse_args
-from ftio.prediction.helper import export_extrap, get_dominant_and_conf, print_data
+from ftio.prediction.helper import build_reply, export_extrap, print_data
 from ftio.prediction.processes import prediction_process
 
 CONSOLE = MyConsole()
@@ -63,13 +62,13 @@ def predictor_with_processes_zmq(
     debounce = getattr(tmp_args, "debounce", False)
     max_predictions = getattr(tmp_args, "max_predictions", 0)
 
-    # bind the socket
+    # bind the incoming socket; the reply socket (if any) is opened once here
     socket_in = setup_socket(addr, port_in, zmq.PULL)
     socket_out = None
-
     if return_data:
-        port_out = tmp_args.zmq_port_reply
-        socket_out = setup_socket(addr, port_out, zmq.PUSH, False)
+        socket_out = setup_socket(addr, tmp_args.zmq_port_reply, zmq.PUSH, False)
+    reply_format = getattr(tmp_args, "zmq_reply_format", "msgpack")
+    sent = 0  # predictions already replied to
 
     # can be extended to listen to multiple sockets
     poller = zmq.Poller()
@@ -81,18 +80,14 @@ def predictor_with_processes_zmq(
     try:
         with CONSOLE.status("[green]started\n", spinner="arrow3") as status:
             while True:
-                pre_num_procs = len(procs)
                 if not debounce:
                     # Original behaviour: reap finished procs, then wait for msgs.
                     procs = join_procs(procs)
 
-                if return_data and socket_out and pre_num_procs > len(procs):
-                    CONSOLE.print("[cyan]Returning Results[/]")
-                    data = get_dominant_and_conf(shared_resources.data[-1])
-                    CONSOLE.print(f"[cyan]Sending Frequency:{data[0]}[/]")
-                    CONSOLE.print(f"[cyan]Sending Confidence:{data[1]}[/]")
-                    packet = struct.pack("dd", data[0], data[1])
-                    socket_out.send(packet)
+                # a prediction finished since the last poll -> PUSH it back
+                if return_data and socket_out and len(shared_resources.data) > sent:
+                    socket_out.send(build_reply(shared_resources.data[-1], reply_format))
+                    sent = len(shared_resources.data)
 
                 # get messages
                 msgs, ranks, recv_time = receive_messages(socket_in, poller)

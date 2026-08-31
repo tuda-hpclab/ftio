@@ -238,8 +238,8 @@ There are three options to use `ftio` and `predictor`:
    a [custom format](/docs/file_formats.md#parsing-custom-file-formats).
 2. Use the [API](/docs/api.md#general). This is particularly good if you just want to experiment with the tool, or
    directly jump into using it with as little effort as possible.
-3. Send TCP messages over ZeroMQ (ZMQ) to the tools as described [here](/docs/zmq.md). There is also an API example with
-   ZMQ and GekkoFS [here](/docs/api.md#gekkofs-with-zmq). Usually, `predictor` is used with ZMQ, as it makes little
+3. Send TCP messages over ZeroMQ (ZMQ) to the tools as described [here](/docs/zmq.md). There is also a send + receive
+   API example [here](/docs/api.md#online-prediction-over-zmq). Usually, `predictor` is used with ZMQ, as it makes little
    sense to use `ftio` with this option.
 
 In all cases, various options can be provided to `ftio` and `predictor`. To see all available command line arguments,

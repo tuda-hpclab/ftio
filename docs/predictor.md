@@ -22,6 +22,22 @@ command.
 See also [ZMQ interface](zmq.md), [FTIO server](ftio_server.md), and
 [Metric Proxy](metric_proxy_zmq.md).
 
+### How the socket interfaces relate
+
+FTIO can be reached over a socket in a few ways. They differ in the transport
+and in whether one connection serves one prediction or stays open:
+
+| Interface | Entry point | Transport | Per call | Keeps state | Used by |
+|-----------|-------------|-----------|----------|-------------|---------|
+| in process | `ftio_core.core()` / `main()` | Python call | one prediction | no | your own script ([API](api.md)) |
+| HTTP server | `server_ftio` | HTTP POST `:5000` | one prediction | no | any language ([FTIO server](ftio_server.md)) |
+| Metric Proxy | `admire_proxy_zmq` | ZMQ request/reply | one prediction | no, shuts down when idle | the Metric Proxy ([doc](metric_proxy_zmq.md)) |
+| `predictor --zmq` | `predictor` | ZMQ PULL, optional PUSH reply | keeps running | yes: window, phase automaton, probability | any sender (TMIO, your own, an app) |
+| GLASS predictor | `predictor_jit` | ZMQ, GekkoFS 9 field | keeps running | yes, plus Cargo staging | the JIT / GekkoFS runs only |
+
+`predictor --zmq` is the one to use for a running application. `server_ftio` and
+`admire_proxy_zmq` answer one request at a time.
+
 ## Running
 
 ```bash

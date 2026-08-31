@@ -581,7 +581,15 @@ Full documentation:
             dest="zmq_port_reply",
             type=str,
             default="5556",
-            help="zmq port for communicating dominant frequency",
+            help="zmq port for sending predictions back (pass it to turn the reply on)",
+        )
+        group.add_argument(
+            "--zmq_reply_format",
+            "--zmq-reply-format",
+            dest="zmq_reply_format",
+            choices=["msgpack", "struct", "raw"],
+            default="msgpack",
+            help="reply encoding: msgpack map (default), struct pack('dd') for TMIO, or raw",
         )
 
         group = parser.add_argument_group("performance (predictor only)")
@@ -714,8 +722,26 @@ Full documentation:
             help=(
                 "Disable the rank-change trigger in the phase automaton. "
                 "By default a prediction whose rank count differs from the "
-                "current state's, and stays different for --pa-rank-confirm "
-                "consecutive predictions, opens a new state."
+                "current state's opens a new state (see --pa-rank-strategy for "
+                "how that's protected against a single noisy reading)."
+            ),
+        )
+        group.add_argument(
+            "--pa-rank-strategy",
+            "--pa_rank_strategy",
+            dest="pa_rank_strategy",
+            choices=["retract", "confirm"],
+            default="retract",
+            help=(
+                "How the rank-change trigger guards against a single noisy "
+                "reading (default: retract). 'retract': fire immediately, but "
+                "undo the transition if the count reverts to the previous "
+                "state's within --pa-rank-confirm - 1 further predictions -- "
+                "detects real changes without delay, including ones right at "
+                "the end of a trace. 'confirm': wait for --pa-rank-confirm "
+                "consecutive predictions to agree before firing at all -- "
+                "simpler, but a real change close to the end of a trace can "
+                "run out of predictions to confirm it and never fire."
             ),
         )
         group.add_argument(
@@ -726,12 +752,12 @@ Full documentation:
             default=2,
             metavar="N",
             help=(
-                "Number of consecutive predictions a new rank count must persist "
-                "before the rank-change trigger fires (default: 2). Guards "
-                "against a single window where not all ranks' ZMQ messages had "
-                "arrived yet looking like a rank change. Set to 1 to fire "
-                "immediately (old behaviour). Ignored when --pa-no-rank-trigger "
-                "is set."
+                "Size of the grace/confirmation window for the rank-change "
+                "trigger, in predictions (default: 2) -- see --pa-rank-strategy "
+                "for what it guards. Guards against a single window where not "
+                "all ranks' ZMQ messages had arrived yet looking like a rank "
+                "change. Set to 1 to fire immediately with no protection at all. "
+                "Ignored when --pa-no-rank-trigger is set."
             ),
         )
         group.add_argument(

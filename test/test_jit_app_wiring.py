@@ -248,3 +248,22 @@ def test_set_dir_gekko_relocates_mntdir_inside_a_pre_app_call_list(monkeypatch):
     set_dir_gekko(s)
     assert s.pre_app_call[0] == "mkdir -p /scratch/tmp/123/tarraf_gkfs_mountdir/data"
     assert s.pre_app_call[1] == "mpirun foo"
+
+
+def test_pre_call_srun_wraps_non_mpi_list_items_onto_an_app_node():
+    # setup_core.py's pre_app_call list dispatch used to only flag-wrap items
+    # containing mpirun/mpiexec; a bare `mkdir` ran unwrapped via
+    # execute_block_and_monitor, i.e. as a local subprocess on whatever host
+    # is executing the JIT driver process (the ftio_node), not on an app
+    # node's FUSE mount -- so dlio's pre-created dirs were invisible to the
+    # mpirun step that followed. flaged_call must now be reached for both
+    # branches of the list loop, not just the mpirun one.
+    src = inspect.getsource(
+        __import__("ftio.api.gekkoFs.jit.setup_core", fromlist=["pre_call"])
+    )
+    list_branch = src[src.index("elif isinstance(settings.pre_app_call, list):") :]
+    list_branch = list_branch[: list_branch.index("if returncode == 0:")]
+    assert list_branch.count("flaged_call(") >= 2, (
+        "non-mpi pre_app_call list items must also go through flaged_call "
+        "so they land on an app node instead of running bare"
+    )

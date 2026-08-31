@@ -823,15 +823,18 @@ class JitSettings:
                 # )
                 # generate_data used to launch straight into the $APP_PROCS_X_NODES
                 # mpirun below, so every rank raced to create data/checkpoints/
-                # hydra_log under the FUSE mount at once. At 65 nodes (256 ranks)
-                # that races the same three mkdir()s over and over -- gekko_fuse.log
-                # showed the daemon stuck spinning "root node allocated / . / .."
-                # (readdir on the mount root) for the full 30-minute timeout, never
-                # reaching the actual data-generation writes. The same workload at
-                # the same concurrency runs fine on a real FS (see exclude_daemon
-                # above), so this is FUSE-mount-specific contention, not dlio_benchmark
-                # itself. Pre-creating the three dirs as a single serial step first
-                # removes the race outright.
+                # hydra_log (and, deeper, the data/train/ subdir tf.io.TFRecordWriter
+                # creates itself) under the FUSE mount at once, which hangs/crashes
+                # at scale (65 nodes: 30-min hang; 448 ranks: NotFoundError racing
+                # data/train/). Pre-creating the three dirs as a single serial step
+                # first removes the race. That step used to silently land on the
+                # JIT driver's own node instead of an app node's FUSE mount --
+                # setup_core.py's pre_app_call list dispatch only srun-wrapped
+                # items containing mpirun/mpiexec, so a bare mkdir ran locally on
+                # whatever host was executing the JIT driver process. Fixed by
+                # having pre_call() flag-wrap non-MPI list items too (single node,
+                # single proc), so the mkdir now runs via srun on an actual app
+                # node.
                 self.pre_app_call = [
                     f"mkdir -p {dlio_dir}/data {dlio_dir}/checkpoints {dlio_dir}/hydra_log",
                 ]
@@ -1617,6 +1620,9 @@ class JitSettings:
             # trigger staged 0 items for a whole run (BSC 43752428: "Staging 0
             # item(s)" on every call). Match BOTH namings so in.ckpt's -v mp
             # knob can flip writer count without touching the regex again.
+            # (Multi-file "%" restarts also once segfaulted under the libc
+            # LD_PRELOAD intercept, BSC 43561676; --use_syscall is now the
+            # default interception mode and does not hit that path.)
             self.regex_flush_match = ".*/ckpt\\.restart\\.\\d+(\\.(\\d+|base))?$"
             self.regex_stage_out_match = ".*"
             self.regex_stage_in_match = ".*"
