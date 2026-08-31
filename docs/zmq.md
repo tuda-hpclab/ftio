@@ -53,6 +53,7 @@ picks the shape from the keys that are present, there is no format field:
 | `ts`, `te` | float[] | Rank interval start and end (seconds). Rank level only. |
 | `t` | float[] | Sample times (seconds). App level only. |
 | `ranks` | int | Number of I/O ranks. Optional, defaults to 0. |
+| `total_bytes` | int | Bytes transferred. Optional, defaults to 0. |
 
 Send one shape per run. A run that mixes shapes still works, but the merge takes
 its keys from the first message and can drop data of the other shape.

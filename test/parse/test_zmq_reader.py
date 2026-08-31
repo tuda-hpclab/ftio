@@ -90,3 +90,5 @@ def test_end_to_end_prediction(payload):
 
     preds, _ = main(["ftio", "--zmq", "-e", "no", "-f", "10"], [msgpack.packb(payload)])
     assert preds and preds[0].t_end > preds[0].t_start
+    assert preds[0].ranks == payload.get("ranks", 0)
+    assert preds[0].total_bytes == payload.get("total_bytes", 0)

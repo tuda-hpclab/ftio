@@ -28,6 +28,8 @@ def extract(msgs, args: list) -> tuple[dict, int]:
     # Wire shape by key presence: {b, ts, te?, ranks?} rank-level (overlap runs
     # downstream), or {b, t, ranks?} application-level (already overlapped).
     ranks = unpacked_data.get("ranks", 0)
+    io_data["number_of_ranks"] = ranks
+    io_data["total_bytes"] = unpacked_data.get("total_bytes", 0)
     bw = io_data["bandwidth"]
 
     if "b" in unpacked_data and "ts" in unpacked_data:

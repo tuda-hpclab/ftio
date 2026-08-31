@@ -161,13 +161,14 @@ a second socket. No trace file is written.
 
 ### The message you send
 
-A MessagePack map. Pick one of these shapes:
+A MessagePack map, one of these shapes (`ranks` and `total_bytes` are optional
+in every case):
 
 | Keys | Meaning |
 |------|---------|
-| `b`, `ts`, `te` (`ranks` optional) | rank level I/O intervals. FTIO overlaps concurrent ranks. |
-| `b`, `ts` (`ranks` optional) | same, `te[i]` defaults to `ts[i+1]` |
-| `b`, `t` (`ranks` optional) | an already overlapped signal, analysed as is |
+| `b`, `ts`, `te` | rank level I/O intervals. FTIO overlaps concurrent ranks. |
+| `b`, `ts` | same, `te[i]` defaults to `ts[i+1]` |
+| `b`, `t` | an already overlapped signal, analysed as is |
 
 | Key | Type | Meaning |
 |-----|------|---------|
@@ -175,6 +176,7 @@ A MessagePack map. Pick one of these shapes:
 | `ts`, `te` | float[] | start and end time of each interval, seconds (rank level) |
 | `t` | float[] | sample time, seconds (job level) |
 | `ranks` | int | number of I/O ranks, optional, defaults to 0 |
+| `total_bytes` | int | bytes transferred, optional, defaults to 0 |
 
 Send one shape per run. Several rank level messages that arrive together are
 merged before the overlap.
@@ -265,16 +267,15 @@ print(r)
   "dominant_freq": 0.046153846153846156, "conf": 0.8024962918003531,
   "period": 21.666666666666664,
   "periodicity": [], "amp": [230311.49], "phi": [-3.136],
-  "t_start": 0.0, "t_end": 65.0, "total_bytes": 0, "freq": 10.0, "ranks": 0,
+  "t_start": 0.0, "t_end": 65.0, "total_bytes": 0, "freq": 10.0, "ranks": 2,
   "n_samples": 650, "top_freqs": {}, "candidates": [],
   "burst_widths": [], "duty_cycle": NaN
 }
 ```
 
-`total_bytes` and `ranks` are `0` on the ZMQ path: the wire format carries no
-byte count and the rank count is not passed through. `burst_widths` is empty and
-`duty_cycle` is `NaN` without `-bw`. The other two examples only print
-`r["period"]` and `r["conf"]`.
+`total_bytes` is `0` because the wire format carries no byte count.
+`burst_widths` is empty and `duty_cycle` is `NaN` without `-bw`. The other two
+examples only print `r["period"]` and `r["conf"]`.
 
 **Rank level, one message per rank.** Each rank sends only its own I/O phases.
 FTIO merges the messages that arrive in the same poll window, then overlaps.
