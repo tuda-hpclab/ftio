@@ -424,8 +424,9 @@ class JitSettings:
 
         # ****** gkfs variables ******
         # self.gkfs_dir = f"{self.home}/deps/gekkofs_zmq_install"  # mogon
-        # self.gkfs_dir = "/apps/GPP/GEKKOFS/gkfs-master"  # bsc
-        self.gkfs_dir = os.getenv("GKFS_DIR", f"{self.home}/deps/install")  # bsc
+        # BSC default: the maintained module build (module load GekkoFS/master-0.9.6).
+        # Override with GKFS_DIR for a hand-built tree.
+        self.gkfs_dir = os.getenv("GKFS_DIR", "/apps/GPP/GEKKOFS/gkfs-master")
 
         if self.parsed_gkfs_daemon:
             self.gkfs_daemon = self.parsed_gkfs_daemon
@@ -446,7 +447,9 @@ class JitSettings:
         self.update_files_with_gkfs_mntdir = []
 
         # ****** cargo variables ******
-        self.cargo_bin = f"{self.gkfs_dir}/bin"  # f"{self.home}/cargo/build/cli"
+        # Cargo is a separate project and is not shipped in the GekkoFS module,
+        # so it is not derived from gkfs_dir. Override with CARGO_DIR.
+        self.cargo_bin = os.getenv("CARGO_DIR", f"{self.home}/deps/install/bin")
 
         # ? APP settings
         # ?##########################
@@ -573,10 +576,10 @@ class JitSettings:
         #  ├─ WRF
         elif "wrf" in self.app:
             # em_b_wave_glass is our copy of the idealized baroclinic-wave case
-            # (run_hours=24, restart_interval=60, history off -> 24 restarts).
-            # WRF must NOT run inside the mount: it reads each namelist group
-            # with a REWIND and that fails through GekkoFS. So the inputs stay
-            # on the parallel FS and only rst_outname points into the mount.
+            # (run_hours=48, restart_interval=360). WRF must NOT run inside the
+            # mount: it reads each namelist group with a REWIND and that fails
+            # through GekkoFS. So the inputs stay on the parallel FS and only
+            # rst_outname points into the mount.
             #
             # wrfinput_d01 encodes the domain size, so it MUST be regenerated
             # with ideal.exe whenever e_we/e_sn/e_vert change in namelist.input.
@@ -588,12 +591,28 @@ class JitSettings:
             # WRF drops rsl.out.<rank> + rsl.error.<rank> in its cwd: never $HOME.
             self.run_dir = self.prepare_run_dir(
                 f"{self.home}/WRF/test/em_b_wave_glass",
-                ["namelist.input", "wrfinput_d01"],
+                ["namelist.input", "wrfinput_d01", "ideal.exe", "input_jet"],
             )
             self.app_flags = ""
             self.point_wrf_restarts_at(
                 self.gkfs_mntdir if not self.exclude_daemon else self.run_dir
             )
+            # Weak-scale the domain: a fixed e_we/e_sn (unchanged since
+            # 2026-08-04) means each rank's restart-file slice shrinks as node
+            # count grows -- the same shrinking-per-rank-record bug already
+            # fixed for LAMMPS/WarpX/S3D-IO (weak_scale_lattice/_cells/
+            # _grid3d). See weak_scale_wrf_grid for the dx/time_step coupling.
+            # Opt-in via WRF_WEAK_SCALE_GRID=1 until the whole node-count sweep
+            # has been redone under it (see [[one-scaling-rule-per-app]]).
+            if os.getenv("WRF_WEAK_SCALE_GRID") == "1":
+                ranks = (self.nodes - 1) * self.procs_app
+                e_we, e_sn, dx, dy, dt = self.weak_scale_wrf_grid(ranks)
+                self.set_wrf_domain(e_we, e_sn, dx, dy, dt)
+                # Regenerate wrfinput_d01 for the new domain (ideal.exe reads
+                # input_jet, hence its place in the copy list above).
+                self.pre_app_call = (
+                    f"cd {self.run_dir} && ulimit -s unlimited && ./ideal.exe"
+                )
         #  ├─ Castro (AMReX)
         elif "castro" in self.app:
             # Sedov blast. fixed_dt + init_shrink=1 + max_level=0 keep the
@@ -629,19 +648,11 @@ class JitSettings:
             )
         #  ├─ WarpX (AMReX)
         elif "warpx" in self.app:
-            # WarpX was compute-bound to the point of hiding the FS entirely: 830 s
-            # of app against 6 s of stage-out, so glass/gekko/pfs came out within 5%
-            # of each other. Halve the compute (max_step 85 -> 40) and checkpoint 5x
-            # more often (every 2 steps -> 20 dirs), which raises the I/O fraction
-            # by ~10x. n_cell stays at 128 so a checkpoint dir remains ~484 MB.
+            # AMReX checkpoint directories (chk<step>/...) into the mount,
+            # write-only. Size = n_cell (weak-scaled), period = intervals.
             self.app_call = f"{self.home}/WarpX/build/bin/warpx.3d"
             self.run_dir = self.prepare_run_dir(f"{self.home}/WarpX/glass", ["inputs"])
             ckptdir = self.gkfs_mntdir if not self.exclude_daemon else self.run_dir
-            # n_cell 128 -> 192 (~3.4x cells): 20 checkpoints of ~484 MB totalled
-            # 9.7 GB against an 830 s app -- gekko staged it in 1.5 s, so the FS was
-            # invisible. ~1.6 GB per checkpoint (~32 GB total) makes the I/O matter.
-            # Only knob changed; steps/intervals stay from the last calibration.
-            #
             # Weak-scale n_cell like LAMMPS's lattice (weak_scale_lattice): a fixed
             # n_cell=320 is really a different, shrinking-per-rank workload at every
             # node count, not the same run at a bigger scale -- 9-33N lost to pfs
@@ -654,46 +665,20 @@ class JitSettings:
             n_cell = self.weak_scale_cells(
                 (self.nodes - 1) * self.procs_app, cells_per_rank
             )
-            # The stock deck declares `diagnostics.diags_names = diag1` only, so
-            # every chk.* option below was silently ignored and WarpX wrote no
-            # checkpoint at all -- app.log never mentions one and flush.log holds
-            # just APP-START/END. `chk` has to be declared, and a checkpoint is a
-            # diagnostic with format=checkpoint (Diagnostics.cpp:534).
-            # WARPX_INTERVALS: n_cell scaling alone left 9N unchanged (1.05x/0.86x ->
-            # 1.04x/0.87x, 44697383 vs 44752942) -- the ~20s run is short enough that
-            # checkpoint *size* barely matters against the flat ~3s stage overhead.
-            # Checkpoint more often instead, to raise the fraction of app time spent
-            # writing (which favors glass) vs. pure compute (neutral). Floor is the
-            # Nyquist limit above (period > 0.2s); intervals=200 already gives
-            # ~1.7s/checkpoint at 9N, so there's room to go denser before hitting it.
-            # 50 (4x denser) tested across the sweep 2026-08-18: 9N unchanged (still
-            # the structural floor), 17N 0.81x->0.94x pfs (close, not quite), 33N
-            # 1.00x->1.50x gekko/0.92x->1.23x pfs (loss -> win), 65N 1.52x->1.82x
-            # gekko/1.31x->1.33x pfs (already won, got better, no regression) -- no
-            # node count got worse, so this replaces 200 as the default outright.
-            intervals = int(os.getenv("WARPX_INTERVALS", "50"))
-            # WARPX_MAX_STEP=3200 (2x the old 1600) swept clean across all 7 node
-            # counts 2026-08-20: every one is a full win (glass < gekko AND < pfs),
-            # including 9N and 81N which never won under 1600 -- promoted to default.
+            # WARPX_INTERVALS=800 -> ~5 checkpoints over max_step=3200, ~24 s
+            # apart at 9N. The old value (50 -> a checkpoint every ~1.5 s) was
+            # calibrated while the checkpoint was a silent no-op (chk never
+            # registered); once it actually wrote, the flush fell behind and
+            # the run aborted (job 45134159). Checkpoint period must exceed the
+            # flush drain time -- same rule as DLIO_COMPUTE_TIME.
+            intervals = int(os.getenv("WARPX_INTERVALS", "800"))
             max_step = int(os.getenv("WARPX_MAX_STEP", "3200"))
+            # Declare the checkpoint diagnostic in the deck (command-line
+            # quoting mangles it) and drop the stock diag1 plotfile so the
+            # checkpoint is the only I/O.
+            self.set_warpx_checkpoint(ckptdir, intervals)
             self.app_flags = self.resolve_app_flags(
-                f'inputs max_step={max_step} diagnostics.diags_names="diag1 chk" '
-                f"chk.intervals={intervals} chk.diag_type=Full chk.format=checkpoint "
-                f"chk.write_species=1 diag1.intervals=1000 "
-                # 44585636 (max_step=40/intervals=2) and 44693748 (max_step=160,
-                # same intervals=2) both had glass_out == gekko_out exactly: no
-                # mid-run flush ever fired. Root cause found, not just "too
-                # short": ftio_args is `--freq 10` (10 Hz sampling), which caps
-                # the Nyquist-resolvable period at 1/(10/2) = 0.2 s
-                # (ftio/parse/args.py:208). Checkpoint period was ~0.245s at
-                # intervals=2/max_step=40 and ~0.07s at intervals=2/max_step=160
-                # (per-step cost dropped as steps grew -- fixed AMReX
-                # init/mesh-setup overhead dominates short runs) -- both at or
-                # under the floor, so FTIO literally could not resolve the
-                # periodicity regardless of total runtime. intervals=200 (was 2)
-                # pushes the period comfortably above 0.2s at any plausible
-                # per-step cost; max_step=1600 keeps 8 checkpoints (DFT needs
-                # >=4) at the same n_cell.
+                f"inputs max_step={max_step} "
                 f"chk.file_prefix={ckptdir}/chk amr.n_cell = "
                 f"{n_cell} {n_cell} {n_cell}",
                 ckptdir,
@@ -912,14 +897,18 @@ class JitSettings:
                 self.pre_app_call = f"mkdir -p {self.run_dir}/test_run/mpi"
         # ├─ wrf
         elif "wrf" in self.app:
-            # Deliberately empty. The old body ran WRF *inside* the mount, which
-            # cannot work: WRF reads each namelist group with a REWIND and that
-            # fails through GekkoFS ("ERROR while reading namelist diags" -> FATAL
-            # -> MPI_ABORT), while the identical file parses fine on a real FS.
-            # It also built the call from the `cdf`/`cpf` cluster aliases and
-            # $HOME paths, neither of which exists locally.
+            # Deliberately empty by default. The old body ran WRF *inside* the
+            # mount, which cannot work: WRF reads each namelist group with a
+            # REWIND and that fails through GekkoFS ("ERROR while reading
+            # namelist diags" -> FATAL -> MPI_ABORT), while the identical file
+            # parses fine on a real FS. It also built the call from the
+            # `cdf`/`cpf` cluster aliases and $HOME paths, neither of which
+            # exists locally.
             # Restarts go into the mount via point_wrf_restarts_at() instead.
-            self.pre_app_call = ""
+            # WRF_WEAK_SCALE_GRID=1 sets pre_app_call earlier (ideal.exe regen)
+            # -- don't clobber it here.
+            if not self.pre_app_call:
+                self.pre_app_call = ""
             self.post_app_call = ""
         else:
             self.pre_app_call = ""
@@ -1332,6 +1321,56 @@ class JitSettings:
         raw = (cells_per_rank * max(1, ranks)) ** (1 / 3)
         return max(blocking, round(raw / blocking) * blocking)
 
+    @staticmethod
+    def weak_scale_wrf_grid(
+        ranks: int,
+        base_ranks: int = 8,
+        base_e_we: int = 164,
+        base_e_sn: int = 324,
+        base_dx: float = 25000.0,
+        base_dt: float = 150.0,
+    ) -> tuple[int, int, float, float, float]:
+        """WRF domain size that keeps each rank's restart-file slice constant.
+
+        em_b_wave_glass's e_we/e_sn/dx have been fixed since 2026-08-04 across
+        every node count -- the same shrinking-per-rank-record bug already fixed
+        for LAMMPS/WarpX/S3D-IO (weak_scale_lattice/_cells/_grid3d): WRF
+        decomposes e_we x e_sn across ranks (PROCS=1, so ranks == app nodes), so
+        a fixed grid means each rank's restart slice shrinks as nodes grow.
+
+        Scales e_we/e_sn up by sqrt(ranks/base_ranks) to hold grid-points-per-rank
+        constant, and dx/dy down by the same factor so the physical domain
+        extent (e_we*dx, e_sn*dy) stays exactly what it was at base_ranks --
+        growing e_we/e_sn without shrinking dx let the idealized channel's
+        y-extent exceed a physical bound and segfaulted ideal.exe (2026-08-04,
+        82x162->328x648 test, see [[wrf-scale-dx-with-grid]]). time_step scales
+        with dx to hold the CFL ratio (dt/dx) constant -- a finer dx needs a
+        proportionally smaller step or the integration blows up.
+
+        Note: because dt shrinks with dx, the step count needed to cover a fixed
+        run_hours grows as sqrt(ranks) too, so larger node counts take
+        proportionally longer in wall-clock app time under this formula on top
+        of running more ranks -- a real cost of weak-scaling this deck, not a
+        bug to chase out.
+
+        Args:
+            ranks (int): Total application ranks (WRF runs PROCS=1, so nodes).
+            base_ranks (int): Rank count the base_* values were calibrated at.
+            base_e_we (int): e_we at base_ranks.
+            base_e_sn (int): e_sn at base_ranks.
+            base_dx (float): dx=dy (m) at base_ranks.
+            base_dt (float): time_step (s) at base_ranks.
+
+        Returns:
+            tuple[int, int, float, float, float]: (e_we, e_sn, dx, dy, time_step).
+        """
+        factor = (max(1, ranks) / base_ranks) ** 0.5
+        e_we = max(base_e_we, round(base_e_we * factor))
+        e_sn = max(base_e_sn, round(base_e_sn * factor))
+        dx = base_dx / factor
+        dt = base_dt / factor
+        return e_we, e_sn, dx, dx, dt
+
     def prepare_run_dir(self, deck_dir: str, files: list[str] | None = None) -> str:
         """Copy an app's deck to scratch and return that as the run directory.
 
@@ -1418,6 +1457,87 @@ class JitSettings:
                 self.update_files_with_gkfs_mntdir.append(namelist)
         except OSError as e:
             console.print(f"[yellow]Could not set rst_outname in {namelist}: {e}[/]")
+
+    def set_wrf_domain(
+        self, e_we: int, e_sn: int, dx: float, dy: float, time_step: float
+    ) -> None:
+        """Rewrite the &domains grid fields so ideal.exe regenerates a matching wrfinput_d01.
+
+        Same in-place rewrite approach as point_wrf_restarts_at, done in Python
+        so it works identically locally and on the cluster. wrfinput_d01 bakes
+        in the domain size at ideal.exe-run time, so the namelist must be
+        correct *before* the ideal.exe pre_app_call runs, not after.
+
+        Args:
+            e_we (int): East-west grid points.
+            e_sn (int): South-north grid points.
+            dx (float): Grid spacing in x (m).
+            dy (float): Grid spacing in y (m).
+            time_step (float): Integration step (s).
+        """
+        namelist = os.path.join(self.run_dir, "namelist.input")
+        dt = round(time_step)
+        replacements = {
+            "e_we": f" e_we                                = {e_we},   {e_we},   {e_we},",
+            "e_sn": f" e_sn                                = {e_sn},   {e_sn},   {e_sn},",
+            "dx": f" dx                                  = {round(dx)},",
+            "dy": f" dy                                  = {round(dy)},",
+            "time_step": f" time_step                           = {dt},",
+        }
+        try:
+            with open(namelist) as f:
+                lines = f.read().splitlines()
+            rewritten = []
+            for line in lines:
+                key = line.lstrip().split(None, 1)[0] if line.strip() else ""
+                rewritten.append(replacements.get(key, line))
+            if rewritten != lines:
+                with open(namelist, "w") as f:
+                    f.write("\n".join(rewritten) + "\n")
+        except OSError as e:
+            console.print(f"[yellow]Could not set WRF domain in {namelist}: {e}[/]")
+
+    def set_warpx_checkpoint(self, ckptdir: str, intervals: int) -> None:
+        """Set the deck to write only a `chk` checkpoint (no `diag1` plotfile).
+
+        `diags_names = "diag1 chk"` on the command line does not survive jit's
+        `bash -c` wrapper (the quotes collapse), so it goes in the deck instead.
+        `diag1` is dropped so the checkpoint is the only I/O. Scalar overrides
+        jit passes on the command line (max_step, n_cell, file_prefix) still win.
+
+        Args:
+            ckptdir (str): Directory the checkpoints should be written to.
+            intervals (int): Checkpoint every `intervals` steps.
+        """
+        inputs = os.path.join(self.run_dir, "inputs")
+        block = [
+            "diagnostics.diags_names = chk",
+            f"chk.intervals = {intervals}",
+            "chk.diag_type = Full",
+            "chk.format = checkpoint",
+            f"chk.file_prefix = {ckptdir}/chk",
+        ]
+        try:
+            with open(inputs) as f:
+                lines = f.read().splitlines()
+            rewritten = [
+                line
+                for line in lines
+                if not line.lstrip().startswith(
+                    ("diagnostics.diags_names", "chk.", "diag1.")
+                )
+            ]
+            rewritten += block
+            if rewritten != lines:
+                with open(inputs, "w") as f:
+                    f.write("\n".join(rewritten) + "\n")
+            if (
+                "_gkfs_mountdir" in ckptdir
+                and inputs not in self.update_files_with_gkfs_mntdir
+            ):
+                self.update_files_with_gkfs_mntdir.append(inputs)
+        except OSError as e:
+            console.print(f"[yellow]Could not set WarpX checkpoint in {inputs}: {e}[/]")
 
     def point_qmcpack_output_at(self, ckptdir: str) -> None:
         """Rewrite <project id> in the QMCPACK input so output lands in `ckptdir`.

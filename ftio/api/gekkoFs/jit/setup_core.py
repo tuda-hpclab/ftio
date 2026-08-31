@@ -153,17 +153,17 @@ def start_gekko_daemon(settings: JitSettings) -> None:
     else:
         level = level or ("trace" if settings.debug_lvl > 1 else "err")
         debug_flag = f"--export=ALL,GKFS_DAEMON_LOG_LEVEL={level},GKFS_DAEMON_LOG_PATH={settings.gkfs_daemon_log}_intern"
-        # LIBGKFS_METRICS_IP_PORT is only ever interpolated into the client's
+        # GKFS_METRICS_IP_PORT is only ever interpolated into the client's
         # own bash -c string (see get_env/client call below), never a real
         # exported env var -- so --export=ALL here never carries it to the
-        # daemon process no matter what. The opt-in LIBGKFS_METRICS_AGGREGATOR
+        # daemon process no matter what. The opt-in GKFS_METRICS_AGGREGATOR
         # test feature (GekkoFS daemon.cpp: start_metrics_relay()) needs the
         # daemon to actually know FTIO's address, so pass both through
         # explicitly when relay mode is requested.
-        if not settings.exclude_ftio and os.environ.get("LIBGKFS_METRICS_AGGREGATOR"):
+        if not settings.exclude_ftio and os.environ.get("GKFS_METRICS_AGGREGATOR"):
             debug_flag += (
-                f",LIBGKFS_METRICS_IP_PORT={settings.address_ftio}:{settings.port_ftio}"
-                f",LIBGKFS_METRICS_AGGREGATOR=on"
+                f",GKFS_METRICS_IP_PORT={settings.address_ftio}:{settings.port_ftio}"
+                f",GKFS_METRICS_AGGREGATOR=on"
             )
 
     if settings.cluster:
@@ -279,9 +279,10 @@ def start_fuse(settings: JitSettings) -> None:
                 settings,
                 (
                     f"-x LIBGKFS_HOSTS_FILE={settings.gkfs_hostfile} "
-                    f"-x LIBGKFS_METRICS_IP_PORT={settings.address_ftio}:{settings.port_ftio} "
-                    f"-x LIBGKFS_ENABLE_METRICS=on -x"
-                    f"LIBGKFS_METRICS_FLUSH_INTERVAL=5 "
+                    f"-x LIBGKFS_OFI_INTERFACE=ib0 "
+                    f"-x GKFS_METRICS_IP_PORT={settings.address_ftio}:{settings.port_ftio} "
+                    f"-x GKFS_ENABLE_METRICS=on "
+                    f"-x LIBGKFS_METRICS_FLUSH_INTERVAL=5 "
                     f"{call}"
                 ),
                 settings.app_nodes,
@@ -291,8 +292,9 @@ def start_fuse(settings: JitSettings) -> None:
                 f"srun  --jobid={settings.job_id} {settings.app_nodes_command} --disable-status -N {settings.app_nodes} "
                 #   f"--ntasks={settings.app_nodes*settings.procs_daemon} --cpus-per-task={settings.procs_daemon} --ntasks-per-node={settings.procs_daemon} --overcommit --overlap "
                 f"--export=ALL,LIBGKFS_HOSTS_FILE={settings.gkfs_hostfile},"
-                f"LIBGKFS_METRICS_IP_PORT={settings.address_ftio}:{settings.port_ftio},"
-                f"LIBGKFS_ENABLE_METRICS=on,LIBGKFS_METRICS_FLUSH_INTERVAL=5 "
+                f"LIBGKFS_OFI_INTERFACE=ib0,"
+                f"GKFS_METRICS_IP_PORT={settings.address_ftio}:{settings.port_ftio},"
+                f"GKFS_ENABLE_METRICS=on,LIBGKFS_METRICS_FLUSH_INTERVAL=5 "
                 f"--ntasks={settings.app_nodes} --cpus-per-task={settings.procs_daemon} --ntasks-per-node=1 --overcommit --overlap "
                 f"--oversubscribe --mem=0 {settings.task_set_0} "
                 f"{settings.gkfs_fuse}"
@@ -740,7 +742,7 @@ def stage_in(settings: JitSettings, runtime: JitTime) -> None:
                 )
                 # call = f"srun --jobid={settings.job_id} {settings.single_node_command} --disable-status -N 1 --ntasks=1 --cpus-per-task=1 --ntasks-per-node=1 --overcommit --overlap --oversubscribe --mem=0 "
             else:
-                call = f"mpiexec -x LIBGKFS_ENABLE_METRICS=off -np 1 --oversubscribe {settings.cargo_bin}/ccp --server {settings.gkfs_daemon_protocol}://{settings.address_cargo}:{settings.port_cargo} --output / --input {settings.stage_in_path} --of gekkofs --if {settings.cargo_mode}"
+                call = f"mpiexec -x GKFS_ENABLE_METRICS=off -np 1 --oversubscribe {settings.cargo_bin}/ccp --server {settings.gkfs_daemon_protocol}://{settings.address_cargo}:{settings.port_cargo} --output / --input {settings.stage_in_path} --of gekkofs --if {settings.cargo_mode}"
 
             start = time.time()
 
@@ -1021,7 +1023,7 @@ def start_application(settings: JitSettings, runtime: JitTime):
         additional_arguments = ""
         if settings.use_mpirun:
             if not settings.exclude_ftio:
-                additional_arguments += f"-x LIBGKFS_METRICS_IP_PORT={settings.address_ftio}:{settings.port_ftio} -x LIBGKFS_ENABLE_METRICS=on -x LIBGKFS_METRICS_FLUSH_INTERVAL=5 "
+                additional_arguments += f"-x GKFS_METRICS_IP_PORT={settings.address_ftio}:{settings.port_ftio} -x GKFS_ENABLE_METRICS=on -x LIBGKFS_METRICS_FLUSH_INTERVAL=5 "
             if not settings.exclude_proxy:
                 additional_arguments += (
                     f"-x LIBGKFS_PROXY_PID_FILE={settings.gkfs_proxyfile} "
@@ -1035,6 +1037,7 @@ def start_application(settings: JitSettings, runtime: JitTime):
                     f"-x LIBGKFS_LOG={log_modules} "
                     f"-x LIBGKFS_LOG_OUTPUT={settings.gkfs_client_log} "
                     f"-x LIBGKFS_HOSTS_FILE={settings.gkfs_hostfile} "
+                    f"-x LIBGKFS_OFI_INTERFACE=ib0 "
                 )
                 if settings.preload_via_export:
                     additional_arguments += f"-x LD_PRELOAD={settings.gkfs_intercept} "
@@ -1089,8 +1092,8 @@ def start_application(settings: JitSettings, runtime: JitTime):
                 gkfs_env = ""
                 if not settings.exclude_ftio:
                     gkfs_env += (
-                        f"LIBGKFS_ENABLE_METRICS=on "
-                        f"LIBGKFS_METRICS_IP_PORT={settings.address_ftio}:{settings.port_ftio} "
+                        f"GKFS_ENABLE_METRICS=on "
+                        f"GKFS_METRICS_IP_PORT={settings.address_ftio}:{settings.port_ftio} "
                         f"LIBGKFS_METRICS_FLUSH_INTERVAL=5 "
                     )
                 if not settings.exclude_daemon:
@@ -1099,6 +1102,7 @@ def start_application(settings: JitSettings, runtime: JitTime):
                         f"LIBGKFS_LOG={log_modules} "
                         f"LIBGKFS_LOG_OUTPUT={settings.gkfs_client_log} "
                         f"LIBGKFS_HOSTS_FILE={settings.gkfs_hostfile} "
+                        f"LIBGKFS_OFI_INTERFACE=ib0 "
                     )
                     if settings.gkfs_intercept:
                         gkfs_env = f"LD_PRELOAD={settings.gkfs_intercept} " + gkfs_env
@@ -1122,13 +1126,14 @@ def start_application(settings: JitSettings, runtime: JitTime):
             else:
                 # Legacy / FUSE mode: pass GekkoFS vars via srun --export
                 if not settings.exclude_ftio:
-                    additional_arguments += f"LIBGKFS_ENABLE_METRICS=on,LIBGKFS_METRICS_IP_PORT={settings.address_ftio}:{settings.port_ftio},LIBGKFS_METRICS_FLUSH_INTERVAL=5,"
+                    additional_arguments += f"GKFS_ENABLE_METRICS=on,GKFS_METRICS_IP_PORT={settings.address_ftio}:{settings.port_ftio},LIBGKFS_METRICS_FLUSH_INTERVAL=5,"
                 if not settings.exclude_daemon:
                     log_modules = "all" if settings.debug_lvl > 1 else "errors"
                     additional_arguments += (
                         f'LIBGKFS_LOG="{log_modules}",'
                         f"LIBGKFS_LOG_OUTPUT={settings.gkfs_client_log},"
                         f"LIBGKFS_HOSTS_FILE={settings.gkfs_hostfile},"
+                        f"LIBGKFS_OFI_INTERFACE=ib0,"
                     )
                     if settings.preload_via_export and settings.gkfs_intercept:
                         additional_arguments += f"LD_PRELOAD={settings.gkfs_intercept},"
@@ -1150,7 +1155,7 @@ def start_application(settings: JitSettings, runtime: JitTime):
 
         additional_arguments = ""
         if not settings.exclude_ftio:
-            additional_arguments += f"-x LIBGKFS_METRICS_IP_PORT={settings.address_ftio}:{settings.port_ftio} -x LIBGKFS_ENABLE_METRICS=on "
+            additional_arguments += f"-x GKFS_METRICS_IP_PORT={settings.address_ftio}:{settings.port_ftio} -x GKFS_ENABLE_METRICS=on "
         if not settings.exclude_proxy:
             additional_arguments += (
                 f"-x LIBGKFS_PROXY_PID_FILE={settings.gkfs_proxyfile} "
