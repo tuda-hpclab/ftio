@@ -1143,7 +1143,7 @@ def start_application(settings: JitSettings, runtime: JitTime):
                 f"--export=ALL,{additional_arguments}LD_LIBRARY_PATH={os.environ.get('LD_LIBRARY_PATH')} "
                 f"--jobid={settings.job_id} {settings.app_nodes_command} --disable-status "
                 f"-N {settings.app_nodes} --ntasks={settings.app_nodes * settings.procs_app} "
-                f"--cpus-per-task={settings.procs_app} --ntasks-per-node={settings.procs_app} "
+                f"--cpus-per-task={settings.cpus_per_task_app} --ntasks-per-node={settings.procs_app} "
                 f"--overcommit --overlap --oversubscribe --mem=0 "
                 f"{settings.task_set_1} {app_invocation}"
             )

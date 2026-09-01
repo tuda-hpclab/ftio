@@ -157,6 +157,7 @@ class JitSettings:
         self.procs_proxy = 0
         self.procs_cargo = 0
         self.procs_app = 0
+        self.cpus_per_task_app = 0  # --cpus-per-task; defaults to procs_app below
         self.procs_ftio = 0
         self.fuse_idle_threads = 0  # finalized in parse_options after procs_app is set
         self.cmd_call = ""
@@ -454,6 +455,7 @@ class JitSettings:
         # ? APP settings
         # ?##########################
         # ****** app call ******
+        self.cpus_per_task_app = self.procs_app
         #  ├─ IOR
         if "ior" in self.app:
             self.app_call = "./ior "
@@ -692,6 +694,8 @@ class JitSettings:
             self.point_qmcpack_output_at(
                 self.gkfs_mntdir if not self.exclude_daemon else self.run_dir
             )
+            # QMCPACK auto-threads from --cpus-per-task; keep it at 1 thread/rank.
+            self.cpus_per_task_app = 1
         else:
             self.app_call = ""
             self.run_dir = ""
