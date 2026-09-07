@@ -4,9 +4,11 @@ FTIO supports ZeroMQ (ZMQ) as a live data source, avoiding the need to write int
 
 - [Overview](#overview)
 - [Flags](#flags)
+- [Socket pattern: push-pull vs pub-sub](#socket-pattern-push-pull-vs-pub-sub)
 - [Generic ZMQ format](#generic-zmq-format)
 - [Reply formats](#reply-formats)
 - [ZMQ with TMIO](#zmq-with-tmio)
+- [ZMQ with FlexMPI](#zmq-with-flexmpi)
 - [Returning frequency predictions to TMIO](#returning-frequency-predictions-to-tmio)
 
 ---
@@ -15,7 +17,7 @@ FTIO supports ZeroMQ (ZMQ) as a live data source, avoiding the need to write int
 
 In ZMQ mode:
 
-- The sender (application, TMIO, or any custom producer) pushes bandwidth data to a ZMQ socket.
+- The sender (application, TMIO, FlexMPI monitor, or any custom producer) pushes data to a ZMQ socket.
 - `ftio` or `predictor` receives messages, deserialises them, and analyses the bandwidth data.
 - Predictions are printed to the console and, optionally, sent back over a reply socket.
 
@@ -28,11 +30,39 @@ Use `predictor` for continuous online analysis (re-runs on every new message); u
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--zmq` | off | Enable ZMQ input mode (suppresses opening the HTML output). |
-| `--zmq_format` | `direct` | Encoding of the ZMQ payload: `direct` (generic) or `tmio`. `--zmq_source` is a legacy alias of this flag. Not to be confused with `--source`, which selects the on-disk file format. |
+| `--zmq_format` | `direct` | Encoding of the ZMQ payload: `direct` (generic), `tmio` (a msgpack-encoded TMIO buffer), or `flexmpi` (a [FlexMPI monitor](#zmq-with-flexmpi) metric map). `--zmq_source` is a legacy alias of this flag. Not to be confused with `--source`, which selects the on-disk file format. |
+| `--zmq_socket` | `push-pull` | ZMQ pattern for the incoming stream: `push-pull` or `pub-sub`. See [Socket pattern](#socket-pattern-push-pull-vs-pub-sub). |
 | `--zmq_address` | `*` | ZMQ bind address. `*` binds to all interfaces; use `127.0.0.1` for localhost only. |
 | `--zmq_port` | `5555` | ZMQ port for incoming data messages. |
 | `--zmq_port_reply` | `5556` | ZMQ port for outgoing predictions. Passing this flag turns the reply on. |
 | `--zmq_reply_format` | `msgpack` | Encoding of the reply: `msgpack`, `struct`, or `raw`. See [Reply formats](#reply-formats). |
+
+---
+
+## Socket pattern: push-pull vs pub-sub
+
+`--zmq_socket` selects the ZeroMQ pattern for the **incoming** metric stream. The
+reply channel (`--zmq_port_reply`) is unaffected and always stays PUSH/PULL.
+
+| `--zmq_socket` | FTIO binds | Sender connects | Behaviour |
+|----------------|------------|-----------------|-----------|
+| `push-pull` (default) | `PULL` | `PUSH` | Reliable: messages are queued. But a `PUSH` sender **blocks** on `send()` once the high-water mark is reached with no receiver draining — back-pressure that can stall the monitored application. |
+| `pub-sub` | `SUB` (subscribed to all topics) | `PUB` | Lossy: a `PUB` sender **never blocks**. With no subscriber, or at the high-water mark, it drops. FTIO tolerates the gaps because it resamples onto a uniform grid before the transform. |
+
+Prefer `pub-sub` when the sender is a running HPC application that must not be
+perturbed. Points to keep in mind:
+
+- **Slow joiner** — messages published before the `SUB` subscription propagates
+  are lost. Start `predictor` before the run, or rely on a continuous stream.
+- Raise the receive high-water mark (`RCVHWM`) on FTIO and `SNDHWM` on the
+  publishers so a prediction burst does not cause drops.
+- One stable collector, many transient publishers → let FTIO bind (it does) and
+  the ranks `connect`.
+- There is no liveness feedback to the sender.
+
+```bash
+predictor --zmq --zmq_socket pub-sub -f 10 --phase-automaton
+```
 
 ---
 
@@ -212,6 +242,50 @@ while True:
    # Single-shot analysis
    ftio --zmq --zmq_source tmio -m write_async -f 100
    ```
+
+---
+
+## ZMQ with FlexMPI
+
+FlexMPI applications emit a per-iteration monitor stream that FTIO can consume
+with `--zmq_format flexmpi`. Each message is a MessagePack map, one per rank per
+monitored iteration:
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `rank` | int | MPI rank id of the sender. |
+| `size` | int | MPI communicator size — taken as the number of ranks. |
+| `iter` | int | Iteration counter. |
+| `flops` | float | Floating-point ops in this iteration. |
+| `mflops` | float | MFLOP/s in this iteration. |
+| `rtime` | float | Cumulative wall-clock run time (s) at this point. |
+| `ptime` | float | Compute time of this iteration (s). |
+| `ctime` | float | Communication time of this iteration (s). |
+| `iotime` | float | I/O time of this iteration (s). |
+
+> **Note — this is a starting point, not a finished mapping.** A FlexMPI message
+> carries **no bandwidth or bytes field**, so unlike `direct` there is nothing to
+> feed straight into the frequency analysis. `ftio/parse/flexmpi_reader.py`
+> derives an I/O signal from the timing fields: by default it treats `iotime` as
+> the periodic amplitude and places the sample in `[rtime - iotime, rtime]`.
+> The two functions `_io_signal()` and `_interval()` in that module are
+> documented placeholders — adapt them to your setup (e.g. compute a real
+> `bytes / iotime` bandwidth if the monitor is extended to report I/O volume, or
+> switch the time base to `iter`).
+
+**Start the receiver:**
+
+```bash
+# push-pull (default) — the FlexMPI monitor must PUSH-connect to port 5555
+predictor --zmq --zmq_format flexmpi -f 10 --phase-automaton
+
+# pub-sub — the FlexMPI monitor PUB-connects; it never blocks on send
+predictor --zmq --zmq_format flexmpi --zmq_socket pub-sub -f 10 --phase-automaton
+```
+
+The reference FlexMPI listener uses `SUB` bound to port 5555 with an empty
+subscription ("no topic: get all"); point the monitor at FTIO instead and, for
+`pub-sub`, have it `connect` rather than `bind`.
 
 ---
 
