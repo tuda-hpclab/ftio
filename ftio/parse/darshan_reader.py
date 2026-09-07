@@ -26,13 +26,21 @@ from rich.console import Console
 # darshan is optional: this module is imported unconditionally via
 # ftio.parse.scales -> parse_darshan, so a hard import made every FTIO command
 # unusable wherever darshan is missing or broken, just to read Darshan traces.
+# find_spec() only tells us the Python package exists; actually importing it can
+# still fail (e.g. the darshan-util C library is not installed), so guard the
+# import itself and degrade to "unavailable" on any failure.
+_DARSHAN_IMPORT_ERROR: str = ""
 DARSHAN_AVAILABLE: bool = importlib.util.find_spec("darshan") is not None
 if DARSHAN_AVAILABLE:
-    import darshan
+    try:
+        import darshan
+    except Exception as _exc:  # pragma: no cover - environment dependent
+        DARSHAN_AVAILABLE = False
+        _DARSHAN_IMPORT_ERROR = f"{type(_exc).__name__}: {_exc}"
 
 DARSHAN_MISSING_MSG = (
     "Reading a Darshan trace needs the optional 'darshan' package, which is not "
-    "installed.\nInstall FTIO with Darshan support:\n"
+    "installed (or failed to import).\nInstall FTIO with Darshan support:\n"
     "    pip install 'ftio-hpc[darshan-libs]'\n"
     "or, from a clone:\n"
     "    pip install '.[darshan-libs]'\n"
@@ -40,6 +48,8 @@ DARSHAN_MISSING_MSG = (
     "bindings but not the library, so on Python 3.13/3.14 build darshan-util from "
     "source as well (see the README, Installation)."
 )
+if _DARSHAN_IMPORT_ERROR:
+    DARSHAN_MISSING_MSG += f"\nImport error was: {_DARSHAN_IMPORT_ERROR}"
 
 
 def extract(path, args) -> tuple[dict, int]:
