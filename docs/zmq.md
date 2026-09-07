@@ -254,24 +254,14 @@ monitored iteration:
 | Key | Type | Description |
 |-----|------|-------------|
 | `rank` | int | MPI rank id of the sender. |
-| `size` | int | MPI communicator size — taken as the number of ranks. |
-| `iter` | int | Iteration counter. |
-| `flops` | float | Floating-point ops in this iteration. |
-| `mflops` | float | MFLOP/s in this iteration. |
+| `size` | int | Bytes transferred during this iteration's I/O. |
+| `iotime` | float | Duration of that I/O (s). |
 | `rtime` | float | Cumulative wall-clock run time (s) at this point. |
-| `ptime` | float | Compute time of this iteration (s). |
-| `ctime` | float | Communication time of this iteration (s). |
-| `iotime` | float | I/O time of this iteration (s). |
+| `iter` | int | Iteration counter. |
+| `flops`, `mflops`, `ptime`, `ctime` | float | Compute / communication monitoring metrics (not used by the frequency analysis). |
 
-> **Note — this is a starting point, not a finished mapping.** A FlexMPI message
-> carries **no bandwidth or bytes field**, so unlike `direct` there is nothing to
-> feed straight into the frequency analysis. `ftio/parse/flexmpi_reader.py`
-> derives an I/O signal from the timing fields: by default it treats `iotime` as
-> the periodic amplitude and places the sample in `[rtime - iotime, rtime]`.
-> The two functions `_io_signal()` and `_interval()` in that module are
-> documented placeholders — adapt them to your setup (e.g. compute a real
-> `bytes / iotime` bandwidth if the monitor is extended to report I/O volume, or
-> switch the time base to `iter`).
+`ftio/parse/flexmpi_reader.py` turns each message into a bandwidth sample:
+`size / iotime` over the interval `[rtime - iotime, rtime]`.
 
 **Start the receiver:**
 

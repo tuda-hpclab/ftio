@@ -569,13 +569,10 @@ Full documentation:
             choices=["push-pull", "pub-sub"],
             default="push-pull",
             help=(
-                "ZMQ pattern for the incoming metric stream: 'push-pull' (default) "
-                "binds a PULL socket -- reliable, but a PUSH sender blocks once the "
-                "high-water mark is reached if FTIO is slow or absent. 'pub-sub' binds "
-                "a SUB socket (subscribed to all topics) -- a PUB sender never blocks "
-                "and drops instead, which is the safer choice when the sender is a "
-                "running HPC application that must not be perturbed. The reply channel "
-                "(--zmq_port_reply) is unaffected and stays PUSH/PULL"
+                "ZMQ pattern for the incoming stream: 'push-pull' (default) binds "
+                "PULL (reliable, PUSH sender blocks on back-pressure); 'pub-sub' binds "
+                "SUB (a PUB sender never blocks and drops instead). The reply channel "
+                "stays PUSH/PULL"
             ),
         )
         group.add_argument(

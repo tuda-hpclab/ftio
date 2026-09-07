@@ -64,9 +64,7 @@ def predictor_with_processes_zmq(
     max_predictions = getattr(tmp_args, "max_predictions", 0)
     pattern = getattr(tmp_args, "zmq_socket", "push-pull")
 
-    # bind the incoming socket; the reply socket (if any) is opened once here.
-    # --zmq_socket selects PULL (push-pull) or SUB (pub-sub) -- see
-    # ftio.parse.zmq_socket. The reply socket stays PUSH regardless.
+    # incoming socket type from --zmq_socket; the reply socket stays PUSH
     socket_in = setup_socket(addr, port_in, recv_socket_type(pattern))
     socket_out = None
     if return_data:
@@ -133,8 +131,7 @@ def setup_socket(addr: str, port: str, socket_type=zmq.PULL, bind: bool = True):
     """Bind the ZMQ socket, retrying with a corrected IP if necessary."""
     context = zmq.Context()
     socket = context.socket(socket_type)
-    # a SUB socket receives nothing until subscribed (no-op for PULL/PUSH)
-    subscribe_all(socket)
+    subscribe_all(socket)  # no-op unless SUB
     if not bind and addr == "*":
         addr = "127.0.0.1"
     try:

@@ -42,16 +42,8 @@ class ParseZmq:
 
         source = args.zmq_source.lower()
         if "direct" in source or "flexmpi" in source:
-            # Multiple messages can arrive in one drain cycle (see
-            # processes_zmq.receive_messages) -- keep every one of them
-            # instead of only the last, same as jsonl/msgpack do for their
-            # own multi-part files. ext="jsonl" reuses that existing
-            # multi-part merge path (Simrun.merge_parts): each extract()
-            # shapes its message like one JSONL line/part.
-            #
-            # 'flexmpi' differs from 'direct' only in the per-message decoder:
-            # a FlexMPI monitor map has no bandwidth field, so flexmpi_reader
-            # derives an I/O signal from it (see that module).
+            # one Simrun part per message, merged via the jsonl path;
+            # flexmpi only swaps the per-message decoder
             reader = extract_flexmpi if "flexmpi" in source else extract
             dataframes = []
             ranks = 0

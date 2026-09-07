@@ -24,7 +24,7 @@ def _bandwidth(data: dict) -> dict:
 def _msg(**overrides) -> bytes:
     fields = {
         "rank": 0,
-        "size": 8,
+        "size": 4000,
         "iter": 1,
         "flops": 1.0e9,
         "mflops": 1000.0,
@@ -37,24 +37,19 @@ def _msg(**overrides) -> bytes:
     return msgpack.packb(fields)
 
 
-def test_single_message_is_one_rank_level_sample():
-    data, ranks = extract(_msg(rtime=10.0, iotime=0.4), [])
+def test_bandwidth_is_size_over_iotime():
+    data, ranks = extract(_msg(size=4000, rtime=10.0, iotime=0.4), [])
 
-    assert ranks == 8  # from the "size" field
+    assert ranks == 0
     bw = _bandwidth(data)
-    assert bw["b_rank_avr"] == [0.4]  # placeholder signal == iotime
+    assert bw["b_rank_avr"] == [pytest.approx(10000.0)]  # size / iotime
     assert bw["t_rank_s"] == [pytest.approx(9.6)]  # rtime - iotime
     assert bw["t_rank_e"] == [pytest.approx(10.0)]  # rtime
+    assert data[MODE]["total_bytes"] == 4000
 
 
-def test_size_absent_gives_zero_ranks():
-    raw = {"rank": 0, "iter": 1, "rtime": 5.0, "iotime": 0.0}
-    _, ranks = extract(msgpack.packb(raw), [])
-    assert ranks == 0
-
-
-def test_zero_iotime_is_a_zero_width_sample():
-    data, _ = extract(_msg(rtime=7.0, iotime=0.0), [])
+def test_zero_iotime_is_a_zero_width_zero_bandwidth_sample():
+    data, _ = extract(_msg(size=4000, rtime=7.0, iotime=0.0), [])
     bw = _bandwidth(data)
     assert bw["b_rank_avr"] == [0.0]
     assert bw["t_rank_s"] == [pytest.approx(7.0)]
@@ -74,10 +69,10 @@ def test_end_to_end_prediction():
     msgs = []
     for i in range(40):
         iotime = 0.5 if i % 2 == 0 else 0.0
-        msgs.append(_msg(rank=0, size=4, iter=i, rtime=float(i) + iotime, iotime=iotime))
+        size = 5.0e8 if iotime else 0.0
+        msgs.append(_msg(iter=i, size=size, rtime=float(i) + iotime, iotime=iotime))
 
     preds, _ = main(
         ["ftio", "--zmq", "--zmq_format", "flexmpi", "-e", "no", "-f", "10"], msgs
     )
     assert preds and preds[0].t_end > preds[0].t_start
-    assert preds[0].ranks == 4
