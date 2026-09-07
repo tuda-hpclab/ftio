@@ -15,9 +15,11 @@ https://github.com/tuda-parallel/FTIO/blob/main/LICENSE
 import zmq
 
 from ftio.freq.helper import MyConsole
+from ftio.parse.flexmpi_reader import extract as extract_flexmpi
 from ftio.parse.msgpack_reader import extract_data
 from ftio.parse.simrun import Simrun
 from ftio.parse.zmq_reader import extract
+from ftio.parse.zmq_socket import recv_socket_type, subscribe_all
 
 
 class ParseZmq:
@@ -38,20 +40,26 @@ class ParseZmq:
         if self.msgs is None:
             self.msgs = get_msgs_zmq(args)
 
-        if "direct" in args.zmq_source:
+        source = args.zmq_source.lower()
+        if "direct" in source or "flexmpi" in source:
             # Multiple messages can arrive in one drain cycle (see
             # processes_zmq.receive_messages) -- keep every one of them
             # instead of only the last, same as jsonl/msgpack do for their
             # own multi-part files. ext="jsonl" reuses that existing
-            # multi-part merge path (Simrun.merge_parts): extract() already
-            # shapes each message like one JSONL line/part.
+            # multi-part merge path (Simrun.merge_parts): each extract()
+            # shapes its message like one JSONL line/part.
+            #
+            # 'flexmpi' differs from 'direct' only in the per-message decoder:
+            # a FlexMPI monitor map has no bandwidth field, so flexmpi_reader
+            # derives an I/O signal from it (see that module).
+            reader = extract_flexmpi if "flexmpi" in source else extract
             dataframes = []
             ranks = 0
             for msg in self.msgs:
-                dataframe, ranks = extract(msg, args)
+                dataframe, ranks = reader(msg, args)
                 dataframes.append(dataframe)
             return Simrun(dataframes, "jsonl", str(ranks), args, index)
-        elif "tmio" in args.zmq_source.lower():
+        elif "tmio" in source:
             data = extract_data(self.msgs[0], [])
             return Simrun(data, "msgpack", "0", args, index)
         else:
@@ -63,7 +71,9 @@ def get_msgs_zmq(args) -> list[str]:
     CONSOLE = MyConsole()
     CONSOLE.set(True)
     context = zmq.Context()
-    socket = context.socket(socket_type=zmq.PULL)
+    pattern = getattr(args, "zmq_socket", "push-pull")
+    socket = context.socket(socket_type=recv_socket_type(pattern))
+    subscribe_all(socket)  # no-op unless this is a SUB socket
 
     # socket.bind('tcp://*:5555')
     socket.bind(f"tcp://{args.zmq_address}:{args.zmq_port}")

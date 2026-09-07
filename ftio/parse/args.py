@@ -550,13 +550,32 @@ Full documentation:
             "--zmq-source",
             dest="zmq_source",
             type=str,
-            choices=["direct", "tmio"],
+            choices=["direct", "tmio", "flexmpi"],
             default="direct",
             help=(
                 "encoding of the ZMQ payload: 'direct' (default) for raw bandwidth / "
-                "start / end triples, or 'tmio' for a msgpack-encoded TMIO buffer. "
+                "start / end triples, 'tmio' for a msgpack-encoded TMIO buffer, or "
+                "'flexmpi' for a msgpack map of FlexMPI monitor metrics "
+                "(rank/size/iter/flops/mflops/rtime/ptime/ctime/iotime). "
                 "--zmq_source is a legacy alias of this flag. Unrelated to --source, "
                 "which selects the on-disk file format"
+            ),
+        )
+        group.add_argument(
+            "--zmq_socket",
+            "--zmq-socket",
+            dest="zmq_socket",
+            type=str,
+            choices=["push-pull", "pub-sub"],
+            default="push-pull",
+            help=(
+                "ZMQ pattern for the incoming metric stream: 'push-pull' (default) "
+                "binds a PULL socket -- reliable, but a PUSH sender blocks once the "
+                "high-water mark is reached if FTIO is slow or absent. 'pub-sub' binds "
+                "a SUB socket (subscribed to all topics) -- a PUB sender never blocks "
+                "and drops instead, which is the safer choice when the sender is a "
+                "running HPC application that must not be perturbed. The reply channel "
+                "(--zmq_port_reply) is unaffected and stays PUSH/PULL"
             ),
         )
         group.add_argument(
