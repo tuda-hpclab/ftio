@@ -1,7 +1,5 @@
 """
-Decode a single FlexMPI-monitor ZMQ message into the internal FTIO data
-structure (the same shape ``ftio.parse.zmq_reader.extract`` produces for the
-``direct`` wire format).
+Decode a single FlexMPI-monitor ZMQ message into the internal FTIO
 
 Wire format (``--zmq_format flexmpi``)
 -------------------------------------
@@ -18,20 +16,7 @@ One msgpack-encoded map per rank per monitored iteration, e.g.::
         "ctime":  0.3,      # communication time of this iteration [s]
         "iotime": 0.4,      # I/O time of this iteration [s]
     }
-
-The reference listener that motivated this format:
-https://github.com/tuda-parallel/FTIO  (see the FlexMPI monitor SUB example)
-
-.. important::
-
-   FlexMPI messages carry **no bandwidth / bytes field**, so unlike the
-   ``direct`` format there is nothing to feed straight into the frequency
-   analysis.  :func:`_io_signal` and :func:`_interval` below are deliberate
-   **placeholders** -- they build a plausible periodic signal out of the
-   timing fields so the pipeline runs end to end.  Adapt them once the exact
-   semantics of the FlexMPI fields for your setup are known (in particular
-   whether any field encodes I/O volume in bytes).
-
+    
 Author: Ahmad Tarraf
 Copyright (c) 2024-2026 TU Darmstadt, Germany
 Version: v0.0.9
@@ -67,26 +52,7 @@ _FIELDS = (
 
 
 def extract(msg: bytes, args) -> tuple[dict, int]:
-    """Decode one FlexMPI message into ``(data, ranks)``.
-
-    Mirrors :func:`ftio.parse.zmq_reader.extract`: the returned ``data`` is a
-    ``{mode: io_data, "io_time": io_time}`` dict shaped like one JSONL part, so
-    ``ParseZmq.to_simrun`` can hand a batch of them to ``Simrun`` via the
-    existing multi-part merge path.
-
-    Each message is one rank / one iteration, so it contributes a single
-    ``(b, ts, te)`` sample.  A drain cycle delivers many such messages; the
-    merge step concatenates them into the per-rank interval arrays that the
-    overlap step downstream turns into an application-level bandwidth.
-
-    .. note::
-
-       With more than one rank, samples from different ranks are simply
-       concatenated (and the shared timeline is then non-monotonic).  The
-       overlap step tolerates that, but the cleaner fix -- once you adapt
-       this module -- is to group the batch by ``iter`` and emit one
-       aggregated sample per iteration (sum ``iotime`` across ranks, or take
-       the max, depending on whether I/O is collective).
+    """Decode FlexMPI message into ``(data, ranks)``.
 
     Args:
         msg: raw msgpack bytes from the ZMQ socket.
@@ -106,8 +72,7 @@ def extract(msg: bytes, args) -> tuple[dict, int]:
     ts, te = _interval(fields)
 
     io_data["number_of_ranks"] = ranks
-    # No bytes field on the wire -- leave total_bytes at 0 unless a future
-    # revision of the FlexMPI monitor adds one (then read it here).
+    # No bytes field on the wire 
     io_data["total_bytes"] = int(fields.get("bytes", 0) or 0)
 
     bw = io_data["bandwidth"]
@@ -147,32 +112,6 @@ def _io_signal(fields: dict) -> float:
     -------------------------------------------------------------------------
     PLACEHOLDER -- adapt to the real FlexMPI semantics.
     -------------------------------------------------------------------------
-    The transform only needs a signal whose *amplitude rises and falls with
-    the I/O phases*; the physical unit is irrelevant to periodicity detection.
-
-    Current choice: ``iotime`` -- seconds this rank spent in I/O during the
-    iteration.  It is 0 on compute-only iterations and jumps up on the
-    periodic checkpoint/output iterations, which is exactly the square-ish
-    wave FTIO looks for.
-
-    Better options once the fields are pinned down, roughly in order of
-    preference:
-
-      1. **True bandwidth** ``bytes_written / iotime`` -- if the monitor is
-         extended to report I/O volume (add a ``"bytes"`` field and use it
-         here).  This is the only option that yields a physically meaningful
-         MiB/s figure downstream.
-
-      2. **I/O fraction** ``iotime / (ptime + ctime + iotime)`` -- normalises
-         out variable iteration length; robust when iterations are not
-         uniform in wall-clock duration.
-
-      3. **iotime** (current) -- simplest; fine when iterations are roughly
-         equal length.
-
-    Do NOT use ``flops`` / ``mflops`` here -- those track the *compute* phase,
-    which is the inverse of the I/O phase and would make FTIO report the
-    compute periodicity instead.
     """
     iotime = float(fields.get("iotime", 0.0) or 0.0)
     return iotime
@@ -190,16 +129,6 @@ def _interval(fields: dict) -> tuple[float, float]:
     -------------------------------------------------------------------------
     PLACEHOLDER -- adapt to the real FlexMPI semantics.
     -------------------------------------------------------------------------
-    Assumes ``rtime`` is the *cumulative* wall-clock run time at the end of
-    the iteration, so the I/O of this iteration occupies the last ``iotime``
-    seconds before it:  ``ts = rtime - iotime``, ``te = rtime``.
-
-    This reader is stateless (one call per message), so it cannot accumulate
-    its own clock -- it relies on ``rtime`` being monotonic across a rank's
-    messages.  If ``rtime`` turns out to be *per-iteration* rather than
-    cumulative, replace this with a running sum kept by the caller, or switch
-    the time base to ``iter`` (uniform spacing: ``ts = iter``, ``te = iter+1``)
-    and let the resampler handle the rest.
     """
     rtime = float(fields.get("rtime", 0.0) or 0.0)
     iotime = float(fields.get("iotime", 0.0) or 0.0)
