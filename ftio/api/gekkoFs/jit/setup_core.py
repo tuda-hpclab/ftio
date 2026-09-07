@@ -1120,9 +1120,10 @@ def start_application(settings: JitSettings, runtime: JitTime):
                     if os.environ.get("JIT_STRACE") == "1"
                     else ""
                 )
-                app_invocation = (
-                    f'bash -c "{gkfs_env}{strace_prefix}{app_call} {settings.app_flags}"'
+                ulimit_prefix = (
+                    "ulimit -s unlimited; " if settings.stack_unlimited else ""
                 )
+                app_invocation = f'bash -c "{ulimit_prefix}{gkfs_env}{strace_prefix}{app_call} {settings.app_flags}"'
             else:
                 # Legacy / FUSE mode: pass GekkoFS vars via srun --export
                 if not settings.exclude_ftio:

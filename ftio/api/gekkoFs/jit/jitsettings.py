@@ -158,6 +158,7 @@ class JitSettings:
         self.procs_cargo = 0
         self.procs_app = 0
         self.cpus_per_task_app = 0  # --cpus-per-task; defaults to procs_app below
+        self.stack_unlimited = False  # wrap the app launch in `ulimit -s unlimited`
         self.procs_ftio = 0
         self.fuse_idle_threads = 0  # finalized in parse_options after procs_app is set
         self.cmd_call = ""
@@ -510,9 +511,18 @@ class JitSettings:
             # atoms/rank (default 169_344) makes the pfs win band-independent.
             atoms_per_rank = int(os.getenv("LAMMPS_ATOMS_PER_RANK", "169344"))
             n = self.weak_scale_lattice((self.nodes - 1) * self.procs_app, atoms_per_rank)
+            # Restart writer count. LAMMPS_MP=1 turns on multi-file ("%") restarts
+            # (in.ckpt handles the branch), LAMMPS_NF sets the writer-group count
+            # -- default one group per app node. lessons.md sec.3: single-writer
+            # (mp=0) restart is rank-0-only, so each per-rank record falls under
+            # one 512 KB chunk at scale and lands on a single daemon; mp=1 is the
+            # structural fix. Tracked as the second LAMMPS config variant.
+            lammps_mp = os.getenv("LAMMPS_MP", "0")
+            lammps_nf = os.getenv("LAMMPS_NF", str(self.nodes - 1))
             self.app_flags = self.resolve_app_flags(
                 f"-in {self.run_dir}/in.ckpt -v ckptdir {ckptdir} "
                 f"-v x {n} -v y {n} -v z {n} "
+                f"-v mp {lammps_mp} -v nf {lammps_nf} "
                 # 54 phases: nsteps = phases*every + tail = 818 = ~100 s at 8 compute
                 # nodes (0.12 s/step measured in 43420026). Per-rank work is fixed
                 # by the weak scaling, so wall time stays flat as nodes grow, but
@@ -533,19 +543,14 @@ class JitSettings:
             workload = os.getenv("WORKLOAD")
             # if not set, take a fixed one
             if workload is None:
-                # workload = "cosmoflow_a100"
-                # workload = "bert"
-                # workload = "bert_small"
-                # workload = "bert_v100_pytorch" #paper
-                # workload = "bert_v100_pytorch_2" # good
-                # workload = "resnet50_v100"# work with fues on bsc
-                # workload = "resnet50_v100_new"  # bsc best for real test
-                workload = "resnet50_v100_new_small"  # bsc
-                # workload = "bert_v100_pytorch_allranksyaml "
-                # workload = "unet3d_my_a100"
-                # workload = "resnet50_my_a100"
-                # workload = "llama_my_7b_zero3"
-                # workload = "resnet50_my_a100_pytorch"
+                # GLASS paper (paper/dlio/DLIO_20GB): pytorch framework + npz
+                # format -> no h5py import, so no libhdf5.so.103 break. The old
+                # default resnet50_v100_new_small is framework: tensorflow, and
+                # keras eager-imports h5py at startup -> ImportError on every leg.
+                # DLIO_20GB won 1.15-1.26x vs pfs in the paper; DLIO_40GB 1.31x.
+                # workload = "resnet50_v100_new_small"  # tensorflow -> h5py break
+                # workload = "llama_my_7b_zero3"        # zero_stage=3 metadata storm
+                workload = "resnet50_my_a100_pytorch"
             # ensure surrounding spaces
             workload = f" workload={workload} "
         #  ├─ S3D-IO
@@ -554,23 +559,43 @@ class JitSettings:
             # (/lustre/project/nhr-gekko/shared/...) does not exist on BSC, so
             # -a s3d could never run there even though the binary is installed.
             self.app_call = os.getenv("S3D_BIN", f"{self.home}/S3D-IO/s3d_io.x")
+            # A big local subdomain (fixed_grid3d at low PROCS gives each rank a
+            # much larger block than weak_scale_grid3d ever did -- e.g. 512 MB/rank
+            # at PROCS=8/16+1/800^3) overflows the default 8 MB stack if S3D-IO
+            # keeps that block on the stack rather than heap-allocating it, and the
+            # GekkoFS interceptor's extra call-stack depth is what tips a marginal
+            # allocation over: job 45408816 (PROCS=8, fixed 800^3, 16+1) SIGSEGV'd
+            # inside pnetcdf_write on the glass/gekko (intercepted) legs only --
+            # the pfs leg, same binary and buffer size, no interception, ran clean.
+            # Same class of fix as WRF's ideal.exe (jitsettings.py pre_app_call).
+            self.stack_unlimited = True
             # S3D-IO's own output-path CLI arg was a bare "." -- resolved against
             # jit's cwd (the job's $HOME/jit/<jobid>/ dir), which has a quota and
             # is not meant for parallel I/O (same class of bug prepare_run_dir was
             # built for -- see its docstring). Route to scratch instead.
             self.run_dir = self.prepare_run_dir(f"{self.home}/S3D-IO", files=[])
             if not self.app_flags:  # default value if app_flags is not set
-                # S3D_EDGE_PER_RANK: per-rank subdomain edge. 64^3 grid points *
-                # 16 double-precision "planes" (mass:11 + velocity:3 + pressure:1 +
-                # temperature:1, see S3D-IO/README.md) * 8 bytes = ~33.5 MB/rank
-                # record -- see weak_scale_grid3d for why this replaces the old
-                # fixed-800 recipe (paper/s3d-io/*) that was accidentally strong
-                # scaling, not weak.
-                edge_per_rank = int(os.getenv("S3D_EDGE_PER_RANK", "64"))
                 ranks = (self.nodes - 1) * self.procs_app
-                nx_g, ny_g, nz_g, npx, npy, npz = self.weak_scale_grid3d(
-                    ranks, edge_per_rank
-                )
+                # Two sizing modes:
+                #  - S3D_GLOBAL_EDGE set  -> fixed_grid3d, the GLASS paper recipe
+                #    (paper/s3d-io/serial_800 = 800): a ~62 GB aggregate checkpoint
+                #    at every node count, so PFS's collective write is genuinely
+                #    slow and GLASS's incremental flush has something to beat. Run
+                #    this with PROCS=64 (the paper's -p 64) for the golden-goal
+                #    comparison.
+                #  - otherwise            -> weak_scale_grid3d via S3D_EDGE_PER_RANK
+                #    (default 64 -> ~33.5 MB/rank): per-rank record fixed, aggregate
+                #    grows with the job. A scaling study, not a GLASS win at small N.
+                global_edge = os.getenv("S3D_GLOBAL_EDGE")
+                if global_edge:
+                    nx_g, ny_g, nz_g, npx, npy, npz = self.fixed_grid3d(
+                        ranks, int(global_edge)
+                    )
+                else:
+                    edge_per_rank = int(os.getenv("S3D_EDGE_PER_RANK", "64"))
+                    nx_g, ny_g, nz_g, npx, npy, npz = self.weak_scale_grid3d(
+                        ranks, edge_per_rank
+                    )
                 self.app_flags = f"{nx_g} {ny_g} {nz_g} {npx} {npy} {npz} 0 F ."
         #  ├─ WRF
         elif "wrf" in self.app:
@@ -694,8 +719,25 @@ class JitSettings:
             self.point_qmcpack_output_at(
                 self.gkfs_mntdir if not self.exclude_daemon else self.run_dir
             )
-            # QMCPACK auto-threads from --cpus-per-task; keep it at 1 thread/rank.
-            self.cpus_per_task_app = 1
+            # Run QMC at PROCS=8 -- the config behind every table-1 QMC win.
+            # "-p 56" was documented as "current best" but never validated, and it
+            # broke two ways: QMCPACK auto-threads from --cpus-per-task (56x56 =
+            # 3136 threads/node, ~28x oversubscribed), and 56 ranks/node x 8192
+            # walkers/rank put ~68 GB of walker buffers on each node -> the 32+1
+            # run stalled 90 min in walker setup (job 45335439, same class as the
+            # 16384-walker hang in 44475461). cpus_per_task_app=2 keeps 2 OMP
+            # threads/rank (1 starves the GekkoFS RPC-progress thread).
+            self.cpus_per_task_app = 2
+            # glass.xml's <walkers> is PER RANK. Node memory for the walker
+            # buffers is per_rank * omp_threads * 73808 B * ranks_per_node, so at
+            # PROCS=8 / 2 threads the safe ceiling is ~32k walkers/rank. Pin the
+            # aggregate instead (QMC_TOTAL_WALKERS, default 2M = ~4x the historical
+            # baseline, well under the ~7M that ran clean at 16+1): the per-section
+            # config.h5 checkpoint -- what GLASS's incremental flush has to beat
+            # gekko's end drain on -- stays a fixed large size at every node count,
+            # and bumping the env var is the golden-goal lever for a wider margin.
+            ranks = (self.nodes - 1) * self.procs_app
+            self.set_qmc_walkers(int(os.getenv("QMC_TOTAL_WALKERS", "2000000")), ranks)
         else:
             self.app_call = ""
             self.run_dir = ""
@@ -1261,20 +1303,32 @@ class JitSettings:
         return max(1, files_per_rank * max(1, ranks))
 
     @staticmethod
+    def _factor3(ranks: int) -> tuple[int, int, int]:
+        """Balanced 3-way factorization of `ranks` -> (npx, npy, npz), npx>=npy>=npz.
+
+        Peel the largest divisor <= cube root first, then the largest divisor of
+        what's left <= sqrt of it. Shared by weak_scale_grid3d and fixed_grid3d.
+        """
+        ranks = max(1, ranks)
+        npz = max(d for d in range(1, ranks + 1) if ranks % d == 0 and d * d * d <= ranks)
+        rem = ranks // npz
+        npy = max(d for d in range(1, rem + 1) if rem % d == 0 and d * d <= rem)
+        npx = rem // npy
+        return npx, npy, npz
+
+    @staticmethod
     def weak_scale_grid3d(
         ranks: int, edge_per_rank: int
     ) -> tuple[int, int, int, int, int, int]:
         """S3D-IO process grid + global domain that keeps each rank's subdomain fixed.
 
-        S3D-IO's own README calls itself a weak-scaling benchmark ("aggregate I/O
-        amount proportionally increases" with rank count), but the historical BSC
-        recipe (paper/s3d-io/*/README) held nx_g=ny_g=nz_g=800 fixed while npx*npy*npz
-        grew -- that is strong scaling (shrinking per-rank subdomain), the same
-        fixed-checkpoint mistake already fixed for LAMMPS/WarpX
-        (weak_scale_lattice/weak_scale_cells). Here nx_g/ny_g/nz_g = npx/npy/npz *
-        edge_per_rank instead, so each rank always writes the same subdomain volume
-        regardless of node count, and nx_g is always an exact multiple of npx (S3D-IO
-        block-partitions each dimension; a non-exact split is undefined behavior).
+        Weak scaling: nx_g/ny_g/nz_g = npx/npy/npz * edge_per_rank, so each rank
+        always writes the same subdomain volume regardless of node count and the
+        aggregate checkpoint grows with the job. Fine for scaling studies, but at
+        small node counts the aggregate is only a few GB and PFS writes it fast
+        enough that GLASS's incremental flush has nothing to beat -- for the
+        golden-goal comparison use fixed_grid3d (the GLASS paper recipe) instead,
+        which pins a large aggregate checkpoint at every node count.
 
         Args:
             ranks (int): Total application ranks (must equal npx*npy*npz exactly --
@@ -1284,17 +1338,43 @@ class JitSettings:
         Returns:
             tuple[int, int, int, int, int, int]: (nx_g, ny_g, nz_g, npx, npy, npz).
         """
-        ranks = max(1, ranks)
-        # Balanced 3-way factorization of `ranks`: peel the largest divisor <=
-        # cube root first, then the largest divisor of what's left <= sqrt of it.
-        npz = max(d for d in range(1, ranks + 1) if ranks % d == 0 and d * d * d <= ranks)
-        rem = ranks // npz
-        npy = max(d for d in range(1, rem + 1) if rem % d == 0 and d * d <= rem)
-        npx = rem // npy
+        npx, npy, npz = JitSettings._factor3(ranks)
         return (
             npx * edge_per_rank,
             npy * edge_per_rank,
             npz * edge_per_rank,
+            npx,
+            npy,
+            npz,
+        )
+
+    @staticmethod
+    def fixed_grid3d(ranks: int, global_edge: int) -> tuple[int, int, int, int, int, int]:
+        """S3D-IO process grid + a fixed global domain (the GLASS paper recipe).
+
+        paper/s3d-io/serial_800 held nx_g=ny_g=nz_g=800 while npx*npy*npz grew with
+        the job -- the aggregate checkpoint stays ~62 GB at every node count, so
+        PFS's collective write is genuinely slow and GLASS beats both PFS and gekko
+        at every point 3-33N in the paper. Per-rank work shrinks with scale (strong
+        scaling of the grid), which is the price of a fixed large checkpoint and
+        exactly what makes it a GLASS benchmark rather than a scaling study.
+
+        Each global edge is rounded down to an exact multiple of its process-grid
+        dimension (S3D-IO block-partitions each dimension; a non-exact split is
+        undefined behavior), so the realized grid is <= global_edge on each axis.
+
+        Args:
+            ranks (int): Total application ranks (== npx*npy*npz exactly).
+            global_edge (int): Target global domain edge on each axis.
+
+        Returns:
+            tuple[int, int, int, int, int, int]: (nx_g, ny_g, nz_g, npx, npy, npz).
+        """
+        npx, npy, npz = JitSettings._factor3(ranks)
+        return (
+            (global_edge // npx) * npx,
+            (global_edge // npy) * npy,
+            (global_edge // npz) * npz,
             npx,
             npy,
             npz,
@@ -1574,6 +1654,42 @@ class JitSettings:
                 self.update_files_with_gkfs_mntdir.append(xml)
         except OSError as e:
             console.print(f"[yellow]Could not set the project id in {xml}: {e}[/]")
+
+    def set_qmc_walkers(self, total: int, ranks: int, per_rank_cap: int = 24000) -> None:
+        """Rewrite every <walkers> in glass.xml to a memory- and total-bounded value.
+
+        glass.xml's walkers value is per MPI rank. Two limits apply:
+          * per node: per_rank * omp_threads * 73808 B * ranks_per_node must fit
+            RAM, so per_rank is capped (``per_rank_cap``, ~24k for PROCS=8 / 2
+            OMP threads -- job 44475461 hung at 16384/rank once thread-cloning is
+            counted);
+          * aggregate: QMCPACK's walker setup is ~O(total) and serial before the
+            first VMC block, so ``total`` bounds the sum (job 45335439 stalled
+            90 min at 14.7M; 16+1 ran 7.3M clean).
+        Pinning the aggregate keeps the per-section config.h5 checkpoint a
+        constant large size at every node count -- the size GLASS's incremental
+        flush has to beat gekko's end drain on.
+
+        Args:
+            total (int): Target aggregate walker count across all ranks.
+            ranks (int): Total application MPI ranks.
+            per_rank_cap (int): Hard ceiling on walkers per rank (node-RAM bound).
+        """
+        per_rank = min(per_rank_cap, max(64, total // max(1, ranks)))
+        xml = os.path.join(self.run_dir, "glass.xml")
+        try:
+            with open(xml) as f:
+                text = f.read()
+            rewritten = re.sub(
+                r'(<parameter name="walkers"\s*>\s*)\d+(\s*</parameter>)',
+                rf"\g<1>{per_rank}\g<2>",
+                text,
+            )
+            if rewritten != text:
+                with open(xml, "w") as f:
+                    f.write(rewritten)
+        except OSError as e:
+            console.print(f"[yellow]Could not set QMC walkers in {xml}: {e}[/]")
 
     def select_regexes(self) -> None:
         """Pick the flush / stage-out / stage-in patterns for the current app.

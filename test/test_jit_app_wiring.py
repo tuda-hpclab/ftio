@@ -216,7 +216,7 @@ def test_no_app_is_wired_with_the_cdf_cpf_cluster_aliases():
 # ── cpus-per-task must not scale with procs_app for auto-threading apps ─────
 
 
-def test_qmcpack_pins_one_cpu_per_task_regardless_of_procs_app():
+def test_qmcpack_pins_a_low_fixed_cpus_per_task_regardless_of_procs_app():
     """QMCPACK reads --cpus-per-task and spawns that many OpenMP threads per
     rank on top of its walker-level MPI parallelism. The shared srun launch
     line ties --cpus-per-task to procs_app, so raising procs_app for more MPI
@@ -225,10 +225,16 @@ def test_qmcpack_pins_one_cpu_per_task_regardless_of_procs_app():
     112-core node -- confirmed the cause of a 6-8x slowdown vs. the
     procs_app=8 baseline (2026-09-01).
 
+    Pinning cpus_per_task_app to 1 fixes the oversubscription but hangs at
+    launch (job 45275298/87/88, 2026-09-01): GekkoFS's client intercept needs
+    its own progress thread alongside the app thread, so 1 core/rank starves
+    it too. 2 threads/rank (56 ranks * 2 = 112, exactly the node's core count,
+    no oversubscription) is the fix.
+
     set_variables() defaults cpus_per_task_app to procs_app (every other app
-    keeps its current launch shape) and must override it to a fixed 1 inside
-    the qmcpack branch specifically, so procs_app only ever controls MPI rank
-    count for this app.
+    keeps its current launch shape) and must override it inside the qmcpack
+    branch specifically, so procs_app only ever controls MPI rank count for
+    this app.
     """
     src = inspect.getsource(JitSettings.set_variables)
     lines = src.splitlines()
@@ -237,9 +243,7 @@ def test_qmcpack_pins_one_cpu_per_task_regardless_of_procs_app():
         for i, line in enumerate(lines)
         if line.strip() == "self.cpus_per_task_app = self.procs_app"
     )
-    qmc_idx = next(
-        i for i, line in enumerate(lines) if 'elif "qmc" in self.app:' in line
-    )
+    qmc_idx = next(i for i, line in enumerate(lines) if 'elif "qmc" in self.app:' in line)
     assert default_idx < qmc_idx, "default cpus_per_task_app must precede the qmc branch"
 
     qmc_block = []
@@ -248,8 +252,8 @@ def test_qmcpack_pins_one_cpu_per_task_regardless_of_procs_app():
             break
         qmc_block.append(line)
     assert any(
-        line.strip() == "self.cpus_per_task_app = 1" for line in qmc_block
-    ), "qmcpack branch must pin cpus_per_task_app to 1"
+        line.strip() == "self.cpus_per_task_app = 2" for line in qmc_block
+    ), "qmcpack branch must pin cpus_per_task_app to 2 (1 hangs at launch)"
 
 
 # ── pre_app_call as a list (dlio: mkdir before the racy parallel mpirun) ─────
