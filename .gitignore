@@ -33,3 +33,42 @@ build
 info.txt
 info.md
 artifacts/ipdps24/IOR/o*
+
+# --- editors / tooling ---
+.idea/
+*vscode*
+.ipynb_checkpoints/
+
+# --- local run output: logs, scratch, checkpoints ---
+*.log
+*.err
+res.log
+hydra_log/
+tmp/
+executions.txt
+execution.txt
+failed_execution.txt
+logs_nodes*/
+*.pth
+
+# --- local data / traces / paper artifacts (not source) ---
+ftio/api/trace_analysis/data/
+ftio/api/trace_analysis/paper_results/
+ftio/api/trace_analysis/blue_waters/
+ftio/api/trace_analysis/plafrim/
+ftio/api/trace_analysis/*.csv
+ftio/api/io_malleability/*traces/
+ftio/api/io_malleability/paper/
+ftio/api/metric_proxy/traces/
+ftio/api/metric_proxy/dlio/
+ftio/api/metric_proxy/taylan/
+test/data/
+
+# --- stray files accidentally created via shell redirection ---
+ftio/api/metric_proxy/argparse
+ftio/api/metric_proxy/difflib
+ftio/api/metric_proxy/time
+ftio/api/gekkoFs/glass/argparse
+
+# --- scratch images ---
+cv2_*.jpg

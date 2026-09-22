@@ -47,17 +47,17 @@ ftio_debug_venv: override PYTHON = .venv/bin/python3
 ftio_debug_venv: ftio_debug
 
 ftio_debug: 
-	$(PYTHON) -m pip install -e '.[external-libs,development-libs,plot-libs]' --no-cache-dir || \
+	@$(PYTHON) -m pip install -e '.[external-libs,development-libs,plot-libs]' --no-cache-dir || \
 	(echo "Installing external libs failed, trying fallback..." && $(PYTHON) -m pip install -e . --no-cache-dir)
 
 ftio: 
-	$(PYTHON) -m pip install . 
+	@$(PYTHON) -m pip install . 
 
 ftio_full: 
-	$(PYTHON) -m pip install -e '.[external-libs,development-libs,plot-libs,amd-libs,ml-libs,redis-libs]' --no-cache-dir || \
+	@$(PYTHON) -m pip install -e '.[external-libs,development-libs,plot-libs,amd-libs,ml-libs,redis-libs]' --no-cache-dir || \
 	(echo "Installing external libs failed, trying fallback..." && $(PYTHON) -m pip install -e . --no-cache-dir)
 venv: 
-	$(PYTHON) -m venv .venv 
+	@$(PYTHON) -m venv .venv 
 	@echo -e "Environment created. Using python from .venv/bin/python3" 
 
 msg: 
@@ -69,8 +69,8 @@ msg:
 
 
 clean_project:
-	echo "Cleaning old installation"
-	$(PYTHON) -m pip uninstall --yes ftio-hpc || echo "no installation of ftio found"
+	@echo "Cleaning old installation"
+	@$(PYTHON) -m pip uninstall --yes ftio-hpc || echo "no installation of ftio found"
 	# @mv old_pyproject pyproject.toml && mv setup.py old_setup || true
 
 clean: clean_project
@@ -156,7 +156,6 @@ pack:
 	$(PYTHON) -m  pip install --upgrade pip
 	$(PYTHON) -m  pip install --upgrade build 
 	$(PYTHON) -m build
-
 
 
 .PHONY: all test test_all clean clean_all build pack testpypi ftio

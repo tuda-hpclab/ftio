@@ -157,6 +157,8 @@ class JitSettings:
         self.procs_proxy = 0
         self.procs_cargo = 0
         self.procs_app = 0
+        self.cpus_per_task_app = 0  # --cpus-per-task; defaults to procs_app below
+        self.stack_unlimited = False  # wrap the app launch in `ulimit -s unlimited`
         self.procs_ftio = 0
         self.fuse_idle_threads = 0  # finalized in parse_options after procs_app is set
         self.cmd_call = ""
@@ -424,8 +426,9 @@ class JitSettings:
 
         # ****** gkfs variables ******
         # self.gkfs_dir = f"{self.home}/deps/gekkofs_zmq_install"  # mogon
-        # self.gkfs_dir = "/apps/GPP/GEKKOFS/gkfs-master"  # bsc
-        self.gkfs_dir = os.getenv("GKFS_DIR", f"{self.home}/deps/install")  # bsc
+        # BSC default: the maintained module build (module load GekkoFS/master-0.9.6).
+        # Override with GKFS_DIR for a hand-built tree.
+        self.gkfs_dir = os.getenv("GKFS_DIR", "/apps/GPP/GEKKOFS/gkfs-master")
 
         if self.parsed_gkfs_daemon:
             self.gkfs_daemon = self.parsed_gkfs_daemon
@@ -446,11 +449,14 @@ class JitSettings:
         self.update_files_with_gkfs_mntdir = []
 
         # ****** cargo variables ******
-        self.cargo_bin = f"{self.gkfs_dir}/bin"  # f"{self.home}/cargo/build/cli"
+        # Cargo is a separate project and is not shipped in the GekkoFS module,
+        # so it is not derived from gkfs_dir. Override with CARGO_DIR.
+        self.cargo_bin = os.getenv("CARGO_DIR", f"{self.home}/deps/install/bin")
 
         # ? APP settings
         # ?##########################
         # ****** app call ******
+        self.cpus_per_task_app = self.procs_app
         #  ├─ IOR
         if "ior" in self.app:
             self.app_call = "./ior "
@@ -502,25 +508,31 @@ class JitSettings:
             # dominates predictably. Per glass-rarely-beats-pfs, growing the
             # checkpoint until pfs is the bottleneck is what turned 168 -> 221 from
             # a loss into a win in the first place; probe whether a bigger
-            # atoms/rank (default 84_672) makes the pfs win band-independent.
-            atoms_per_rank = int(os.getenv("LAMMPS_ATOMS_PER_RANK", "84672"))
+            # atoms/rank (default 169_344) makes the pfs win band-independent.
+            atoms_per_rank = int(os.getenv("LAMMPS_ATOMS_PER_RANK", "169344"))
             n = self.weak_scale_lattice((self.nodes - 1) * self.procs_app, atoms_per_rank)
+            # Restart writer count. LAMMPS_MP=1 turns on multi-file ("%") restarts
+            # (in.ckpt handles the branch), LAMMPS_NF sets the writer-group count
+            # -- default one group per app node. lessons.md sec.3: single-writer
+            # (mp=0) restart is rank-0-only, so each per-rank record falls under
+            # one 512 KB chunk at scale and lands on a single daemon; mp=1 is the
+            # structural fix. Tracked as the second LAMMPS config variant.
+            lammps_mp = os.getenv("LAMMPS_MP", "0")
+            lammps_nf = os.getenv("LAMMPS_NF", str(self.nodes - 1))
             self.app_flags = self.resolve_app_flags(
                 f"-in {self.run_dir}/in.ckpt -v ckptdir {ckptdir} "
                 f"-v x {n} -v y {n} -v z {n} "
+                f"-v mp {lammps_mp} -v nf {lammps_nf} "
                 # 54 phases: nsteps = phases*every + tail = 818 = ~100 s at 8 compute
                 # nodes (0.12 s/step measured in 43420026). Per-rank work is fixed
                 # by the weak scaling, so wall time stays flat as nodes grow, but
                 # the restart does not: drop phases for very large node counts or
                 # the sweep will outrun stage-out (a past run hit 6.9 TB).
-                # 2x checkpoint frequency (every 15/phases 54 -> every 8/phases 101,
-                # same ~816 steps) confirmed a full win (44585615: 1.76x gekko/1.02x
-                # pfs) -- kept as the new default. LAMMPS_EVERY/LAMMPS_PHASES let a
-                # single submission probe further (e.g. another 2x) without moving
-                # the default every concurrently-queued job reads.
+                # LAMMPS_EVERY/LAMMPS_PHASES let a single submission probe further
+                # without moving the default every concurrently-queued job reads.
                 f"-v every {os.getenv('LAMMPS_EVERY', '8')} "
                 f"-v nb {os.getenv('LAMMPS_EVERY', '8')} "
-                f"-v phases {os.getenv('LAMMPS_PHASES', '101')} -v tail 8",
+                f"-v phases {os.getenv('LAMMPS_PHASES', '30')} -v tail 8",
                 ckptdir,
             )
         #  ├─ DLIO
@@ -531,19 +543,14 @@ class JitSettings:
             workload = os.getenv("WORKLOAD")
             # if not set, take a fixed one
             if workload is None:
-                # workload = "cosmoflow_a100"
-                # workload = "bert"
-                # workload = "bert_small"
-                # workload = "bert_v100_pytorch" #paper
-                # workload = "bert_v100_pytorch_2" # good
-                # workload = "resnet50_v100"# work with fues on bsc
-                # workload = "resnet50_v100_new"  # bsc best for real test
-                workload = "resnet50_v100_new_small"  # bsc
-                # workload = "bert_v100_pytorch_allranksyaml "
-                # workload = "unet3d_my_a100"
-                # workload = "resnet50_my_a100"
-                # workload = "llama_my_7b_zero3"
-                # workload = "resnet50_my_a100_pytorch"
+                # GLASS paper (paper/dlio/DLIO_20GB): pytorch framework + npz
+                # format -> no h5py import, so no libhdf5.so.103 break. The old
+                # default resnet50_v100_new_small is framework: tensorflow, and
+                # keras eager-imports h5py at startup -> ImportError on every leg.
+                # DLIO_20GB won 1.15-1.26x vs pfs in the paper; DLIO_40GB 1.31x.
+                # workload = "resnet50_v100_new_small"  # tensorflow -> h5py break
+                # workload = "llama_my_7b_zero3"        # zero_stage=3 metadata storm
+                workload = "resnet50_my_a100_pytorch"
             # ensure surrounding spaces
             workload = f" workload={workload} "
         #  ├─ S3D-IO
@@ -552,31 +559,51 @@ class JitSettings:
             # (/lustre/project/nhr-gekko/shared/...) does not exist on BSC, so
             # -a s3d could never run there even though the binary is installed.
             self.app_call = os.getenv("S3D_BIN", f"{self.home}/S3D-IO/s3d_io.x")
+            # A big local subdomain (fixed_grid3d at low PROCS gives each rank a
+            # much larger block than weak_scale_grid3d ever did -- e.g. 512 MB/rank
+            # at PROCS=8/16+1/800^3) overflows the default 8 MB stack if S3D-IO
+            # keeps that block on the stack rather than heap-allocating it, and the
+            # GekkoFS interceptor's extra call-stack depth is what tips a marginal
+            # allocation over: job 45408816 (PROCS=8, fixed 800^3, 16+1) SIGSEGV'd
+            # inside pnetcdf_write on the glass/gekko (intercepted) legs only --
+            # the pfs leg, same binary and buffer size, no interception, ran clean.
+            # Same class of fix as WRF's ideal.exe (jitsettings.py pre_app_call).
+            self.stack_unlimited = True
             # S3D-IO's own output-path CLI arg was a bare "." -- resolved against
             # jit's cwd (the job's $HOME/jit/<jobid>/ dir), which has a quota and
             # is not meant for parallel I/O (same class of bug prepare_run_dir was
             # built for -- see its docstring). Route to scratch instead.
             self.run_dir = self.prepare_run_dir(f"{self.home}/S3D-IO", files=[])
             if not self.app_flags:  # default value if app_flags is not set
-                # S3D_EDGE_PER_RANK: per-rank subdomain edge. 64^3 grid points *
-                # 16 double-precision "planes" (mass:11 + velocity:3 + pressure:1 +
-                # temperature:1, see S3D-IO/README.md) * 8 bytes = ~33.5 MB/rank
-                # record -- see weak_scale_grid3d for why this replaces the old
-                # fixed-800 recipe (paper/s3d-io/*) that was accidentally strong
-                # scaling, not weak.
-                edge_per_rank = int(os.getenv("S3D_EDGE_PER_RANK", "64"))
                 ranks = (self.nodes - 1) * self.procs_app
-                nx_g, ny_g, nz_g, npx, npy, npz = self.weak_scale_grid3d(
-                    ranks, edge_per_rank
-                )
+                # Two sizing modes:
+                #  - S3D_GLOBAL_EDGE set  -> fixed_grid3d, the GLASS paper recipe
+                #    (paper/s3d-io/serial_800 = 800): a ~62 GB aggregate checkpoint
+                #    at every node count, so PFS's collective write is genuinely
+                #    slow and GLASS's incremental flush has something to beat. Run
+                #    this with PROCS=64 (the paper's -p 64) for the golden-goal
+                #    comparison.
+                #  - otherwise            -> weak_scale_grid3d via S3D_EDGE_PER_RANK
+                #    (default 64 -> ~33.5 MB/rank): per-rank record fixed, aggregate
+                #    grows with the job. A scaling study, not a GLASS win at small N.
+                global_edge = os.getenv("S3D_GLOBAL_EDGE")
+                if global_edge:
+                    nx_g, ny_g, nz_g, npx, npy, npz = self.fixed_grid3d(
+                        ranks, int(global_edge)
+                    )
+                else:
+                    edge_per_rank = int(os.getenv("S3D_EDGE_PER_RANK", "64"))
+                    nx_g, ny_g, nz_g, npx, npy, npz = self.weak_scale_grid3d(
+                        ranks, edge_per_rank
+                    )
                 self.app_flags = f"{nx_g} {ny_g} {nz_g} {npx} {npy} {npz} 0 F ."
         #  ├─ WRF
         elif "wrf" in self.app:
             # em_b_wave_glass is our copy of the idealized baroclinic-wave case
-            # (run_hours=24, restart_interval=60, history off -> 24 restarts).
-            # WRF must NOT run inside the mount: it reads each namelist group
-            # with a REWIND and that fails through GekkoFS. So the inputs stay
-            # on the parallel FS and only rst_outname points into the mount.
+            # (run_hours=48, restart_interval=360). WRF must NOT run inside the
+            # mount: it reads each namelist group with a REWIND and that fails
+            # through GekkoFS. So the inputs stay on the parallel FS and only
+            # rst_outname points into the mount.
             #
             # wrfinput_d01 encodes the domain size, so it MUST be regenerated
             # with ideal.exe whenever e_we/e_sn/e_vert change in namelist.input.
@@ -588,12 +615,28 @@ class JitSettings:
             # WRF drops rsl.out.<rank> + rsl.error.<rank> in its cwd: never $HOME.
             self.run_dir = self.prepare_run_dir(
                 f"{self.home}/WRF/test/em_b_wave_glass",
-                ["namelist.input", "wrfinput_d01"],
+                ["namelist.input", "wrfinput_d01", "ideal.exe", "input_jet"],
             )
             self.app_flags = ""
             self.point_wrf_restarts_at(
                 self.gkfs_mntdir if not self.exclude_daemon else self.run_dir
             )
+            # Weak-scale the domain: a fixed e_we/e_sn (unchanged since
+            # 2026-08-04) means each rank's restart-file slice shrinks as node
+            # count grows -- the same shrinking-per-rank-record bug already
+            # fixed for LAMMPS/WarpX/S3D-IO (weak_scale_lattice/_cells/
+            # _grid3d). See weak_scale_wrf_grid for the dx/time_step coupling.
+            # Opt-in via WRF_WEAK_SCALE_GRID=1 until the whole node-count sweep
+            # has been redone under it (see [[one-scaling-rule-per-app]]).
+            if os.getenv("WRF_WEAK_SCALE_GRID") == "1":
+                ranks = (self.nodes - 1) * self.procs_app
+                e_we, e_sn, dx, dy, dt = self.weak_scale_wrf_grid(ranks)
+                self.set_wrf_domain(e_we, e_sn, dx, dy, dt)
+                # Regenerate wrfinput_d01 for the new domain (ideal.exe reads
+                # input_jet, hence its place in the copy list above).
+                self.pre_app_call = (
+                    f"cd {self.run_dir} && ulimit -s unlimited && ./ideal.exe"
+                )
         #  ├─ Castro (AMReX)
         elif "castro" in self.app:
             # Sedov blast. fixed_dt + init_shrink=1 + max_level=0 keep the
@@ -629,19 +672,11 @@ class JitSettings:
             )
         #  ├─ WarpX (AMReX)
         elif "warpx" in self.app:
-            # WarpX was compute-bound to the point of hiding the FS entirely: 830 s
-            # of app against 6 s of stage-out, so glass/gekko/pfs came out within 5%
-            # of each other. Halve the compute (max_step 85 -> 40) and checkpoint 5x
-            # more often (every 2 steps -> 20 dirs), which raises the I/O fraction
-            # by ~10x. n_cell stays at 128 so a checkpoint dir remains ~484 MB.
+            # AMReX checkpoint directories (chk<step>/...) into the mount,
+            # write-only. Size = n_cell (weak-scaled), period = intervals.
             self.app_call = f"{self.home}/WarpX/build/bin/warpx.3d"
             self.run_dir = self.prepare_run_dir(f"{self.home}/WarpX/glass", ["inputs"])
             ckptdir = self.gkfs_mntdir if not self.exclude_daemon else self.run_dir
-            # n_cell 128 -> 192 (~3.4x cells): 20 checkpoints of ~484 MB totalled
-            # 9.7 GB against an 830 s app -- gekko staged it in 1.5 s, so the FS was
-            # invisible. ~1.6 GB per checkpoint (~32 GB total) makes the I/O matter.
-            # Only knob changed; steps/intervals stay from the last calibration.
-            #
             # Weak-scale n_cell like LAMMPS's lattice (weak_scale_lattice): a fixed
             # n_cell=320 is really a different, shrinking-per-rank workload at every
             # node count, not the same run at a bigger scale -- 9-33N lost to pfs
@@ -654,46 +689,20 @@ class JitSettings:
             n_cell = self.weak_scale_cells(
                 (self.nodes - 1) * self.procs_app, cells_per_rank
             )
-            # The stock deck declares `diagnostics.diags_names = diag1` only, so
-            # every chk.* option below was silently ignored and WarpX wrote no
-            # checkpoint at all -- app.log never mentions one and flush.log holds
-            # just APP-START/END. `chk` has to be declared, and a checkpoint is a
-            # diagnostic with format=checkpoint (Diagnostics.cpp:534).
-            # WARPX_INTERVALS: n_cell scaling alone left 9N unchanged (1.05x/0.86x ->
-            # 1.04x/0.87x, 44697383 vs 44752942) -- the ~20s run is short enough that
-            # checkpoint *size* barely matters against the flat ~3s stage overhead.
-            # Checkpoint more often instead, to raise the fraction of app time spent
-            # writing (which favors glass) vs. pure compute (neutral). Floor is the
-            # Nyquist limit above (period > 0.2s); intervals=200 already gives
-            # ~1.7s/checkpoint at 9N, so there's room to go denser before hitting it.
-            # 50 (4x denser) tested across the sweep 2026-08-18: 9N unchanged (still
-            # the structural floor), 17N 0.81x->0.94x pfs (close, not quite), 33N
-            # 1.00x->1.50x gekko/0.92x->1.23x pfs (loss -> win), 65N 1.52x->1.82x
-            # gekko/1.31x->1.33x pfs (already won, got better, no regression) -- no
-            # node count got worse, so this replaces 200 as the default outright.
-            intervals = int(os.getenv("WARPX_INTERVALS", "50"))
-            # WARPX_MAX_STEP=3200 (2x the old 1600) swept clean across all 7 node
-            # counts 2026-08-20: every one is a full win (glass < gekko AND < pfs),
-            # including 9N and 81N which never won under 1600 -- promoted to default.
+            # WARPX_INTERVALS=800 -> ~5 checkpoints over max_step=3200, ~24 s
+            # apart at 9N. The old value (50 -> a checkpoint every ~1.5 s) was
+            # calibrated while the checkpoint was a silent no-op (chk never
+            # registered); once it actually wrote, the flush fell behind and
+            # the run aborted (job 45134159). Checkpoint period must exceed the
+            # flush drain time -- same rule as DLIO_COMPUTE_TIME.
+            intervals = int(os.getenv("WARPX_INTERVALS", "800"))
             max_step = int(os.getenv("WARPX_MAX_STEP", "3200"))
+            # Declare the checkpoint diagnostic in the deck (command-line
+            # quoting mangles it) and drop the stock diag1 plotfile so the
+            # checkpoint is the only I/O.
+            self.set_warpx_checkpoint(ckptdir, intervals)
             self.app_flags = self.resolve_app_flags(
-                f'inputs max_step={max_step} diagnostics.diags_names="diag1 chk" '
-                f"chk.intervals={intervals} chk.diag_type=Full chk.format=checkpoint "
-                f"chk.write_species=1 diag1.intervals=1000 "
-                # 44585636 (max_step=40/intervals=2) and 44693748 (max_step=160,
-                # same intervals=2) both had glass_out == gekko_out exactly: no
-                # mid-run flush ever fired. Root cause found, not just "too
-                # short": ftio_args is `--freq 10` (10 Hz sampling), which caps
-                # the Nyquist-resolvable period at 1/(10/2) = 0.2 s
-                # (ftio/parse/args.py:208). Checkpoint period was ~0.245s at
-                # intervals=2/max_step=40 and ~0.07s at intervals=2/max_step=160
-                # (per-step cost dropped as steps grew -- fixed AMReX
-                # init/mesh-setup overhead dominates short runs) -- both at or
-                # under the floor, so FTIO literally could not resolve the
-                # periodicity regardless of total runtime. intervals=200 (was 2)
-                # pushes the period comfortably above 0.2s at any plausible
-                # per-step cost; max_step=1600 keeps 8 checkpoints (DFT needs
-                # >=4) at the same n_cell.
+                f"inputs max_step={max_step} "
                 f"chk.file_prefix={ckptdir}/chk amr.n_cell = "
                 f"{n_cell} {n_cell} {n_cell}",
                 ckptdir,
@@ -710,6 +719,25 @@ class JitSettings:
             self.point_qmcpack_output_at(
                 self.gkfs_mntdir if not self.exclude_daemon else self.run_dir
             )
+            # Run QMC at PROCS=8 -- the config behind every table-1 QMC win.
+            # "-p 56" was documented as "current best" but never validated, and it
+            # broke two ways: QMCPACK auto-threads from --cpus-per-task (56x56 =
+            # 3136 threads/node, ~28x oversubscribed), and 56 ranks/node x 8192
+            # walkers/rank put ~68 GB of walker buffers on each node -> the 32+1
+            # run stalled 90 min in walker setup (job 45335439, same class as the
+            # 16384-walker hang in 44475461). cpus_per_task_app=2 keeps 2 OMP
+            # threads/rank (1 starves the GekkoFS RPC-progress thread).
+            self.cpus_per_task_app = 2
+            # glass.xml's <walkers> is PER RANK. Node memory for the walker
+            # buffers is per_rank * omp_threads * 73808 B * ranks_per_node, so at
+            # PROCS=8 / 2 threads the safe ceiling is ~32k walkers/rank. Pin the
+            # aggregate instead (QMC_TOTAL_WALKERS, default 2M = ~4x the historical
+            # baseline, well under the ~7M that ran clean at 16+1): the per-section
+            # config.h5 checkpoint -- what GLASS's incremental flush has to beat
+            # gekko's end drain on -- stays a fixed large size at every node count,
+            # and bumping the env var is the golden-goal lever for a wider margin.
+            ranks = (self.nodes - 1) * self.procs_app
+            self.set_qmc_walkers(int(os.getenv("QMC_TOTAL_WALKERS", "2000000")), ranks)
         else:
             self.app_call = ""
             self.run_dir = ""
@@ -915,14 +943,18 @@ class JitSettings:
                 self.pre_app_call = f"mkdir -p {self.run_dir}/test_run/mpi"
         # ├─ wrf
         elif "wrf" in self.app:
-            # Deliberately empty. The old body ran WRF *inside* the mount, which
-            # cannot work: WRF reads each namelist group with a REWIND and that
-            # fails through GekkoFS ("ERROR while reading namelist diags" -> FATAL
-            # -> MPI_ABORT), while the identical file parses fine on a real FS.
-            # It also built the call from the `cdf`/`cpf` cluster aliases and
-            # $HOME paths, neither of which exists locally.
+            # Deliberately empty by default. The old body ran WRF *inside* the
+            # mount, which cannot work: WRF reads each namelist group with a
+            # REWIND and that fails through GekkoFS ("ERROR while reading
+            # namelist diags" -> FATAL -> MPI_ABORT), while the identical file
+            # parses fine on a real FS. It also built the call from the
+            # `cdf`/`cpf` cluster aliases and $HOME paths, neither of which
+            # exists locally.
             # Restarts go into the mount via point_wrf_restarts_at() instead.
-            self.pre_app_call = ""
+            # WRF_WEAK_SCALE_GRID=1 sets pre_app_call earlier (ideal.exe regen)
+            # -- don't clobber it here.
+            if not self.pre_app_call:
+                self.pre_app_call = ""
             self.post_app_call = ""
         else:
             self.pre_app_call = ""
@@ -1225,7 +1257,7 @@ class JitSettings:
         return flags
 
     @staticmethod
-    def weak_scale_lattice(ranks: int, atoms_per_rank: int = 84_672) -> int:
+    def weak_scale_lattice(ranks: int, atoms_per_rank: int = 169_344) -> int:
         """fcc lattice edge that gives each rank ~`atoms_per_rank` atoms.
 
         LAMMPS writes its restart from rank 0 only, one record per rank. GekkoFS
@@ -1235,9 +1267,6 @@ class JitSettings:
         ranks each record is 466 KB, under one chunk, so every write hits one
         daemon and GekkoFS loses to the PFS. Holding atoms/rank constant keeps
         each record many chunks wide at any scale.
-
-        The default is the value measured at 4 compute nodes (7.45 MB/record),
-        where GLASS beat the PFS by 2.2x.
 
         Args:
             ranks (int): Total application ranks.
@@ -1274,20 +1303,32 @@ class JitSettings:
         return max(1, files_per_rank * max(1, ranks))
 
     @staticmethod
+    def _factor3(ranks: int) -> tuple[int, int, int]:
+        """Balanced 3-way factorization of `ranks` -> (npx, npy, npz), npx>=npy>=npz.
+
+        Peel the largest divisor <= cube root first, then the largest divisor of
+        what's left <= sqrt of it. Shared by weak_scale_grid3d and fixed_grid3d.
+        """
+        ranks = max(1, ranks)
+        npz = max(d for d in range(1, ranks + 1) if ranks % d == 0 and d * d * d <= ranks)
+        rem = ranks // npz
+        npy = max(d for d in range(1, rem + 1) if rem % d == 0 and d * d <= rem)
+        npx = rem // npy
+        return npx, npy, npz
+
+    @staticmethod
     def weak_scale_grid3d(
         ranks: int, edge_per_rank: int
     ) -> tuple[int, int, int, int, int, int]:
         """S3D-IO process grid + global domain that keeps each rank's subdomain fixed.
 
-        S3D-IO's own README calls itself a weak-scaling benchmark ("aggregate I/O
-        amount proportionally increases" with rank count), but the historical BSC
-        recipe (paper/s3d-io/*/README) held nx_g=ny_g=nz_g=800 fixed while npx*npy*npz
-        grew -- that is strong scaling (shrinking per-rank subdomain), the same
-        fixed-checkpoint mistake already fixed for LAMMPS/WarpX
-        (weak_scale_lattice/weak_scale_cells). Here nx_g/ny_g/nz_g = npx/npy/npz *
-        edge_per_rank instead, so each rank always writes the same subdomain volume
-        regardless of node count, and nx_g is always an exact multiple of npx (S3D-IO
-        block-partitions each dimension; a non-exact split is undefined behavior).
+        Weak scaling: nx_g/ny_g/nz_g = npx/npy/npz * edge_per_rank, so each rank
+        always writes the same subdomain volume regardless of node count and the
+        aggregate checkpoint grows with the job. Fine for scaling studies, but at
+        small node counts the aggregate is only a few GB and PFS writes it fast
+        enough that GLASS's incremental flush has nothing to beat -- for the
+        golden-goal comparison use fixed_grid3d (the GLASS paper recipe) instead,
+        which pins a large aggregate checkpoint at every node count.
 
         Args:
             ranks (int): Total application ranks (must equal npx*npy*npz exactly --
@@ -1297,17 +1338,43 @@ class JitSettings:
         Returns:
             tuple[int, int, int, int, int, int]: (nx_g, ny_g, nz_g, npx, npy, npz).
         """
-        ranks = max(1, ranks)
-        # Balanced 3-way factorization of `ranks`: peel the largest divisor <=
-        # cube root first, then the largest divisor of what's left <= sqrt of it.
-        npz = max(d for d in range(1, ranks + 1) if ranks % d == 0 and d * d * d <= ranks)
-        rem = ranks // npz
-        npy = max(d for d in range(1, rem + 1) if rem % d == 0 and d * d <= rem)
-        npx = rem // npy
+        npx, npy, npz = JitSettings._factor3(ranks)
         return (
             npx * edge_per_rank,
             npy * edge_per_rank,
             npz * edge_per_rank,
+            npx,
+            npy,
+            npz,
+        )
+
+    @staticmethod
+    def fixed_grid3d(ranks: int, global_edge: int) -> tuple[int, int, int, int, int, int]:
+        """S3D-IO process grid + a fixed global domain (the GLASS paper recipe).
+
+        paper/s3d-io/serial_800 held nx_g=ny_g=nz_g=800 while npx*npy*npz grew with
+        the job -- the aggregate checkpoint stays ~62 GB at every node count, so
+        PFS's collective write is genuinely slow and GLASS beats both PFS and gekko
+        at every point 3-33N in the paper. Per-rank work shrinks with scale (strong
+        scaling of the grid), which is the price of a fixed large checkpoint and
+        exactly what makes it a GLASS benchmark rather than a scaling study.
+
+        Each global edge is rounded down to an exact multiple of its process-grid
+        dimension (S3D-IO block-partitions each dimension; a non-exact split is
+        undefined behavior), so the realized grid is <= global_edge on each axis.
+
+        Args:
+            ranks (int): Total application ranks (== npx*npy*npz exactly).
+            global_edge (int): Target global domain edge on each axis.
+
+        Returns:
+            tuple[int, int, int, int, int, int]: (nx_g, ny_g, nz_g, npx, npy, npz).
+        """
+        npx, npy, npz = JitSettings._factor3(ranks)
+        return (
+            (global_edge // npx) * npx,
+            (global_edge // npy) * npy,
+            (global_edge // npz) * npz,
             npx,
             npy,
             npz,
@@ -1334,6 +1401,56 @@ class JitSettings:
         """
         raw = (cells_per_rank * max(1, ranks)) ** (1 / 3)
         return max(blocking, round(raw / blocking) * blocking)
+
+    @staticmethod
+    def weak_scale_wrf_grid(
+        ranks: int,
+        base_ranks: int = 8,
+        base_e_we: int = 164,
+        base_e_sn: int = 324,
+        base_dx: float = 25000.0,
+        base_dt: float = 150.0,
+    ) -> tuple[int, int, float, float, float]:
+        """WRF domain size that keeps each rank's restart-file slice constant.
+
+        em_b_wave_glass's e_we/e_sn/dx have been fixed since 2026-08-04 across
+        every node count -- the same shrinking-per-rank-record bug already fixed
+        for LAMMPS/WarpX/S3D-IO (weak_scale_lattice/_cells/_grid3d): WRF
+        decomposes e_we x e_sn across ranks (PROCS=1, so ranks == app nodes), so
+        a fixed grid means each rank's restart slice shrinks as nodes grow.
+
+        Scales e_we/e_sn up by sqrt(ranks/base_ranks) to hold grid-points-per-rank
+        constant, and dx/dy down by the same factor so the physical domain
+        extent (e_we*dx, e_sn*dy) stays exactly what it was at base_ranks --
+        growing e_we/e_sn without shrinking dx let the idealized channel's
+        y-extent exceed a physical bound and segfaulted ideal.exe (2026-08-04,
+        82x162->328x648 test, see [[wrf-scale-dx-with-grid]]). time_step scales
+        with dx to hold the CFL ratio (dt/dx) constant -- a finer dx needs a
+        proportionally smaller step or the integration blows up.
+
+        Note: because dt shrinks with dx, the step count needed to cover a fixed
+        run_hours grows as sqrt(ranks) too, so larger node counts take
+        proportionally longer in wall-clock app time under this formula on top
+        of running more ranks -- a real cost of weak-scaling this deck, not a
+        bug to chase out.
+
+        Args:
+            ranks (int): Total application ranks (WRF runs PROCS=1, so nodes).
+            base_ranks (int): Rank count the base_* values were calibrated at.
+            base_e_we (int): e_we at base_ranks.
+            base_e_sn (int): e_sn at base_ranks.
+            base_dx (float): dx=dy (m) at base_ranks.
+            base_dt (float): time_step (s) at base_ranks.
+
+        Returns:
+            tuple[int, int, float, float, float]: (e_we, e_sn, dx, dy, time_step).
+        """
+        factor = (max(1, ranks) / base_ranks) ** 0.5
+        e_we = max(base_e_we, round(base_e_we * factor))
+        e_sn = max(base_e_sn, round(base_e_sn * factor))
+        dx = base_dx / factor
+        dt = base_dt / factor
+        return e_we, e_sn, dx, dx, dt
 
     def prepare_run_dir(self, deck_dir: str, files: list[str] | None = None) -> str:
         """Copy an app's deck to scratch and return that as the run directory.
@@ -1422,6 +1539,87 @@ class JitSettings:
         except OSError as e:
             console.print(f"[yellow]Could not set rst_outname in {namelist}: {e}[/]")
 
+    def set_wrf_domain(
+        self, e_we: int, e_sn: int, dx: float, dy: float, time_step: float
+    ) -> None:
+        """Rewrite the &domains grid fields so ideal.exe regenerates a matching wrfinput_d01.
+
+        Same in-place rewrite approach as point_wrf_restarts_at, done in Python
+        so it works identically locally and on the cluster. wrfinput_d01 bakes
+        in the domain size at ideal.exe-run time, so the namelist must be
+        correct *before* the ideal.exe pre_app_call runs, not after.
+
+        Args:
+            e_we (int): East-west grid points.
+            e_sn (int): South-north grid points.
+            dx (float): Grid spacing in x (m).
+            dy (float): Grid spacing in y (m).
+            time_step (float): Integration step (s).
+        """
+        namelist = os.path.join(self.run_dir, "namelist.input")
+        dt = round(time_step)
+        replacements = {
+            "e_we": f" e_we                                = {e_we},   {e_we},   {e_we},",
+            "e_sn": f" e_sn                                = {e_sn},   {e_sn},   {e_sn},",
+            "dx": f" dx                                  = {round(dx)},",
+            "dy": f" dy                                  = {round(dy)},",
+            "time_step": f" time_step                           = {dt},",
+        }
+        try:
+            with open(namelist) as f:
+                lines = f.read().splitlines()
+            rewritten = []
+            for line in lines:
+                key = line.lstrip().split(None, 1)[0] if line.strip() else ""
+                rewritten.append(replacements.get(key, line))
+            if rewritten != lines:
+                with open(namelist, "w") as f:
+                    f.write("\n".join(rewritten) + "\n")
+        except OSError as e:
+            console.print(f"[yellow]Could not set WRF domain in {namelist}: {e}[/]")
+
+    def set_warpx_checkpoint(self, ckptdir: str, intervals: int) -> None:
+        """Set the deck to write only a `chk` checkpoint (no `diag1` plotfile).
+
+        `diags_names = "diag1 chk"` on the command line does not survive jit's
+        `bash -c` wrapper (the quotes collapse), so it goes in the deck instead.
+        `diag1` is dropped so the checkpoint is the only I/O. Scalar overrides
+        jit passes on the command line (max_step, n_cell, file_prefix) still win.
+
+        Args:
+            ckptdir (str): Directory the checkpoints should be written to.
+            intervals (int): Checkpoint every `intervals` steps.
+        """
+        inputs = os.path.join(self.run_dir, "inputs")
+        block = [
+            "diagnostics.diags_names = chk",
+            f"chk.intervals = {intervals}",
+            "chk.diag_type = Full",
+            "chk.format = checkpoint",
+            f"chk.file_prefix = {ckptdir}/chk",
+        ]
+        try:
+            with open(inputs) as f:
+                lines = f.read().splitlines()
+            rewritten = [
+                line
+                for line in lines
+                if not line.lstrip().startswith(
+                    ("diagnostics.diags_names", "chk.", "diag1.")
+                )
+            ]
+            rewritten += block
+            if rewritten != lines:
+                with open(inputs, "w") as f:
+                    f.write("\n".join(rewritten) + "\n")
+            if (
+                "_gkfs_mountdir" in ckptdir
+                and inputs not in self.update_files_with_gkfs_mntdir
+            ):
+                self.update_files_with_gkfs_mntdir.append(inputs)
+        except OSError as e:
+            console.print(f"[yellow]Could not set WarpX checkpoint in {inputs}: {e}[/]")
+
     def point_qmcpack_output_at(self, ckptdir: str) -> None:
         """Rewrite <project id> in the QMCPACK input so output lands in `ckptdir`.
 
@@ -1456,6 +1654,42 @@ class JitSettings:
                 self.update_files_with_gkfs_mntdir.append(xml)
         except OSError as e:
             console.print(f"[yellow]Could not set the project id in {xml}: {e}[/]")
+
+    def set_qmc_walkers(self, total: int, ranks: int, per_rank_cap: int = 24000) -> None:
+        """Rewrite every <walkers> in glass.xml to a memory- and total-bounded value.
+
+        glass.xml's walkers value is per MPI rank. Two limits apply:
+          * per node: per_rank * omp_threads * 73808 B * ranks_per_node must fit
+            RAM, so per_rank is capped (``per_rank_cap``, ~24k for PROCS=8 / 2
+            OMP threads -- job 44475461 hung at 16384/rank once thread-cloning is
+            counted);
+          * aggregate: QMCPACK's walker setup is ~O(total) and serial before the
+            first VMC block, so ``total`` bounds the sum (job 45335439 stalled
+            90 min at 14.7M; 16+1 ran 7.3M clean).
+        Pinning the aggregate keeps the per-section config.h5 checkpoint a
+        constant large size at every node count -- the size GLASS's incremental
+        flush has to beat gekko's end drain on.
+
+        Args:
+            total (int): Target aggregate walker count across all ranks.
+            ranks (int): Total application MPI ranks.
+            per_rank_cap (int): Hard ceiling on walkers per rank (node-RAM bound).
+        """
+        per_rank = min(per_rank_cap, max(64, total // max(1, ranks)))
+        xml = os.path.join(self.run_dir, "glass.xml")
+        try:
+            with open(xml) as f:
+                text = f.read()
+            rewritten = re.sub(
+                r'(<parameter name="walkers"\s*>\s*)\d+(\s*</parameter>)',
+                rf"\g<1>{per_rank}\g<2>",
+                text,
+            )
+            if rewritten != text:
+                with open(xml, "w") as f:
+                    f.write(rewritten)
+        except OSError as e:
+            console.print(f"[yellow]Could not set QMC walkers in {xml}: {e}[/]")
 
     def select_regexes(self) -> None:
         """Pick the flush / stage-out / stage-in patterns for the current app.

@@ -2,10 +2,9 @@
 requires = ["setuptools", "wheel"]
 build-backend = "setuptools.build_meta"
 
-[tool.setuptools.packages]
-find = { }
-# include = ["ftio*"]  # package names should match these glob patterns (["*"] by default)
-# exclude = ["ftio.tests*"]  
+[tool.setuptools.packages.find]
+include = ["ftio*"]
+exclude = ["build*", "dist*", "artifacts*", "examples*", "test*", "tmp*", "docs*", "prototypes*", "*.egg-info*"]
 
 
 [project]
