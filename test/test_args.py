@@ -156,6 +156,16 @@ def test_zmq_format_is_an_alias_of_zmq_source():
     assert ftio("--zmq-format", "tmio").zmq_source == "tmio"
 
 
+def test_zmq_format_flexmpi_is_accepted():
+    assert ftio("--zmq_format", "flexmpi").zmq_source == "flexmpi"
+
+
+def test_zmq_socket_default_and_choices():
+    assert ftio().zmq_socket == "push-pull"
+    assert ftio("--zmq_socket", "pub-sub").zmq_socket == "pub-sub"
+    assert vars(ftio("--zmq_socket", "pub-sub")) == vars(ftio("--zmq-socket", "pub-sub"))
+
+
 # ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
@@ -174,6 +184,7 @@ def test_zmq_format_is_an_alias_of_zmq_source():
         ("-r", "interactive"),
         ("-p", "acf"),
         ("--zmq_source", "bogus"),
+        ("--zmq_socket", "pushpull"),  # must be push-pull / pub-sub
         ("-le", "-1"),
         ("-le", "three"),
     ],

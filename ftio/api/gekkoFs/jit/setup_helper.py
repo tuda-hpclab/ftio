@@ -86,7 +86,7 @@ def check_port(settings: JitSettings) -> None:
     Move settings.port_ftio to a free port on the FTIO node.
 
     Must run before the application command is built: the app is handed
-    LIBGKFS_METRICS_IP_PORT, and if FTIO ends up somewhere else the gekko clients
+    GKFS_METRICS_IP_PORT, and if FTIO ends up somewhere else the gekko clients
     push metrics into a socket nobody drains. Picking the port here instead of
     letting `setup_socket` retry keeps both ends on the same address.
 
@@ -2214,8 +2214,8 @@ def load_flags_mpiexec(
     additional_arguments = ""
     if not settings.exclude_ftio and "ftio" not in exclude:
         additional_arguments += (
-            f"-x LIBGKFS_METRICS_IP_PORT={default['LIBGKFS_METRICS_IP_PORT']} "
-            f"-x LIBGKFS_ENABLE_METRICS={default['LIBGKFS_ENABLE_METRICS']} "
+            f"-x GKFS_METRICS_IP_PORT={default['GKFS_METRICS_IP_PORT']} "
+            f"-x GKFS_ENABLE_METRICS={default['GKFS_ENABLE_METRICS']} "
         )
     if not settings.exclude_proxy and "proxy" not in exclude:
         additional_arguments += (
@@ -2261,8 +2261,8 @@ def load_flags_srun(
     additional_arguments = ""
     if not settings.exclude_ftio and "ftio" not in exclude:
         additional_arguments += (
-            f"LIBGKFS_ENABLE_METRICS={default['LIBGKFS_ENABLE_METRICS']},"
-            f"LIBGKFS_METRICS_IP_PORT={default['LIBGKFS_METRICS_IP_PORT']},"
+            f"GKFS_ENABLE_METRICS={default['GKFS_ENABLE_METRICS']},"
+            f"GKFS_METRICS_IP_PORT={default['GKFS_METRICS_IP_PORT']},"
         )
     if not settings.exclude_proxy and "proxy" not in exclude:
         additional_arguments += (
@@ -2298,8 +2298,8 @@ def load_defauts(settings: JitSettings, special_flags: dict = None):
     if special_flags is None:
         special_flags = {}
     default = {
-        "LIBGKFS_METRICS_IP_PORT": f"{settings.address_ftio}:{settings.port_ftio}",
-        "LIBGKFS_ENABLE_METRICS": "on",
+        "GKFS_METRICS_IP_PORT": f"{settings.address_ftio}:{settings.port_ftio}",
+        "GKFS_ENABLE_METRICS": "on",
         "LIBGKFS_PROXY_PID_FILE": f"{settings.gkfs_proxyfile}",
         "LIBGKFS_LOG": "errors" if settings.debug_lvl <= 1 else "all",
         "LIBGKFS_LOG_OUTPUT": f"{settings.gkfs_client_log}",

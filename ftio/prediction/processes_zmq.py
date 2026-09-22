@@ -25,6 +25,7 @@ from ftio.multiprocessing.async_process import (
     join_procs,
 )
 from ftio.parse.args import parse_args
+from ftio.parse.zmq_socket import recv_socket_type, subscribe_all
 from ftio.prediction.helper import build_reply, export_extrap, print_data
 from ftio.prediction.processes import prediction_process
 
@@ -61,9 +62,10 @@ def predictor_with_processes_zmq(
     port_in = tmp_args.zmq_port
     debounce = getattr(tmp_args, "debounce", False)
     max_predictions = getattr(tmp_args, "max_predictions", 0)
+    pattern = getattr(tmp_args, "zmq_socket", "push-pull")
 
-    # bind the incoming socket; the reply socket (if any) is opened once here
-    socket_in = setup_socket(addr, port_in, zmq.PULL)
+    # incoming socket type from --zmq_socket; the reply socket stays PUSH
+    socket_in = setup_socket(addr, port_in, recv_socket_type(pattern))
     socket_out = None
     if return_data:
         socket_out = setup_socket(addr, tmp_args.zmq_port_reply, zmq.PUSH, False)
@@ -129,6 +131,7 @@ def setup_socket(addr: str, port: str, socket_type=zmq.PULL, bind: bool = True):
     """Bind the ZMQ socket, retrying with a corrected IP if necessary."""
     context = zmq.Context()
     socket = context.socket(socket_type)
+    subscribe_all(socket)  # no-op unless SUB
     if not bind and addr == "*":
         addr = "127.0.0.1"
     try:
