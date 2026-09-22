@@ -12,11 +12,11 @@ else
 $(info Using python: $(PYTHON))
 endif
 
-REQUIRED_PYTHON_VERSION := 3.8
-PYTHON_VERSION := $(shell python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+REQUIRED_PYTHON_VERSION := 3.9
+PYTHON_VERSION := $(shell $(PYTHON) -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
 
-version_check = $(shell python3 -c 'import sys; required_version = tuple(map(int, "$(REQUIRED_PYTHON_VERSION)".split("."))); \
-    sys.exit((sys.version_info.major, sys.version_info.minor) < required_version)')
+version_check := $(shell $(PYTHON) -c 'import sys; required_version = tuple(map(int, "$(REQUIRED_PYTHON_VERSION)".split("."))); \
+    print(1 if (sys.version_info.major, sys.version_info.minor) < required_version else 0)')
 
 # Terminate the make process if the version is below the required version
 ifeq ($(version_check),1)

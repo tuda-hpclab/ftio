@@ -33,7 +33,7 @@ dependencies = [
     "seaborn"
 ]
 
-requires-python = ">=3.8"
+requires-python = ">=3.9"
 authors = [{ name = "Ahmad Tarraf", email = "ahmad.tarraf@tu-darmstadt.de" }]
 maintainers = [
     { name = "Ahmad Tarraf", email = "ahmad.tarraf@tu-darmstadt.de" },
