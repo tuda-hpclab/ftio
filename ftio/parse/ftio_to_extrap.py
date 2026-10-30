@@ -54,10 +54,31 @@ def build_experiment(records) -> Experiment:
     return experiment
 
 
+def fit_models(experiment: Experiment, allow_negative_exponents: bool = False) -> dict:
+    """Fits one Extra-P model per (callpath, metric) of an experiment.
+
+    Args:
+        experiment: the experiment, see build_experiment.
+        allow_negative_exponents: sets Extra-P's `allow_negative_exponents`.
+            Use it when a value shrinks as the rank count grows (e.g. strong
+            scaling).
+
+    Returns:
+        dict: (Callpath, Metric) -> Extra-P model
+    """
+    model_generator = ModelGenerator(
+        experiment, modeler="Basic" if allow_negative_exponents else "Default"
+    )
+    if allow_negative_exponents:
+        model_generator.modeler.allow_negative_exponents = True
+    model_generator.model_all()
+    return model_generator.models
+
+
 def print_models(models: dict) -> None:
     for (callpath, metric), model in models.items():
         fn = model.hypothesis.function
-        print(f"{callpath} / {metric}\n  {fn}")
+        print(f"{callpath} / {metric}\n  {fn}  (aR2={model.hypothesis.AR2:.3f})")
 
 
 def main(files):
@@ -76,9 +97,7 @@ def main(files):
     )
 
     # build model/ fit
-    model_generator = ModelGenerator(experiment)
-    model_generator.model_all()
-    models = model_generator.models
+    models = fit_models(experiment)
     print_models(models)
 
     return models
