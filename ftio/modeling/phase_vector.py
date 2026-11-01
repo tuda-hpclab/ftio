@@ -40,6 +40,17 @@ Signal = tuple[np.ndarray, np.ndarray]
 
 
 @dataclass
+class RunContext:
+    """What all phases of one run share."""
+
+    run_id: str = ""  # e.g. the trace file
+    duration: float = 0.0
+    total_bytes: float = 0.0
+    n_phases: int = 1
+    min_period: float = 0.0
+
+
+@dataclass
 class IOMode:
     """Data moved by one phase, split by I/O mode (read or write)."""
 
@@ -69,6 +80,7 @@ class PhaseVector:
     io: IOMode | None = None  # None if the I/O signals were not loaded
     # source automaton state, kept for reference (e.g. its per-window predictions)
     state: PhaseState | None = field(default=None, repr=False)
+    run: RunContext | None = field(default=None, repr=False)
 
     @property
     def duration(self) -> float:
@@ -91,6 +103,36 @@ class PhaseVector:
             return np.nan
         return self.io.total_bytes / self.ranks
 
+    @property
+    def period_ratio(self) -> float:
+        """Period compared to the shortest period of the run."""
+        if self.run is None or self.run.min_period <= 0:
+            return np.nan
+        return self.period / self.run.min_period
+
+    @property
+    def relative_position(self) -> float:
+        """Position in the run: 0 = first phase, 1 = last phase."""
+        if self.run is None:
+            return np.nan
+        if self.run.n_phases <= 1:
+            return 0.0
+        return self.phase_id / (self.run.n_phases - 1)
+
+    @property
+    def relative_duration(self) -> float:
+        """Fraction of run time spent in this phase"""
+        if self.run is None or self.run.duration <= 0:
+            return np.nan
+        return self.duration / self.run.duration
+
+    @property
+    def relative_volume(self) -> float:
+        """Portion of total bytes moved in this phase"""
+        if self.io is None or self.run is None or self.run.total_bytes <= 0:
+            return np.nan
+        return self.io.total_bytes / self.run.total_bytes
+
     def as_dict(self) -> dict:
         """Flat dict of all descriptors (e.g. for matcher)."""
         out = {
@@ -102,6 +144,9 @@ class PhaseVector:
             "period": self.period,
             "frequency": self.frequency,
             "n_windows": self.n_windows,
+            "period_ratio": self.period_ratio,
+            "relative_position": self.relative_position,
+            "relative_duration": self.relative_duration,
         }
         if self.io is not None:
             out.update(
@@ -112,6 +157,7 @@ class PhaseVector:
                     "read_fraction": self.io.read_fraction,
                     "intensity": self.intensity,
                     "bytes_per_rank": self.bytes_per_rank,
+                    "relative_volume": self.relative_volume,
                 }
             )
         return out
@@ -133,6 +179,7 @@ def from_automaton(
     t_start: float,
     t_end: float,
     signals: dict[str, list[Signal]] | None = None,
+    run_id: str = "",
 ) -> list[PhaseVector]:
     """One PhaseVector per automaton state, including the I/O of each phase.
 
@@ -152,6 +199,7 @@ def from_automaton(
             to cover all signals (the automaton only saw one FTIO -m value,
             write_sync by default, so e.g. reads after the last write would
             otherwise fall outside).
+        run_id: identifier of the run, e.g. the trace path.
     """
     if signals is not None:
         times = [t for sigs in signals.values() for t, _ in sigs if len(t)]
@@ -188,6 +236,17 @@ def from_automaton(
                 state=s,
             )
         )
+
+    # only known once all phases exist
+    run = RunContext(
+        run_id=run_id,
+        duration=t_end - t_start,
+        total_bytes=sum(v.io.total_bytes for v in vectors if v.io is not None),
+        n_phases=len(vectors),
+        min_period=min(v.period for v in vectors),
+    )
+    for v in vectors:
+        v.run = run
     return vectors
 
 
@@ -239,4 +298,6 @@ def phase_vectors(
             f"(need at least {aut.min_cycles} periods per STFT window)"
         )
     signals = load_signals(trace) if with_io else None
-    return from_automaton(aut, predictions[0].t_start, predictions[0].t_end, signals)
+    return from_automaton(
+        aut, predictions[0].t_start, predictions[0].t_end, signals, run_id=trace
+    )
