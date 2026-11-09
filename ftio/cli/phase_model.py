@@ -34,6 +34,12 @@ SKIP_FOLDERS = ("io_results", "exported_images")
 
 MIN_FIT_POINTS = 5  # below this, Extra-P's fit is not reliable
 
+# descriptor -> (Extra-P metric, unit for printing, value of a PhaseVector)
+DESCRIPTORS = {
+    "period": ("Time (s)", "s", lambda v: v.period),
+    "frequency": ("Frequency (Hz)", "Hz", lambda v: v.frequency),
+}
+
 console = Console()
 
 
@@ -115,12 +121,16 @@ def main(args: list[str] = sys.argv) -> None:
         matcher.match_run(run)
 
     for fam in matcher.families.values():
-        name = f"family_{fam.family_id}->period"
-        records = [Record(v.ranks, name, "Time (s)", v.period) for v in fam.members]
+        family = f"family_{fam.family_id}"
+        records = [
+            Record(v.ranks, f"{family}->{name}", metric, value(v))
+            for v in fam.members
+            for name, (metric, _, value) in DESCRIPTORS.items()
+        ]
 
         if len(fam.ranks) < MIN_FIT_POINTS:
             console.print(
-                f"[yellow]{name}: fitting on only {len(fam.ranks)} rank counts, "
+                f"[yellow]{family}: fitting on only {len(fam.ranks)} rank counts, "
                 f"{MIN_FIT_POINTS} are recommended[/]"
             )
 
@@ -128,9 +138,12 @@ def main(args: list[str] = sys.argv) -> None:
             build_experiment(records), phase_model_args.allow_negative_exponents
         )
         print_models(models)
-        fn = next(iter(models.values())).hypothesis.function
-        for p in phase_model_args.predict:
-            print(f"  p={p}: predicted {fn.evaluate(p):.2f} s")
+        for (callpath, _), model in models.items():
+            name = callpath.name.split("->")[1]
+            unit = DESCRIPTORS[name][1]
+            for p in phase_model_args.predict:
+                value = model.hypothesis.function.evaluate(p)
+                print(f"  {name} at p={p}: {value:.4g} {unit}")
 
 
 if __name__ == "__main__":
