@@ -20,7 +20,8 @@ import sys
 
 from rich.console import Console
 
-from ftio.modeling.phase_matcher import PhaseMatcher
+from ftio.modeling.alignment_matcher import AlignmentMatcher
+from ftio.modeling.phase_matcher import NEW_FAMILY, PhaseMatcher
 from ftio.modeling.phase_vector import phase_vectors
 from ftio.parse.ftio_to_extrap import build_experiment, fit_models, print_models
 from ftio.parse.helper import print_info
@@ -84,6 +85,19 @@ def main(args: list[str] = sys.argv) -> None:
     parser.add_argument(
         "--predict", type=int, nargs="+", default=[], help="rank counts to predict"
     )
+    parser.add_argument(
+        "-m",
+        "--mode",
+        default=None,
+        help="I/O mode to analyze, as in FTIO (e.g. write_sync, read_sync); "
+        "default: all read and write modes combined",
+    )
+    parser.add_argument(
+        "--matcher",
+        choices=("position", "alignment"),
+        default="position",
+        help="match phases by index (all runs need the same phases) or by alignment",
+    )
     phase_model_args, ftio_args = parser.parse_known_args(
         args[1:]
     )  # the rest goes to FTIO
@@ -105,20 +119,28 @@ def main(args: list[str] = sys.argv) -> None:
     runs = {}
     for trace in traces:
         with contextlib.redirect_stdout(io.StringIO()):  # hide FTIO's output
-            # with_io set to false for baseline approach
-            runs[trace] = phase_vectors(trace, ftio_args, with_io=False)
+            runs[trace] = phase_vectors(trace, ftio_args, mode=phase_model_args.mode)
 
     # matching by position only works if every run has the same phases
     counts = [(os.path.basename(trace), len(run)) for trace, run in runs.items()]
-    if len({n for _, n in counts}) != 1:
+    if phase_model_args.matcher == "position" and len({n for _, n in counts}) != 1:
         console.print(
             f"[red]--- Error --- [/]\n[red]-> Different number of phases per run: {counts}.[/]"
         )
         sys.exit(1)
 
-    matcher = PhaseMatcher()
+    matcher = (
+        AlignmentMatcher() if phase_model_args.matcher == "alignment" else PhaseMatcher()
+    )
     for run in sorted(runs.values(), key=lambda run: run[0].ranks):
-        matcher.match_run(run)
+        for m in matcher.match_run(run):
+            # a cost exists only where alignment compared the phase with a family
+            matched = isinstance(matcher, AlignmentMatcher) and m.case != NEW_FAMILY
+            cost = f", cost {m.cost:.3f}" if matched else ""
+            print(
+                f"p={m.phase.ranks} phase {m.phase.phase_id} -> family_{m.family_id} "
+                f"({m.case}{cost})"
+            )
 
     for fam in matcher.families.values():
         family = f"family_{fam.family_id}"
