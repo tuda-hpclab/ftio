@@ -18,6 +18,7 @@ https://github.com/tuda-parallel/FTIO/blob/main/LICENSE
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -194,7 +195,7 @@ def from_automaton(
             stretched back to t_start and the last to t_end. Dropped windows in
             between stay covered by the neighbouring phases' intervals.
         signals: optional bandwidth signals per I/O mode, {"read": [...],
-            "write": [...]} as returned by load_signals(); when given, every
+            "write": [...]} as built by _prediction(); when given, every
             vector gets the bytes moved in its interval, and the run is widened
             to cover all signals (the automaton only saw one FTIO -m value,
             write_sync by default, so e.g. reads after the last write would
@@ -250,44 +251,110 @@ def from_automaton(
     return vectors
 
 
-def load_signals(trace: str) -> dict[str, list[Signal]]:
-    """Bandwidth signals of a trace, grouped by I/O mode (see IO_MODES).
-    Parses the trace once per FTIO -m value.
-    """
-    from ftio.parse.extract import get_time_behavior
-    from ftio.parse.scales import Scales
+def _load_sims(
+    trace: str, modes: dict[str, tuple[str, ...]] = IO_MODES
+) -> dict[str, list[dict]]:
+    """FTIO's time behavior of a trace per I/O mode (see IO_MODES).
 
-    signals: dict[str, list[Signal]] = {}
-    for mode, ftio_modes in IO_MODES.items():
-        signals[mode] = []
+    Each mode is parsed separately, as FTIO's JSON parser only completes the
+    selected one. FTIO replaces a mode missing in the trace by another one; such
+    a mode is skipped, so no data is counted under the wrong mode.
+    """
+    from ftio.parse.extract import get_time_behavior_and_args
+    from ftio.parse.helper import match_mode
+
+    sims: dict[str, list[dict]] = {}
+    for kind, ftio_modes in modes.items():
+        sims[kind] = []
         for ftio_mode in ftio_modes:
-            data = Scales(["ftio", trace, "-e", "no", "-m", ftio_mode])
-            sims = get_time_behavior(data.get_io_mode(ftio_mode))
-            if sims:  # an FTIO mode may have no I/O at all
-                signals[mode].append((sims[0]["time"], sims[0]["bandwidth"]))
-    return signals
+            data, args = get_time_behavior_and_args(
+                ["ftio", trace, "-e", "no", "-m", ftio_mode]
+            )
+            if match_mode(args.mode) == match_mode(ftio_mode):
+                sims[kind] += data[:1]
+    return sims
+
+
+def combine_signals(signals: dict[str, list[Signal]]) -> Signal:
+    """Sum all read and write signals into one bandwidth signal. Needed for read/write mix"""
+    from ftio.parse.bandwidth import overlap_two_series
+
+    parts = [sig for sigs in signals.values() for sig in sigs]
+    if not parts:
+        raise ValueError("PhaseVector: no I/O signal to combine")
+    t, b = parts[0]
+    for t_i, b_i in parts[1:]:
+        b, t = overlap_two_series(b, t, b_i, t_i)  # FTIO's order is (b, t)
+    return np.asarray(t), np.asarray(b)
+
+
+def _prediction(trace: str, ftio_args: list[str] | None, mode: str | None = None):
+    """FTIO's STFT on one I/O mode, or on the sum of all read and write signals.
+
+    With `mode` (FTIO's -m), only that mode is loaded; if the trace moved no
+    bytes in it, all read and write modes are combined instead.
+    """
+    from ftio.cli.ftio_core import core
+    from ftio.parse.args import parse_args
+    from ftio.parse.helper import match_mode
+
+    sims = None
+    if mode is not None:
+        ftio_mode = match_mode(mode)  # e.g. "r" -> "read_sync"
+        sims = _load_sims(trace, {ftio_mode.split("_")[0]: (ftio_mode,)})
+        if not any(s["total_bytes"] > 0 for ss in sims.values() for s in ss):
+            print(  # stderr, as phase_model hides FTIO's stdout
+                f"PhaseVector: no {ftio_mode} I/O in {trace}, "
+                "combining all read and write modes instead",
+                file=sys.stderr,
+            )
+            sims = None
+    if sims is None:
+        sims = _load_sims(trace)
+    first = next(
+        (ss[0] for ss in (sims.get("write", []), sims.get("read", [])) if ss), None
+    )
+    if first is None:
+        raise ValueError(f"PhaseVector: no I/O found in {trace}")
+    signals = {
+        mode: [(s["time"], s["bandwidth"]) for s in ss] for mode, ss in sims.items()
+    }
+    t, b = combine_signals(signals)
+    total = sum(s["total_bytes"] for ss in sims.values() for s in ss)
+    sim = {**first, "time": t, "bandwidth": b, "total_bytes": total}  # keeps ranks
+    args = parse_args([*FTIO_ARGS, *(ftio_args or [])], "ftio")
+    prediction, _ = core(sim, args)
+    return prediction, args, signals
 
 
 def phase_vectors(
-    trace: str, ftio_args: list[str] | None = None, with_io: bool = True
+    trace: str,
+    ftio_args: list[str] | None = None,
+    mode: str | None = None,
 ) -> list[PhaseVector]:
     """Run FTIO's STFT + phase automaton on one trace and describe its phases.
+
+    By default, phases are detected on the sum of all read and write signals,
+    so a phase that writes and reads back (e.g. a checkpoint) stays one phase;
+    the read and write bytes of each phase are kept in PhaseVector.io.
 
     Args:
         trace: path of one trace file.
         ftio_args: extra FTIO options, added after FTIO_ARGS, so they override
-            it (e.g. another --pa-period-ratio). Must keep "-tr stft".
-        with_io: also load the read and write signals and fill PhaseVector.io.
+            it (e.g. another --pa-period-ratio). Must keep "-tr stft". FTIO's
+            -m has no effect here, use `mode` instead.
+        mode: analyze only this I/O mode (FTIO's -m values, e.g. "read_sync")
+            for both the phases and PhaseVector.io; falls back to all modes
+            combined if the trace moved no bytes in it.
 
     Raises:
         ValueError: FTIO produced no per-window STFT sequence, or the automaton
             accepted none of its windows.
     """
-    from ftio.cli.ftio_core import main as ftio_main
     from ftio.modeling.phase_automaton import windows_from_stft_prediction
 
-    predictions, args = ftio_main(["ftio", trace, *FTIO_ARGS, *(ftio_args or [])])
-    windows = windows_from_stft_prediction(predictions[0]) if predictions else []
+    prediction, args, signals = _prediction(trace, ftio_args, mode)
+    windows = windows_from_stft_prediction(prediction) if prediction else []
     if not windows:
         raise ValueError(f"PhaseVector: no per-window STFT sequence for {trace}")
     aut = PhaseAutomaton.from_args(args)
@@ -297,7 +364,6 @@ def phase_vectors(
             f"PhaseVector: no phase found for {trace} "
             f"(need at least {aut.min_cycles} periods per STFT window)"
         )
-    signals = load_signals(trace) if with_io else None
     return from_automaton(
-        aut, predictions[0].t_start, predictions[0].t_end, signals, run_id=trace
+        aut, prediction.t_start, prediction.t_end, signals, run_id=trace
     )
