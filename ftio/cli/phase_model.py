@@ -22,7 +22,13 @@ from rich.console import Console
 
 from ftio.modeling.alignment_matcher import AlignmentMatcher
 from ftio.modeling.assignment_matcher import AssignmentMatcher
-from ftio.modeling.phase_matcher import NEW_FAMILY, PhaseMatcher
+from ftio.modeling.phase_matcher import (
+    DESCRIPTOR_KINDS,
+    FEATURES,
+    NEW_FAMILY,
+    PhaseMatcher,
+    parse_features,
+)
 from ftio.modeling.phase_vector import phase_vectors
 from ftio.parse.ftio_to_extrap import build_experiment, fit_models, print_models
 from ftio.parse.helper import print_info
@@ -101,11 +107,42 @@ def main(args: list[str] = sys.argv) -> None:
         "(same order in every run) or by assignment (any order, at most one phase "
         "per family and run)",
     )
+    parser.add_argument(
+        "--features",
+        nargs="+",
+        metavar="NAME[:WEIGHT]",
+        default=None,
+        help="descriptors the alignment or assignment matcher compares, each with "
+        "an optional weight (default 1.0), e.g. --features period_ratio "
+        f"relative_position:0.5. Known: {', '.join(DESCRIPTOR_KINDS)}. "
+        "Default: all of them, relative_position with weight 0.5",
+    )
     phase_model_args, ftio_args = parser.parse_known_args(
         args[1:]
     )  # the rest goes to FTIO
 
     print_info("Phase_model", False)
+
+    features = FEATURES
+    if phase_model_args.features is not None:
+        if phase_model_args.matcher == "position":
+            console.print(
+                "[red]--- Error --- [/]\n[red]-> --features needs --matcher "
+                "alignment or assignment, the position matcher compares no descriptors.[/]"
+            )
+            sys.exit(1)
+        try:
+            features = parse_features(phase_model_args.features)
+        except ValueError as e:
+            console.print(f"[red]--- Error --- [/]\n[red]-> --features: {e}.[/]")
+            sys.exit(1)
+    if phase_model_args.mode is not None and phase_model_args.matcher != "position":
+        single = [f for f in ("read_fraction", "relative_volume") if f in features]
+        if single:  # with one I/O mode, they no longer tell phases apart
+            console.print(
+                f"[yellow]-m {phase_model_args.mode} analyzes one I/O mode only, "
+                f"so {', '.join(single)} carry little information[/]"
+            )
 
     missing = [path for path in phase_model_args.files if not os.path.exists(path)]
     if missing:  # checked here, as FTIO's own message is hidden below
@@ -137,7 +174,13 @@ def main(args: list[str] = sys.argv) -> None:
         "alignment": AlignmentMatcher,
         "assignment": AssignmentMatcher,
     }
-    matcher = matchers[phase_model_args.matcher]()
+    if phase_model_args.matcher == "position":
+        matcher = PhaseMatcher()
+        print("matcher: position")
+    else:
+        matcher = matchers[phase_model_args.matcher](features=features)
+        used = ", ".join(f"{name}={w:g}" for name, (_, w) in features.items())
+        print(f"matcher: {phase_model_args.matcher}, features: {used}")
     for run in sorted(runs.values(), key=lambda run: run[0].ranks):
         for m in matcher.match_run(run):
             # a cost exists only where a matcher compared the phase with a family

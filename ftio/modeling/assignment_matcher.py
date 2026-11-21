@@ -23,6 +23,7 @@ import numpy as np
 from scipy.optimize import linear_sum_assignment
 
 from ftio.modeling.phase_matcher import (
+    FEATURES,  # default descriptors, shared with AlignmentMatcher
     NEW_FAMILY,
     NEW_RANKS,
     SAME_RANKS,
@@ -32,11 +33,6 @@ from ftio.modeling.phase_matcher import (
     phase_distance,
 )
 from ftio.modeling.phase_vector import PhaseVector
-
-# descriptor -> (comparison, weight), see alignment_matcher.FEATURES.
-# Features are added one by one; first the read/write mix, which needs the
-# read and write modes combined (with a single -m mode it is 0 or 1 everywhere).
-FEATURES = {"read_fraction": ("lin", 1.0)}
 
 
 class AssignmentMatcher(PhaseMatcher):

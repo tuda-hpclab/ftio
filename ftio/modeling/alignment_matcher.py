@@ -21,6 +21,7 @@ from __future__ import annotations
 import numpy as np
 
 from ftio.modeling.phase_matcher import (
+    FEATURES,  # default descriptors, shared with AssignmentMatcher
     NEW_FAMILY,
     NEW_RANKS,
     SAME_RANKS,
@@ -30,18 +31,6 @@ from ftio.modeling.phase_matcher import (
     phase_distance,
 )
 from ftio.modeling.phase_vector import PhaseVector
-
-# descriptor -> (comparison, weight)
-# we assume that all scale-free descriptors are equally important. 
-# "log": |log(a/b)| for positive ratios,
-# "lin": |a-b| for values in [0, 1].
-FEATURES = {
-    "period_ratio": ("log", 1.0),
-    "relative_duration": ("lin", 1.0),
-    "relative_volume": ("lin", 1.0),
-    "read_fraction": ("lin", 1.0),
-    "relative_position": ("lin", 0.5),  # index-based, shifts with extra phases
-}
 
 #used for the Needleman-Wunsch algorithm
 DIAG, UP, LEFT = 0, 1, 2  # match, family missing in run, phase without family
@@ -105,10 +94,13 @@ def align(dist: np.ndarray, gap: float):
 class AlignmentMatcher(PhaseMatcher):
     """Matches a run by aligning it to the ordered list of known families."""
 
-    def __init__(self, threshold: float = 0.5, trend: bool = True):
+    def __init__(
+        self, threshold: float = 0.5, trend: bool = True, features: dict = FEATURES
+    ):
         super().__init__(threshold)
         self.gap = threshold / 2  # a pair is matched only if its distance < threshold
         self.trend = trend  # extrapolate families beyond their observed rank counts
+        self.features = features  # descriptor -> (comparison, weight)
         self.order: list[int] = []  # family ids in run order
 
     def _reference(self, fam: PhaseFamily, ranks: int) -> dict:
@@ -131,7 +123,7 @@ class AlignmentMatcher(PhaseMatcher):
         ):
             return ref
         members = [(m.ranks, m.as_dict()) for m in fam.members]
-        for name, (kind, _) in FEATURES.items():
+        for name, (kind, _) in self.features.items():
             # extrapolate the descriptor's trend to the new rank count
             value = power_law_at([(r, d.get(name, np.nan)) for r, d in members], ranks)
             if np.isfinite(value):
@@ -150,7 +142,7 @@ class AlignmentMatcher(PhaseMatcher):
                     phase_distance(
                         self._reference(self.families[f], v.ranks),
                         v.as_dict(),
-                        FEATURES,
+                        self.features,
                     )
                     for v in run
                 ]
