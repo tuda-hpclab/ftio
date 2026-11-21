@@ -27,6 +27,7 @@ from ftio.modeling.phase_matcher import (
     Match,
     PhaseFamily,
     PhaseMatcher,
+    phase_distance,
 )
 from ftio.modeling.phase_vector import PhaseVector
 
@@ -61,24 +62,6 @@ def power_law_at(points: list[tuple[int, float]], at: int) -> float:
     log_y = np.log([y for _, y in pts])
     slope, intercept = np.polyfit(log_r, log_y, 1)
     return float(np.exp(intercept + slope * np.log(at)))
-
-
-def phase_distance(a: dict, b: dict, features: dict = FEATURES) -> float:
-    """Weighted mean distance over the descriptors both phases have (NaN skipped)."""
-    total = weight = 0.0
-    for name, (kind, w) in features.items():
-        x, y = a.get(name, np.nan), b.get(name, np.nan)
-        if not (np.isfinite(x) and np.isfinite(y)):
-            continue
-        if kind == "log":
-            if x <= 0 or y <= 0:
-                continue
-            d = abs(np.log(x / y))
-        else:
-            d = abs(x - y)
-        total += w * d
-        weight += w
-    return total / weight if weight > 0 else np.inf
 
 
 def align(dist: np.ndarray, gap: float):
@@ -165,7 +148,9 @@ class AlignmentMatcher(PhaseMatcher):
             [
                 [
                     phase_distance(
-                        self._reference(self.families[f], v.ranks), v.as_dict()
+                        self._reference(self.families[f], v.ranks),
+                        v.as_dict(),
+                        FEATURES,
                     )
                     for v in run
                 ]

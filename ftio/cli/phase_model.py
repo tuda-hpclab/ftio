@@ -21,6 +21,7 @@ import sys
 from rich.console import Console
 
 from ftio.modeling.alignment_matcher import AlignmentMatcher
+from ftio.modeling.assignment_matcher import AssignmentMatcher
 from ftio.modeling.phase_matcher import NEW_FAMILY, PhaseMatcher
 from ftio.modeling.phase_vector import phase_vectors
 from ftio.parse.ftio_to_extrap import build_experiment, fit_models, print_models
@@ -94,9 +95,11 @@ def main(args: list[str] = sys.argv) -> None:
     )
     parser.add_argument(
         "--matcher",
-        choices=("position", "alignment"),
+        choices=("position", "alignment", "assignment"),
         default="position",
-        help="match phases by index (all runs need the same phases) or by alignment",
+        help="match phases by index (all runs need the same phases), by alignment "
+        "(same order in every run) or by assignment (any order, at most one phase "
+        "per family and run)",
     )
     phase_model_args, ftio_args = parser.parse_known_args(
         args[1:]
@@ -129,13 +132,16 @@ def main(args: list[str] = sys.argv) -> None:
         )
         sys.exit(1)
 
-    matcher = (
-        AlignmentMatcher() if phase_model_args.matcher == "alignment" else PhaseMatcher()
-    )
+    matchers = {
+        "position": PhaseMatcher,
+        "alignment": AlignmentMatcher,
+        "assignment": AssignmentMatcher,
+    }
+    matcher = matchers[phase_model_args.matcher]()
     for run in sorted(runs.values(), key=lambda run: run[0].ranks):
         for m in matcher.match_run(run):
-            # a cost exists only where alignment compared the phase with a family
-            matched = isinstance(matcher, AlignmentMatcher) and m.case != NEW_FAMILY
+            # a cost exists only where a matcher compared the phase with a family
+            matched = type(matcher) is not PhaseMatcher and m.case != NEW_FAMILY
             cost = f", cost {m.cost:.3f}" if matched else ""
             print(
                 f"p={m.phase.ranks} phase {m.phase.phase_id} -> family_{m.family_id} "

@@ -19,11 +19,36 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+import numpy as np
+
 from ftio.modeling.phase_vector import PhaseVector
 
 SAME_RANKS = "same_ranks"  # known family, already seen at this rank count
 NEW_RANKS = "new_ranks"  # known family, not yet seen at this rank count
 NEW_FAMILY = "new_family"  # first time this phase_id is seen
+
+
+def phase_distance(a: dict, b: dict, features: dict) -> float:
+    """Weighted mean distance over the descriptors both phases have (NaN skipped).
+
+    features: descriptor -> (comparison, weight); "log": |log(a/b)| for
+    positive ratios, "lin": |a-b| for values in [0, 1].
+    Returns inf if the phases share no descriptor.
+    """
+    total = weight = 0.0
+    for name, (kind, w) in features.items():
+        x, y = a.get(name, np.nan), b.get(name, np.nan)
+        if not (np.isfinite(x) and np.isfinite(y)):
+            continue
+        if kind == "log":
+            if x <= 0 or y <= 0:
+                continue
+            d = abs(np.log(x / y))
+        else:
+            d = abs(x - y)
+        total += w * d
+        weight += w
+    return total / weight if weight > 0 else np.inf
 
 
 @dataclass
