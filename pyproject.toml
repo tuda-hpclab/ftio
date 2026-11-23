@@ -144,8 +144,8 @@ ml-libs = [
 ]
 
 redis-libs = [
-    "redis",
-	"fakeredis[lua]",
+    "redis<8.2",  # redis 8.2 breaks fakeredis 2.40 (__closure__ AttributeError)
+    "fakeredis[lua]",
 ]
 
 [tool.setuptools.dynamic]
