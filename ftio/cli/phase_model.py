@@ -118,11 +118,24 @@ def main(args: list[str] = sys.argv) -> None:
         f"bytes_per_rank:0.5. Known: {', '.join(DESCRIPTOR_KINDS)}. "
         "Default: " + " ".join(f"{name}:{w:g}" for name, (_, w) in FEATURES.items()),
     )
+    parser.add_argument(
+        "--recurrences",
+        action="store_true",
+        help="with --matcher assignment: a phase that repeats an earlier phase of "
+        "its run (same rank count, similar period) joins that phase's family "
+        "instead of being assigned on its own",
+    )
     phase_model_args, ftio_args = parser.parse_known_args(
         args[1:]
     )  # the rest goes to FTIO
 
     print_info("Phase_model", False)
+
+    if phase_model_args.recurrences and phase_model_args.matcher != "assignment":
+        console.print(
+            "[red]--- Error --- [/]\n[red]-> --recurrences needs --matcher assignment.[/]"
+        )
+        sys.exit(1)
 
     features = FEATURES
     if phase_model_args.features is not None:
@@ -185,6 +198,13 @@ def main(args: list[str] = sys.argv) -> None:
     if phase_model_args.matcher == "position":
         matcher = PhaseMatcher()
         print("matcher: position")
+    elif phase_model_args.matcher == "assignment":
+        matcher = AssignmentMatcher(
+            features=features, recurrences=phase_model_args.recurrences
+        )
+        used = ", ".join(f"{name}={w:g}" for name, (_, w) in features.items())
+        rec = ", recurrences" if phase_model_args.recurrences else ""
+        print(f"matcher: assignment{rec}, features: {used}")
     else:
         matcher = matchers[phase_model_args.matcher](features=features)
         used = ", ".join(f"{name}={w:g}" for name, (_, w) in features.items())
@@ -194,9 +214,14 @@ def main(args: list[str] = sys.argv) -> None:
             # a cost exists only where a matcher compared the phase with a family
             matched = type(matcher) is not PhaseMatcher and m.case != NEW_FAMILY
             cost = f", cost {m.cost:.3f}" if matched else ""
+            repeat = (
+                f", repeats phase {m.phase.same_as}"
+                if m.phase.same_as is not None
+                else ""
+            )
             print(
                 f"p={m.phase.ranks} phase {m.phase.phase_id} -> family_{m.family_id} "
-                f"({m.case}{cost})"
+                f"({m.case}{cost}{repeat})"
             )
 
     for fam in matcher.families.values():

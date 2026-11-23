@@ -39,6 +39,11 @@ FTIO_ARGS = ["-e", "no", "-tr", "stft", "--pa-period-ratio", "1.5"]
 # (time, bandwidth); b[i] holds from t[i] until t[i+1]
 Signal = tuple[np.ndarray, np.ndarray]
 
+# max period ratio between two visits of the same phase in one run (see
+# label_recurrences). Repeats measured on synthetic data agree within 1.02; 1.5
+# (the transition threshold) also links a phase measured at half its period.
+RECURRENCE_RATIO = 1.2
+
 
 @dataclass
 class RunContext:
@@ -79,6 +84,9 @@ class PhaseVector:
     period: float  # median over the phase's STFT windows
     n_windows: int  # windows the automaton accepted (the warm-up guard drops some)
     io: IOMode | None = None  # None if the I/O signals were not loaded
+    # phase_id of the earlier phase of the same run this one repeats (A ... A),
+    # None for a first visit; set by label_recurrences
+    same_as: int | None = None
     # source automaton state, kept for reference (e.g. its per-window predictions)
     state: PhaseState | None = field(default=None, repr=False)
     run: RunContext | None = field(default=None, repr=False)
@@ -262,7 +270,41 @@ def from_automaton(
     )
     for v in vectors:
         v.run = run
+    label_recurrences(vectors)
     return vectors
+
+
+def label_recurrences(
+    vectors: list[PhaseVector], ratio: float = RECURRENCE_RATIO
+) -> None:
+    """Set same_as for phases that repeat an earlier phase of the same run.
+
+    The automaton opens a new state on every transition, so a phase that comes
+    back after another one (A -> B -> A) gets a new phase_id. A phase repeats
+    the earlier first visit with the same rank count and the closest period,
+    if the periods differ by less than `ratio`. Phases at other rank counts are
+    never linked: their period changes with the scale, which is what the
+    cross-run matchers handle. The phases stay separate, each with its own
+    times and bytes; only same_as links them.
+
+    Args:
+        vectors: the phases of one run, in run order.
+        ratio: max period ratio (larger / smaller) between two visits.
+    """
+    founders: list[PhaseVector] = []
+    for v in vectors:
+        v.same_as = None
+        best, best_ratio = None, ratio
+        for f in founders:
+            if f.ranks != v.ranks or not (f.period > 0 and v.period > 0):
+                continue
+            r = max(v.period / f.period, f.period / v.period)
+            if r < best_ratio:
+                best, best_ratio = f, r
+        if best is None:
+            founders.append(v)
+        else:
+            v.same_as = best.phase_id
 
 
 def _load_sims(
