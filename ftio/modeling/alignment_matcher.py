@@ -33,7 +33,7 @@ from ftio.modeling.phase_matcher import (
 )
 from ftio.modeling.phase_vector import PhaseVector
 
-#used for the Needleman-Wunsch algorithm
+# used for the Needleman-Wunsch algorithm
 DIAG, UP, LEFT = 0, 1, 2  # match, family missing in run, phase without family
 
 

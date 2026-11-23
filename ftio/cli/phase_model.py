@@ -116,8 +116,7 @@ def main(args: list[str] = sys.argv) -> None:
         help="descriptors the alignment or assignment matcher compares, each with "
         "an optional weight (default 1.0), e.g. --features read_fraction "
         f"bytes_per_rank:0.5. Known: {', '.join(DESCRIPTOR_KINDS)}. "
-        "Default: "
-        + " ".join(f"{name}:{w:g}" for name, (_, w) in FEATURES.items()),
+        "Default: " + " ".join(f"{name}:{w:g}" for name, (_, w) in FEATURES.items()),
     )
     phase_model_args, ftio_args = parser.parse_known_args(
         args[1:]

@@ -44,6 +44,7 @@ from ftio.modeling.phase_matcher import (
 )
 from ftio.modeling.phase_vector import PhaseVector
 
+
 def median_of(points: list[tuple[int, float]]) -> float:
     """Median of a descriptor over (ranks, value) points (NaN skipped)."""
     values = [y for _, y in points if np.isfinite(y)]
@@ -122,7 +123,7 @@ class AssignmentMatcher(PhaseMatcher):
         rows, cols = linear_sum_assignment(cost)  # rows come back sorted
 
         matches = []
-        for i, j in zip(rows, cols):
+        for i, j in zip(rows, cols, strict=True):
             v = run[i]
             if j < len(fids):
                 fid = fids[j]
