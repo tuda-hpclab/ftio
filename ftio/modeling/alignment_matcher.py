@@ -22,6 +22,7 @@ import numpy as np
 
 from ftio.modeling.phase_matcher import (
     FEATURES,  # default descriptors, shared with AssignmentMatcher
+    MIN_TREND_RANKS,
     NEW_FAMILY,
     NEW_RANKS,
     SAME_RANKS,
@@ -34,8 +35,6 @@ from ftio.modeling.phase_vector import PhaseVector
 
 #used for the Needleman-Wunsch algorithm
 DIAG, UP, LEFT = 0, 1, 2  # match, family missing in run, phase without family
-
-MIN_TREND_RANKS = 3  # rank counts a family needs before its trend is extrapolated
 
 
 def power_law_at(points: list[tuple[int, float]], at: int) -> float:

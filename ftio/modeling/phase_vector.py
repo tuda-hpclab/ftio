@@ -92,11 +92,23 @@ class PhaseVector:
         return 1.0 / self.period if self.period > 0 else np.nan
 
     @property
+    def n_bursts(self) -> float:
+        """Number of periods (I/O bursts) in the phase: duration / period."""
+        return self.duration / self.period if self.period > 0 else np.nan
+
+    @property
     def intensity(self) -> float:
         """Average bandwidth over the phase (bytes / duration), idle time included."""
         if self.io is None or self.duration <= 0:
             return np.nan
         return self.io.total_bytes / self.duration
+
+    @property
+    def volume_per_period(self) -> float:
+        """Bytes moved per period (one I/O burst on average)."""
+        if not self.period > 0:  # also catches nan
+            return np.nan
+        return self.intensity * self.period
 
     @property
     def bytes_per_rank(self) -> float:
@@ -144,6 +156,7 @@ class PhaseVector:
             "duration": self.duration,
             "period": self.period,
             "frequency": self.frequency,
+            "n_bursts": self.n_bursts,
             "n_windows": self.n_windows,
             "period_ratio": self.period_ratio,
             "relative_position": self.relative_position,
@@ -157,6 +170,7 @@ class PhaseVector:
                     "total_bytes": self.io.total_bytes,
                     "read_fraction": self.io.read_fraction,
                     "intensity": self.intensity,
+                    "volume_per_period": self.volume_per_period,
                     "bytes_per_rank": self.bytes_per_rank,
                     "relative_volume": self.relative_volume,
                 }

@@ -2,9 +2,14 @@
 PhaseMatcher: group the phases of several runs into phase families.
 
 A phase family is one behavior observed in one or more runs, possibly at
-different rank counts. Phases are currently matched by position: phases with
+different rank counts. PhaseMatcher itself matches by position: phases with
 the same phase_id belong to the same family, which assumes that every run goes
-through the same phases in the same order.
+through the same phases in the same order. AlignmentMatcher and
+AssignmentMatcher build on it and compare descriptors instead.
+
+This module also holds what they share: the descriptors (DESCRIPTOR_KINDS),
+which of them are clean (CLEAN, NOT_CLEAN) or change with the rank count
+(RANK_DEPENDENT), the default features (FEATURES) and phase_distance.
 
 Author: Albani Alvarado Mauriello
 Copyright (c) 2024-2026 TU Darmstadt, Germany
@@ -27,26 +32,67 @@ SAME_RANKS = "same_ranks"  # known family, already seen at this rank count
 NEW_RANKS = "new_ranks"  # known family, not yet seen at this rank count
 NEW_FAMILY = "new_family"  # first time this phase_id is seen
 
+MIN_TREND_RANKS = 3  # rank counts a family needs before a trend is fitted
+
 # descriptors a matcher can compare (keys of PhaseVector.as_dict()) -> comparison:
 # "log": |log(a/b)| for positive ratios, "lin": |a-b| for values in [0, 1]
 DESCRIPTOR_KINDS = {
-    "period_ratio": "log",
-    "relative_duration": "lin",
-    "relative_volume": "lin",
     "read_fraction": "lin",
+    "relative_volume": "lin",
+    "total_bytes": "log",
+    "bytes_per_rank": "log",
     "relative_position": "lin",
+    "relative_duration": "lin",
+    "intensity": "log",  # bytes / duration
+    "duration": "log",
+    "period": "log",
+    "period_ratio": "log",  # period / shortest period of the run
+    "volume_per_period": "log",  # intensity x period, bytes per I/O burst
+    "n_bursts": "log",  # duration / period
+}
+
+# descriptors that change with the rank count. AssignmentMatcher follows their
+# trend over a family's members; all others are taken as scale-invariant.
+RANK_DEPENDENT = {
+    "total_bytes",
+    "bytes_per_rank",  # constant in weak scaling, ~1/p in strong scaling
+    "intensity",
+    "duration",
+    "period",
+    "volume_per_period",
+}
+
+# descriptors that are safe to match on before the period is modeled: bytes
+# only, no time and no order. All others are for ablations only (NOT_CLEAN).
+CLEAN = {"read_fraction", "relative_volume", "total_bytes", "bytes_per_rank"}
+
+# duration = n_bursts x period for any number of bursts: a number that varies
+# with the rank count only adds noise, the period stays in it
+_IN_DURATION = "contains the period (duration = n_bursts x period)"
+
+# descriptor -> why matching on it is not clean. The period is what
+# phase_model fits (period, frequency): matching on it makes the fitted models
+# look better than they are, as the matcher then picks the phases that agree
+# with the trend. Update if the targets change.
+NOT_CLEAN = {
+    "period": "is the modeled period",
+    "period_ratio": "contains the period",
+    "volume_per_period": "contains the period",
+    "n_bursts": "contains the period",
+    "duration": _IN_DURATION,
+    "relative_duration": _IN_DURATION,
+    "intensity": "contains the period (bytes / duration = bytes per burst / period)",
+    "relative_position": "uses the phase order, which assignment is meant to "
+    "ignore, and splits recurring phases",
 }
 
 # default descriptors of AlignmentMatcher and AssignmentMatcher:
-# descriptor -> (comparison, weight). All scale-free descriptors are assumed
-# equally important, except the position, which is index-based and shifts
-# when a run has extra or missing phases.
+# descriptor -> (comparison, weight). A subset of CLEAN. Both use the same
+# defaults, so their results differ only by the matching method.
 FEATURES = {
-    "period_ratio": ("log", 1.0),
-    "relative_duration": ("lin", 1.0),
-    "relative_volume": ("lin", 1.0),
     "read_fraction": ("lin", 1.0),
-    "relative_position": ("lin", 0.5),
+    "relative_volume": ("lin", 1.0),
+    "bytes_per_rank": ("log", 1.0),
 }
 
 

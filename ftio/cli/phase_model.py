@@ -26,6 +26,7 @@ from ftio.modeling.phase_matcher import (
     DESCRIPTOR_KINDS,
     FEATURES,
     NEW_FAMILY,
+    NOT_CLEAN,
     PhaseMatcher,
     parse_features,
 )
@@ -113,9 +114,10 @@ def main(args: list[str] = sys.argv) -> None:
         metavar="NAME[:WEIGHT]",
         default=None,
         help="descriptors the alignment or assignment matcher compares, each with "
-        "an optional weight (default 1.0), e.g. --features period_ratio "
-        f"relative_position:0.5. Known: {', '.join(DESCRIPTOR_KINDS)}. "
-        "Default: all of them, relative_position with weight 0.5",
+        "an optional weight (default 1.0), e.g. --features read_fraction "
+        f"bytes_per_rank:0.5. Known: {', '.join(DESCRIPTOR_KINDS)}. "
+        "Default: "
+        + " ".join(f"{name}:{w:g}" for name, (_, w) in FEATURES.items()),
     )
     phase_model_args, ftio_args = parser.parse_known_args(
         args[1:]
@@ -143,6 +145,13 @@ def main(args: list[str] = sys.argv) -> None:
                 f"[yellow]-m {phase_model_args.mode} analyzes one I/O mode only, "
                 f"so {', '.join(single)} carry little information[/]"
             )
+    not_clean = [f for f in features if f in NOT_CLEAN]
+    if not_clean and phase_model_args.matcher != "position":
+        reasons = "; ".join(f"{f} {NOT_CLEAN[f]}" for f in not_clean)
+        console.print(
+            f"[yellow]Not clean: {reasons}. Use this run to compare matching only, "
+            "not to judge the fitted models[/]"
+        )
 
     missing = [path for path in phase_model_args.files if not os.path.exists(path)]
     if missing:  # checked here, as FTIO's own message is hidden below
