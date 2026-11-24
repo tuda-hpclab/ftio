@@ -7,7 +7,7 @@ JSON results. It supports all FTIO CLI arguments.
 
 You can start the server with default settings or specify a custom port and host address.
 Note that this call is only avilable if you installed FTIO
-for [development]https://github.com/tuda-parallel/FTIO/tree/development?tab=readme-ov-file#automated-installation-developer-environment-setup).
+for [development]https://github.com/tuda-hpclab/ftio/tree/development?tab=readme-ov-file#automated-installation-developer-environment-setup).
 Afterwards, you can execute the command:
 
 ```bash
@@ -19,7 +19,7 @@ server_ftio
 ## Usage
 
 Running `server_ftio` starts the server by running the `main_cli()`
-function [server_ftio.py](https://github.com/tuda-parallel/FTIO/blob/development/ftio/util/server_ftio.py).
+function [server_ftio.py](https://github.com/tuda-hpclab/ftio/blob/development/ftio/util/server_ftio.py).
 By default, it listens on `127.0.0.1` and port `5000`, but you can specify custom address and port via environment
 variables or command-line
 options.

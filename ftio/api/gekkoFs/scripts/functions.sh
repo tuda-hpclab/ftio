@@ -705,7 +705,7 @@ EXCLUDE_PROXY=false
 	## build FTIO:
 	# echo -e "${GREEN}>>> Installing FTIO${BLACK}"
 	# cd ${INSTALL_LOCATION}
-	# git clone https://github.com/tuda-parallel/FTIO.git
+	# git clone https://github.com/tuda-hpclab/ftio.git
 	# ml lang/Python/3.10.8-GCCcore-12.2.0 || echo "skipping module load";
 	# cd FTIO
 	# # Install FTIO

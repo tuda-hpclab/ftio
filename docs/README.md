@@ -28,7 +28,7 @@ FTIO (Frequency Techniques for I/O) detects and predicts periodic I/O patterns i
 ### Install
 
 ```bash
-git clone https://github.com/tuda-parallel/FTIO.git
+git clone https://github.com/tuda-hpclab/ftio.git
 cd FTIO
 make install          # basic install
 source .venv/bin/activate

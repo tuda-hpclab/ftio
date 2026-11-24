@@ -8,7 +8,7 @@ This folder contains:
 
 ## Analyzing the provided trace file
 
-If you didn't install `ftio`, first check out version 0.0.1 as described [here](/artifacts/ipdps24/README.md#ftio-version), then install it as described [here](https://github.com/tuda-parallel/FTIO#installation).
+If you didn't install `ftio`, first check out version 0.0.1 as described [here](/artifacts/ipdps24/README.md#ftio-version), then install it as described [here](https://github.com/tuda-hpclab/ftio#installation).
 To get the dominant frequency with `ftio` simply call:
 
 ```sh
@@ -19,8 +19,8 @@ ftio lammps_3072.json
 
 ## Repeating the experiment on your cluster
 First, install the required software on your cluster:
-- [Install TMIO](https://github.com/tuda-parallel/TMIO#installation) 
-- [Install FTIO](https://github.com/tuda-parallel/FTIO#installation) 
+- [Install TMIO](https://github.com/tuda-hpclab/tmio#installation) 
+- [Install FTIO](https://github.com/tuda-hpclab/ftio#installation) 
 - [Install LAMMPS](https://docs.lammps.org/Install.html) with MPI support
 
 For this experiment, we executed LAMMPS on the Lichtenberg cluster with the following sbatch.sh script:
@@ -106,7 +106,7 @@ cd build
 make library
 ```
 
-This is also described in the [TMIO Github](https://github.com/tuda-parallel/TMIO/?tab=readme-ov-file#installation). 
+This is also described in the [TMIO Github](https://github.com/tuda-hpclab/tmio/?tab=readme-ov-file#installation). 
 Copy the library `libtmio.so`, the LAMMPS executable, the input file `in.flow.pois`, and the sbatch script `sbatch.sh` to the same folder. 
 Now, simply call the sbatch command:
 ```sh

@@ -36,7 +36,7 @@
       This helps us track contributions and avoids duplicate work. Keep the description abstract and add a few
       checkboxes listing what you want to add. You do not need to explicitly mention the methods. Keep it abstract,
       mentioning the purpose or benefits gained.
-    - Go to the **Issues** tab in the [FTIO repository](https://github.com/tuda-parallel/FTIO).
+    - Go to the **Issues** tab in the [FTIO repository](https://github.com/tuda-hpclab/ftio).
     - Click **New Issue** and provide a clear title and description.
     - Label the issue appropriately as `feature` and include call it `feature...`.
     - Once you push commits, some of them should address the issue.
@@ -96,7 +96,7 @@
   **If you work on a fork:**
   ```bash
   # First, add the main repo as a remote (one-time setup)
-  git remote add upstream https://github.com/tuda-parallel/FTIO.git
+  git remote add upstream https://github.com/tuda-hpclab/ftio.git
   git fetch upstream
   git checkout your-branch
   git merge upstream/development
@@ -165,12 +165,12 @@ That's it. Now every time you commit, the code is formatted correctly.
 ### 3. Working With Issues
 
 - **Link your work**: Link commits to your assigned issue in the main repository.
-- **If working on a fork**: To link your fork's commits to an issue in the main repository (`tuda-parallel/FTIO`), use the full repository reference in your commit messages or pull request descriptions.
-  - **Commit messages**: Include `tuda-parallel/FTIO#<issue_number>` in your commit message. For example:
+- **If working on a fork**: To link your fork's commits to an issue in the main repository (`tuda-hpclab/ftio`), use the full repository reference in your commit messages or pull request descriptions.
+  - **Commit messages**: Include `tuda-hpclab/ftio#<issue_number>` in your commit message. For example:
     ```bash
-    git commit -m "Add feature X (ref: tuda-parallel/FTIO#123)"
+    git commit -m "Add feature X (ref: tuda-hpclab/ftio#123)"
     ```
-  - **Pull Request descriptions**: Use keywords like `Closes tuda-parallel/FTIO#123` or `Fixes tuda-parallel/FTIO#123` to automatically link and eventually close the issue.
+  - **Pull Request descriptions**: Use keywords like `Closes tuda-hpclab/ftio#123` or `Fixes tuda-hpclab/ftio#123` to automatically link and eventually close the issue.
 - **Update issues regularly**: Post updates or ask code-related questions directly in the issue on the main repository.
 - **Use issue discussion**: Use issue discussion only for code-related questions. For content discussion, wait for the scheduled meetings.
 
@@ -327,7 +327,7 @@ Date: <Month Year>
 
 Licensed under the BSD 3-Clause License.  
 For more information, see the LICENSE file in the project root:
-https://github.com/tuda-parallel/FTIO/blob/main/LICENSE
+https://github.com/tuda-hpclab/ftio/blob/main/LICENSE
 """
 
 ```

@@ -317,6 +317,6 @@ period 10.0 s, confidence 1.0
 
 See [ZMQ](zmq.md#generic-zmq-format) for the wire format. For the GekkoFS/GLASS
 setup (Cargo staging, the GekkoFS 9 field message) see
-[`predictor_gekko_zmq.py`](https://github.com/tuda-parallel/FTIO/blob/main/ftio/api/gekkoFs/predictor_gekko_zmq.py).
+[`predictor_gekko_zmq.py`](https://github.com/tuda-hpclab/ftio/blob/main/ftio/api/gekkoFs/predictor_gekko_zmq.py).
 
 <p align="right"><a href="#api">⬆</a></p>

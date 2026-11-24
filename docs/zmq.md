@@ -212,7 +212,7 @@ while True:
 
 ## ZMQ with TMIO
 
-[TMIO](https://github.com/tuda-parallel/TMIO) can stream bandwidth data directly to `ftio` or `predictor` without writing trace files.
+[TMIO](https://github.com/tuda-hpclab/tmio) can stream bandwidth data directly to `ftio` or `predictor` without writing trace files.
 
 > **Note:** ZMQ support in TMIO is still under active development.
 

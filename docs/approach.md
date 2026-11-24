@@ -8,7 +8,7 @@ FTIO supports two modes:
 	- [Burst Width Estimation](#burst-width-estimation)
 
 ## Offline Detection
-The Python implementation of FTIO ([`ftio`](https://github.com/tuda-parallel/FTIO/tree/main/ftio/cli/ftio_core.py)) takes the traces that contain the bandwidth over time to find the period of the I/O phases (if any). 
+The Python implementation of FTIO ([`ftio`](https://github.com/tuda-hpclab/ftio/tree/main/ftio/cli/ftio_core.py)) takes the traces that contain the bandwidth over time to find the period of the I/O phases (if any). 
 An overview of `ftio` is provided in the image below:
 
 <br />
@@ -37,7 +37,7 @@ An overview of the core of FTIO is provided below:
 
  ## Online Prediction
 
-The tool [`predictor`](https://github.com/tuda-parallel/FTIO/tree/main/ftio/cli/predictor.py) launches `ftio` in a loop. It monitors a file for changes. The file contains bandwidth values over time. Once the file changes, `ftio` is called and a new prediction is found. `predictor` performs a few additional steps compared `ftio`:
+The tool [`predictor`](https://github.com/tuda-hpclab/ftio/tree/main/ftio/cli/predictor.py) launches `ftio` in a loop. It monitors a file for changes. The file contains bandwidth values over time. Once the file changes, `ftio` is called and a new prediction is found. `predictor` performs a few additional steps compared `ftio`:
 * FTIO results are merged into frequency ranges using DB-Scan​
 * Conditional probability is calculated
 * Data is further processed (e.g., average bytes estimation, estimated number of phases,...)

@@ -16,7 +16,7 @@ setup(
     # description=info['__description__'],
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/tuda-parallel/FTIO",
+    url="https://github.com/tuda-hpclab/ftio",
     entry_points={
         "console_scripts": [
             # ftio

@@ -1,11 +1,11 @@
 # Tools
-Aside from [`ftio`](https://github.com/tuda-parallel/FTIO#usage) or [`predictor`](https://github.com/tuda-parallel/FTIO/blob/main/docs/approach.md#online-prediction), the FTIO repository offers several more tools for various purposes: 
+Aside from [`ftio`](https://github.com/tuda-hpclab/ftio#usage) or [`predictor`](https://github.com/tuda-hpclab/ftio/blob/main/docs/approach.md#online-prediction), the FTIO repository offers several more tools for various purposes: 
 
 - [`ioplot`](#ioplot) generates interactive plots in HTML
 - [`ioparse`](#parse) parses and merges several traces to an [Extra-P](https://github.com/extra-p/extrap)-supported file format
-- [`convert_trace`](#convert_trace) converts an old [TMIO](https://github.com/tuda-parallel/TMIO) trace to the latest version
+- [`convert_trace`](#convert_trace) converts an old [TMIO](https://github.com/tuda-hpclab/tmio) trace to the latest version
 
-The tools are automatically generated when installing FTIO, for example, by calling `make install` as described [here](https://github.com/tuda-parallel/FTIO#installation)
+The tools are automatically generated when installing FTIO, for example, by calling `make install` as described [here](https://github.com/tuda-hpclab/ftio#installation)
 
 ## ioplot
 This tool generates interactive plots using Plotly. Supported file formats are described [here](./file_formats.md).
@@ -32,7 +32,7 @@ ioplot *.json
 ```
 
 ## ioparse
-Parses and merges several traces generated with [FTIO](https://github.com/tuda-parallel/FTIO) or [TMIO](https://github.com/tuda-parallel/TMIO) to an [Extra-P](https://github.com/extra-p/extrap) supported file format. Supported file formats are described [here](./file_formats.md). Usage:
+Parses and merges several traces generated with [FTIO](https://github.com/tuda-hpclab/ftio) or [TMIO](https://github.com/tuda-hpclab/tmio) to an [Extra-P](https://github.com/extra-p/extrap) supported file format. Supported file formats are described [here](./file_formats.md). Usage:
 ```bash
 usage: ioparse [-h] [-m MODE] [-s SOURCE] [--scale] [--sum]
                [--no_sum] [--avr] [--no_avr] [--ind] [--no_ind]
@@ -63,7 +63,7 @@ convert_trace 9216.json -o file_name.json
 
 ## parallel_trace_analysis
 Kindly see this link for more details:
-https://github.com/tuda-parallel/FTIO/tree/main/artifacts/ipdps25
+https://github.com/tuda-hpclab/ftio/tree/main/artifacts/ipdps25
 
 Example:
 ``` bash

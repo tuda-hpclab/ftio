@@ -42,7 +42,7 @@ Next, run `ftio` on the trace file as described [here](#run-ftio).
 
 
 ## Run FTIO
-If you didn't install `ftio`, first check out version 0.0.1 as described [here](/artifacts/ipdps24/README.md#ftio-version), then install it as described [here](https://github.com/tuda-parallel/FTIO#installation).
+If you didn't install `ftio`, first check out version 0.0.1 as described [here](/artifacts/ipdps24/README.md#ftio-version), then install it as described [here](https://github.com/tuda-hpclab/ftio#installation).
 The instructions below assume that the trace file is called `9216.json`, which after [extracting](#extract-the-provided-trace-file) the trace file, should be located in `data/application_traces/IOR`.
 
 To get the dominant frequency with `ftio` simply call:
@@ -69,7 +69,7 @@ ftio 9216.json  -e no  -t 0.45 -c
 ### Detection Mode:
 Download and extract the file data.zip as described [here](/artifacts/ipdps24/README.md#extracting-the-data-set).
 
-Navigate to `data/application_traces/IOR/overhead/detection` and call [`ioplot`](https://github.com/tuda-parallel/FTIO/blob/main/docs/tools.md#ioplot):
+Navigate to `data/application_traces/IOR/overhead/detection` and call [`ioplot`](https://github.com/tuda-hpclab/ftio/blob/main/docs/tools.md#ioplot):
 
 ```sh
 cd data/application_traces/IOR/overhead/detection
@@ -84,7 +84,7 @@ Now examine the plots in your browser by selecting "Time". If your browser does 
 
 Download and extract the file data.zip
 
-Navigate to `data/application_traces/IOR/overhead/prediction` and call [`ioplot`](https://github.com/tuda-parallel/FTIO/blob/main/docs/tools.md#ioplot):
+Navigate to `data/application_traces/IOR/overhead/prediction` and call [`ioplot`](https://github.com/tuda-hpclab/ftio/blob/main/docs/tools.md#ioplot):
 
 ```sh
 cd data/application_traces/IOR/overhead/detection

@@ -63,11 +63,11 @@ classifiers = [
 
 
 [project.urls]
-Homepage = "https://github.com/tuda-parallel/FTIO"
-Documentation = "https://github.com/tuda-parallel/FTIO/docs"
-Repository = "https://github.com/tuda-parallel/FTIO"
-"Bug Tracker" = "https://github.com/tuda-parallel/FTIO/issues"
-Changelog = "https://github.com/tuda-parallel/FTIO/blob/master/CHANGELOG.md"
+Homepage = "https://github.com/tuda-hpclab/ftio"
+Documentation = "https://github.com/tuda-hpclab/ftio/docs"
+Repository = "https://github.com/tuda-hpclab/ftio"
+"Bug Tracker" = "https://github.com/tuda-hpclab/ftio/issues"
+Changelog = "https://github.com/tuda-hpclab/ftio/blob/master/CHANGELOG.md"
 
 
 [project.scripts]

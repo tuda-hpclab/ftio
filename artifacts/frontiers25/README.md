@@ -31,7 +31,7 @@ Before you start, there are two prerequisites:
 
 ### FTIO Version
 
-For all the cases below, `ftio` first needs to be installed (see [Installation](https://github.com/tuda-parallel/FTIO?tab=readme-ov-file#installation)). We used `ftio` version 0.0.7 for the experiment in the paper. To get this version, simply execute the following code:
+For all the cases below, `ftio` first needs to be installed (see [Installation](https://github.com/tuda-hpclab/ftio?tab=readme-ov-file#installation)). We used `ftio` version 0.0.7 for the experiment in the paper. To get this version, simply execute the following code:
 ```sh
 git checkout v0.0.7 
 ```
@@ -260,7 +260,7 @@ Download and extract the repository of the modified HACC-IO version from [here](
 #### Download and install TMIO:
 The next step is to download and install TMIO and make sure that it works. For that, execute the following steps:
 ```bash
-git clone https://github.com/tuda-parallel/TMIO.git
+git clone https://github.com/tuda-hpclab/tmio.git
 git checkout v0.0.2
 cd TMIO/build
 make msgpack_library 

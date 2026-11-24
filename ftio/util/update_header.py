@@ -11,7 +11,7 @@ from pathlib import Path
 AUTHOR = "Ahmad Tarraf"
 INSTITUTION = "TU Darmstadt, Germany"
 LICENSE_NAME = "BSD 3-Clause License"
-LICENSE_URL = "https://github.com/tuda-parallel/FTIO/blob/main/LICENSE"
+LICENSE_URL = "https://github.com/tuda-hpclab/ftio/blob/main/LICENSE"
 # ============================================
 
 CURRENT_YEAR = datetime.datetime.now().year

@@ -22,7 +22,7 @@ git tag -a v0.0.X -m "IPDPS'24 release"
 git push --tags
 
 ## 3. Login to GitHub and create the release:
-- Go to https://github.com/tuda-parallel/FTIO/releases/new
+- Go to https://github.com/tuda-hpclab/ftio/releases/new
 - Select tag v0.0.X
 - Create a message like:
 
@@ -33,7 +33,7 @@ git push --tags
 - Fixed ...
 - Docs: ...
 
-### Full Changelog: https://github.com/tuda-parallel/FTIO/compare/v0.0.(X-1)...v0.0.X
+### Full Changelog: https://github.com/tuda-hpclab/ftio/compare/v0.0.(X-1)...v0.0.X
 
 ####################################
 
@@ -47,4 +47,4 @@ git push --tags
 - Cleaned Readme and extended [file formats](docs/file_formats.md) and [API](docs/api.md) documentation
 - Code cleaning
 
-### Full Changelog: https://github.com/tuda-parallel/FTIO/compare/v0.0.3...v0.0.4
+### Full Changelog: https://github.com/tuda-hpclab/ftio/compare/v0.0.3...v0.0.4

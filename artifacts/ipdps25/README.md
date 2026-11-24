@@ -22,7 +22,7 @@ We used `ftio` version 0.0.4 for the experiment in the paper. To get this versio
 ```sh
 git checkout v0.0.4
 ```
-Afterward, you can install FTIO on your system (see [Installation](https://github.com/tuda-parallel/FTIO?tab=readme-ov-file#installation)). There are no issues or compatibility problems with newer FTIO versions. You can also simply use the latest FTIO version.
+Afterward, you can install FTIO on your system (see [Installation](https://github.com/tuda-hpclab/ftio?tab=readme-ov-file#installation)). There are no issues or compatibility problems with newer FTIO versions. You can also simply use the latest FTIO version.
 
 For the experiments, we used the parallel trace analysis in FTIO. After installation, you can check that it works with the following command:
 

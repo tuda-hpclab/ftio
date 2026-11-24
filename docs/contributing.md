@@ -36,7 +36,7 @@
       This helps us track contributions and avoids duplicate work. Keep the description abstract and add a few
       checkboxes listing what you want to add. You do not need to explicitly mention the methods. Keep it abstract,
       mentioning the purpose or benefits gained.
-    - Go to the **Issues** tab in the [FTIO repository](https://github.com/tuda-parallel/FTIO).
+    - Go to the **Issues** tab in the [FTIO repository](https://github.com/tuda-hpclab/ftio).
     - Click **New Issue** and provide a clear title and description.
     - Label the issue appropriately as `feature` and include call it `feature...`.
     - Once you push commits, some of them should address the issue.
@@ -314,7 +314,7 @@ Date: <Month Year>
 
 Licensed under the BSD 3-Clause License.  
 For more information, see the LICENSE file in the project root:
-https://github.com/tuda-parallel/FTIO/blob/main/LICENSE
+https://github.com/tuda-hpclab/ftio/blob/main/LICENSE
 """
 
 ```

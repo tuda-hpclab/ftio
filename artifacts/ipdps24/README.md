@@ -30,7 +30,7 @@ Before you start, there are two prerequisites:
 
 ### FTIO Version
 
-For all the cases below, `ftio` first needs to be installed (see [Installation](https://github.com/tuda-parallel/FTIO?tab=readme-ov-file#installation)). We used `ftio` version 0.0.1 for the experiment in the paper. To get this version, simply execute the following code:
+For all the cases below, `ftio` first needs to be installed (see [Installation](https://github.com/tuda-hpclab/ftio?tab=readme-ov-file#installation)). We used `ftio` version 0.0.1 for the experiment in the paper. To get this version, simply execute the following code:
 ```sh
 git checkout v0.0.1 
 ```
