@@ -14,7 +14,7 @@ https://github.com/tuda-parallel/FTIO/blob/main/LICENSE
 import argparse
 import json
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import numpy as np
 import plotly.graph_objs as go
@@ -119,8 +119,10 @@ def parse_flush_log(path: str) -> tuple[list[dict], list[dict]]:
     """Parse a flush.log file produced by the JIT staging layer.
 
     Returns:
-        entries: dicts with ts, label, src, dst, copy_time, delete_time
-        events:  dicts with ts, event (APP-START / APP-END strings)
+        entries: dicts with ts, start, label, src, dst, copy_time, delete_time.
+            A line is written once copy AND delete are done, so ``ts`` is the END
+            of the flush; ``start`` = ts - copy_time - delete_time.
+        events:  dicts with ts, event (APP-START / APP-END / FTIO-SHUTDOWN strings)
     """
     entries: list[dict] = []
     events: list[dict] = []
@@ -136,7 +138,7 @@ def parse_flush_log(path: str) -> tuple[list[dict], list[dict]]:
                 except ValueError:
                     continue
                 second = parts[1].strip() if len(parts) > 1 else ""
-                if second.startswith("APP-"):
+                if second.startswith(("APP-", "FTIO-SHUTDOWN")):
                     events.append({"ts": ts, "event": second})
                 elif len(parts) >= 5:
                     src_dst = parts[2].strip()
@@ -151,6 +153,7 @@ def parse_flush_log(path: str) -> tuple[list[dict], list[dict]]:
                     entries.append(
                         {
                             "ts": ts,
+                            "start": ts - timedelta(seconds=copy_time + delete_time),
                             "label": second,
                             "src": src,
                             "dst": dst,
@@ -192,7 +195,7 @@ def plot_flush_log(flush_log_path: str, show: bool = True) -> go.Figure:
     if app_start_events:
         t0 = app_start_events[0]["ts"]
     else:
-        all_ts = [e["ts"] for e in entries] + [ev["ts"] for ev in events]
+        all_ts = [e["start"] for e in entries] + [ev["ts"] for ev in events]
         t0 = min(all_ts)
 
     def to_sec(ts: datetime) -> float:
@@ -219,7 +222,7 @@ def plot_flush_log(flush_log_path: str, show: bool = True) -> go.Figure:
                 x=[e["copy_time"] for e in group],
                 y=names,
                 orientation="h",
-                base=[to_sec(e["ts"]) for e in group],
+                base=[to_sec(e["start"]) for e in group],
                 name=label,
                 legendgroup=label,
                 showlegend=label not in first_in_legend,
@@ -240,7 +243,7 @@ def plot_flush_log(flush_log_path: str, show: bool = True) -> go.Figure:
                 x=[e["delete_time"] for e in group],
                 y=names,
                 orientation="h",
-                base=[to_sec(e["ts"]) + e["copy_time"] for e in group],
+                base=[to_sec(e["start"]) + e["copy_time"] for e in group],
                 name=f"{label} (delete)",
                 legendgroup=label,
                 showlegend=False,
@@ -490,7 +493,7 @@ def plot_flush_and_bandwidth(
     if app_start_events:
         t0 = app_start_events[0]["ts"]
     else:
-        all_ts = [e["ts"] for e in entries] + [ev["ts"] for ev in events]
+        all_ts = [e["start"] for e in entries] + [ev["ts"] for ev in events]
         t0 = min(all_ts)
 
     def to_sec(ts: datetime) -> float:
@@ -525,7 +528,7 @@ def plot_flush_and_bandwidth(
                 x=[e["copy_time"] for e in group],
                 y=names,
                 orientation="h",
-                base=[to_sec(e["ts"]) for e in group],
+                base=[to_sec(e["start"]) for e in group],
                 name=label,
                 legendgroup=label,
                 showlegend=label not in first_in_legend,
@@ -546,7 +549,7 @@ def plot_flush_and_bandwidth(
                 x=[e["delete_time"] for e in group],
                 y=names,
                 orientation="h",
-                base=[to_sec(e["ts"]) + e["copy_time"] for e in group],
+                base=[to_sec(e["start"]) + e["copy_time"] for e in group],
                 name=f"{label} (delete)",
                 legendgroup=label,
                 showlegend=False,

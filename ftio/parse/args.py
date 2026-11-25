@@ -639,6 +639,20 @@ Full documentation:
             ),
         )
         group.add_argument(
+            "--max-batch-window",
+            "--max_batch_window",
+            dest="max_batch_window",
+            type=float,
+            default=0.0,
+            help=(
+                "Close a batch of ZMQ messages this many seconds after its first "
+                "message, even if more keep arriving. Set it to the senders' flush "
+                "interval when that is ~1s: messages then never leave a 1s gap and "
+                "an unbounded batch holds every prediction until the app stops "
+                "writing. 0 (default) keeps the original unbounded batch."
+            ),
+        )
+        group.add_argument(
             "--ingest-workers",
             "--ingest_workers",
             dest="ingest_workers",

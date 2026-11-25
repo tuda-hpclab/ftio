@@ -272,6 +272,12 @@ def parse_options(settings: JitSettings, args: list[str]) -> None:
         help="If set, mtime is ignored during flushing process",
     )
     parser.add_argument(
+        "--defer_delete",
+        action="store_true",
+        help="FTIO's flushes copy without deleting the source, so no unlinks hit the "
+        "daemons while the app writes; the final stage-out skips what is already copied",
+    )
+    parser.add_argument(
         "--parallel_move_threads",
         type=int,
         default=0,
@@ -413,6 +419,8 @@ def parse_options(settings: JitSettings, args: list[str]) -> None:
         settings.parsed_gkfs_intercept = parsed_args.gkfs_intercept
     if parsed_args.parallel_move_threads > 0:
         settings.parallel_move_threads = parsed_args.parallel_move_threads
+    if parsed_args.defer_delete:
+        settings.defer_delete = True
     if parsed_args.exclude_all:
         settings.exclude_all = True
     if parsed_args.dry_run:
@@ -1457,6 +1465,8 @@ def log_dir(settings: JitSettings) -> None:
     os.makedirs(settings.log_dir, exist_ok=True)
 
     settings.set_log_dirs()
+    shutil.rmtree(settings.ftio_state_dir, ignore_errors=True)
+    os.makedirs(settings.ftio_state_dir)
     # Auto-compute unless overridden via --fuse-idle-threads.
     # procs_app is tasks-per-node; multiply by 4 to cover the internal reader
     # threads that frameworks like TensorFlow/PyTorch spawn per rank.
@@ -2637,8 +2647,8 @@ def get_env(settings: JitSettings, mode: str = "srun") -> str:
 
 def bandwidth_path(settings: JitSettings) -> str:
     """Where FTIO's dump_json writes bandwidth.json: the predictor cds into the
-    run's log dir first (see the predictor call in setup_core), so it lands here."""
-    return os.path.join(settings.log_dir, "bandwidth.json")
+    run's state dir first (see the predictor call in setup_core), so it lands here."""
+    return os.path.join(settings.ftio_state_dir, "bandwidth.json")
 
 
 def clear_bandwidth(settings: JitSettings) -> None:
@@ -2676,6 +2686,20 @@ def save_bandwidth(settings: JitSettings) -> None:
             "[yellow]No bandwidth.json was produced: FTIO captured no I/O. "
             "Does the application write into the gkfs mountdir?"
         )
+
+
+def save_ftio_state(settings: JitSettings) -> None:
+    """
+    Copy FTIO's node-local run-time files (flush log, registries, bandwidth.json)
+    into the log dir and drop the state dir. Safe to call twice.
+
+    Args:
+        settings (JitSettings): The JIT settings object.
+    """
+    if not settings.ftio_state_dir or not os.path.isdir(settings.ftio_state_dir):
+        return
+    shutil.copytree(settings.ftio_state_dir, settings.log_dir, dirs_exist_ok=True)
+    shutil.rmtree(settings.ftio_state_dir)
 
 
 def parse_time(line: str) -> float | None:

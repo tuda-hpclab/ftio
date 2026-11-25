@@ -22,7 +22,11 @@ https://github.com/tuda-parallel/FTIO/blob/main/LICENSE
 
 import inspect
 
-from ftio.api.gekkoFs.stage_data import should_flush, strategy_avoid_interference
+from ftio.api.gekkoFs.stage_data import (
+    parse_args_data_stager,
+    should_flush,
+    strategy_avoid_interference,
+)
 
 
 def _prediction(probability: float) -> dict:
@@ -96,3 +100,24 @@ def test_cancel_only_consumes_the_queue_when_it_is_non_empty():
 def test_cancel_is_reached_on_its_own_branch_not_an_else():
     src = inspect.getsource(strategy_avoid_interference)
     assert 'elif "cancel" in handle_new_prediction:' in src
+
+
+# ── --freq_scale: a deliberately wrong prediction (misprediction study) ──────
+
+
+def test_freq_scale_defaults_to_the_untouched_prediction():
+    args, _ = parse_args_data_stager(["--", "--zmq"])
+    assert args.freq_scale == 1.0
+
+
+def test_freq_scale_is_parsed():
+    args, _ = parse_args_data_stager(["--freq_scale", "0.5", "--", "--zmq"])
+    assert args.freq_scale == 0.5
+
+
+def test_freq_scale_is_applied_before_the_flush_time_is_computed():
+    # The trigger times the flush from 1 / freq, so the scale has to hit the
+    # prediction right where it leaves the queue, before target_time.
+    src = inspect.getsource(strategy_avoid_interference)
+    scale = src.index('latest_prediction["freq"] *= getattr(args, "freq_scale", 1.0)')
+    assert scale < src.index("target_time =")

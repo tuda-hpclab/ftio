@@ -171,6 +171,7 @@ def test_move_files_os_tar_passes_triggered_by(tmp_path):
 
     with (
         patch("ftio.api.gekkoFs.posix_control.get_files", return_value=[]),
+        patch("ftio.api.gekkoFs.posix_control.stat_files", return_value={}),
         patch("ftio.api.gekkoFs.posix_control.get_items_to_submit", return_value=[]),
         patch("ftio.api.gekkoFs.posix_control.flush_using_tar") as mock_tar,
     ):
@@ -178,3 +179,29 @@ def test_move_files_os_tar_passes_triggered_by(tmp_path):
         mock_tar.assert_called_once()
         _, _, tb = mock_tar.call_args[0]
         assert tb == "ftio"
+
+
+# ---------------------------------------------------------------------------
+# parse_flush_log: a line is written after copy+delete, so ts is the END
+# ---------------------------------------------------------------------------
+
+
+def test_parse_flush_log_bar_ends_at_the_log_timestamp(tmp_path):
+    from datetime import datetime
+
+    from ftio.plot.plot_bandwidth import parse_flush_log
+
+    log = tmp_path / "flush.log"
+    log.write_text(
+        "2026-01-01 00:00:00 | APP-START (lmp)\n"
+        "2026-01-01 00:07:30 | post-app     | /mnt/a -> /out/a"
+        " | copy: 270.000 s | delete: 7.000 s\n"
+        "2026-01-01 00:07:31 | FTIO-SHUTDOWN (0 still in flight)\n"
+    )
+    entries, events = parse_flush_log(str(log))
+    assert entries[0]["ts"] == datetime(2026, 1, 1, 0, 7, 30)
+    assert entries[0]["start"] == datetime(2026, 1, 1, 0, 2, 53)  # 450 - 277 = 173 s
+    assert [ev["event"] for ev in events] == [
+        "APP-START (lmp)",
+        "FTIO-SHUTDOWN (0 still in flight)",
+    ]

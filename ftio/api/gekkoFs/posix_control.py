@@ -19,10 +19,14 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import faulthandler
+import fcntl
 import math
 import mmap
 import os
 import re
+import shutil
+import subprocess
 import sys
 import time
 from concurrent.futures import (
@@ -55,6 +59,115 @@ _daemon_degraded = False
 # submissions both hit the outer walltime with the gekko leg still "running").
 # Override with STAGE_OUT_FLUSH_TIMEOUT= for a slower/faster filesystem.
 STAGE_OUT_FLUSH_TIMEOUT = float(os.getenv("STAGE_OUT_FLUSH_TIMEOUT", "60"))
+
+
+# FTIO's in-flight registry: one path per line, next to the flush log (jit keeps it
+# on the node-local /dev/shm it shares with FTIO), so jit can tell which items FTIO
+# is still copying when the app ends and stage those out in parallel without
+# touching them.
+INFLIGHT_SUFFIX = ".inflight"
+
+
+def inflight_registry(flush_log: str) -> str:
+    """Path of the in-flight registry that belongs to `flush_log` ("" without one)."""
+    return f"{flush_log}{INFLIGHT_SUFFIX}" if flush_log else ""
+
+
+def read_inflight(registry: str) -> list[str]:
+    """Items FTIO is copying right now. A missing registry means none.
+
+    Writers replace the file atomically, so a reader never sees a partial list.
+    """
+    if not registry or not os.path.exists(registry):
+        return []
+    with open(registry) as f:
+        return [line for line in f.read().splitlines() if line]
+
+
+def reset_inflight(registry: str) -> None:
+    """Start an empty registry, dropping entries a killed FTIO left behind."""
+    if registry:
+        _write_inflight(registry, [])
+
+
+def _write_inflight(registry: str, items: list[str]) -> None:
+    tmp = f"{registry}.tmp.{os.getpid()}"
+    with open(tmp, "w") as f:
+        f.write("".join(f"{item}\n" for item in items))
+    os.replace(tmp, registry)
+
+
+def _update_inflight(registry: str, items: list[str], add: bool) -> None:
+    """Add or remove `items` under an exclusive lock (flush workers are processes)."""
+    if not registry or not items:
+        return
+    with open(f"{registry}.lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            current = read_inflight(registry)
+            if add:
+                current += [item for item in items if item not in current]
+            else:
+                current = [item for item in current if item not in items]
+            _write_inflight(registry, current)
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+# --defer_delete: FTIO's flushes copy but keep the source, so they do not unlink
+# chunks on every daemon while the app writes its next checkpoint. The copied
+# registry ("path<TAB>newest mtime" per line, next to the flush log) lets later
+# triggers and jit's final stage-out skip what is already on the target.
+COPIED_SUFFIX = ".copied"
+
+
+def copied_registry(flush_log: str) -> str:
+    """Path of the copied-items registry that belongs to `flush_log` ("" without one)."""
+    return f"{flush_log}{COPIED_SUFFIX}" if flush_log else ""
+
+
+def read_copied(registry: str) -> dict[str, float]:
+    """Items FTIO copied and kept, with their newest mtime at copy time."""
+    if not registry or not os.path.exists(registry):
+        return {}
+    out = {}
+    with open(registry) as f:
+        for line in f.read().splitlines():
+            path, _, stamp = line.rpartition("\t")
+            if path:
+                out[path] = float(stamp)
+    return out
+
+
+def reset_copied(registry: str) -> None:
+    """Start an empty copied registry (a previous leg's entries do not apply)."""
+    if registry:
+        with open(registry, "w"):
+            pass
+
+
+def _record_copied(registry: str, item: str, stamp: float) -> None:
+    if not registry:
+        return
+    with open(f"{registry}.lock", "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            with open(registry, "a") as f:
+                f.write(f"{item}\t{stamp}\n")
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def _registry_of(args: argparse.Namespace, triggered_by: str) -> str:
+    """Only FTIO's own flushes are tracked; jit's post-app pass never is."""
+    if triggered_by != "ftio":
+        return ""
+    return inflight_registry(getattr(args, "flush_log", "") or "")
+
+
+def _is_excluded(path: str, excluded: list[str]) -> bool:
+    path = os.path.normpath(path)
+    return any(path == e or path.startswith(f"{e}/") for e in excluded)
 
 
 def format_size(n_bytes: int) -> str:
@@ -109,8 +222,10 @@ def move_files_os(
     if not os.path.exists(args.stage_out_path):
         os.makedirs(args.stage_out_path)
 
-    # Iterate over all items in the source directory
-    files = get_files(args)
+    # Iterate over all items in the source directory. FTIO's triggers list with
+    # time stamps and sizes, so files already copied can be left out below.
+    stats = stat_files(args) if triggered_by == "ftio" else None
+    files = list(stats) if stats is not None else get_files(args)
     if args.parallel_move_threads > 0:
         TRIGGER_LOGGER.info(
             f"{len(files)} files flagged to move in parallel with {args.parallel_move_threads} threads"
@@ -125,7 +240,16 @@ def move_files_os(
     os.makedirs(args.stage_out_path, exist_ok=True)
     # Check if to submit files or folders
     # items_to_submit = get_items_to_submit(files, args, "files")
-    items_to_submit = get_items_to_submit(files, args, "folder")
+    exclude = list(getattr(args, "exclude", None) or [])
+    if exclude:
+        TRIGGER_LOGGER.info(
+            f"Leaving {len(exclude)} in-flight item(s) to FTIO: {exclude}"
+        )
+    items_to_submit = get_items_to_submit(
+        files, args, "folder", collapse_root=triggered_by == "post_app", exclude=exclude
+    )
+    if stats is not None:
+        items_to_submit = _drop_copied(args, items_to_submit, stats)
 
     # Size the files get_files() already listed instead of a second full
     # `find` traversal of the mount just to format a log message.
@@ -150,10 +274,202 @@ def move_files_os(
             f"({args.regex!r}) selected none — nothing will be staged out"
         )
 
-    if "cp" in args.flush_call:
+    if triggered_by == "post_app" and getattr(args, "all_nodes", 0) and items_to_submit:
+        stage_out_all_nodes(args, items_to_submit)
+    elif "cp" in args.flush_call:
         flush_using_cp(args, items_to_submit, period, triggered_by)
     else:  # flush using tar
         flush_using_tar(args, items_to_submit, triggered_by)
+
+
+def _keeps_source(args: argparse.Namespace, triggered_by: str) -> bool:
+    """Whether a copy leaves its source in the mount.
+
+    --defer_delete keeps FTIO's copies; --keep_source keeps the final stage-out's.
+    Deleting at the end is not needed (the burst buffer goes away with the job) and
+    took as long as the copy itself: LAMMPS 124+1, copy 90 s, delete 113 s.
+    """
+    if triggered_by == "post_app":
+        return bool(getattr(args, "keep_source", False))
+    return bool(getattr(args, "defer_delete", False)) and triggered_by == "ftio"
+
+
+def stat_files(args: argparse.Namespace) -> dict[str, tuple[float, int]]:
+    """Every regular file in the mount with its newest time stamp and size, one find.
+
+    ctime as well as mtime: GekkoFS reports mtime 0 (see newest_mtime).
+    """
+    out = _list_with_retry(
+        args, f"find {args.gkfs_mntdir} -type f -printf '%T@ %C@ %s %p\\n'"
+    )
+    stats = {}
+    for line in out.splitlines():
+        parts = line.split(" ", 3)
+        if len(parts) == 4:
+            stats[parts[3]] = (max(float(parts[0]), float(parts[1])), int(parts[2]))
+    return stats
+
+
+def _drop_copied(
+    args: argparse.Namespace, items: list[str], stats: dict[str, tuple[float, int]]
+) -> list[str]:
+    """Leave out files FTIO already copied that have not changed since.
+
+    Each trigger lists every checkpoint in the mount. With --defer_delete the copied
+    ones stay, and resubmitting them filled all 32 worker slots with re-checks (one
+    GekkoFS stat each) while the newest checkpoint waited (MILC weak 32+1, BSC
+    49108594). Directory items are left to the workers.
+    """
+    done = (
+        read_copied(copied_registry(getattr(args, "flush_log", "") or ""))
+        if getattr(args, "defer_delete", False)
+        else {}
+    )
+    todo = [
+        item
+        for item in items
+        if item not in stats
+        or not (
+            files_in_progress.already_flushed(item, stats[item][0])
+            or stats[item][0] <= done.get(item, float("-inf"))
+        )
+    ]
+    if len(todo) < len(items):
+        TRIGGER_LOGGER.info(
+            f"Leaving out {len(items) - len(todo)} item(s) already copied and unchanged"
+        )
+    return todo
+
+
+def size_key(path: str) -> str:
+    """Checkpoints of one kind share a name up to their numbers (cfg.17, cfg.18)."""
+    return re.sub(r"\d+", "#", path)
+
+
+def ready_by_size(args: argparse.Namespace, state: dict) -> list[str]:
+    """Checkpoints that reached the size all earlier ones of their kind had and did
+    not change since the previous call.
+
+    FTIO triggers at the predicted end of a write phase. With MILC's 5 s period the
+    newest checkpoint was still waiting for that trigger, or still being copied, when
+    the app ended, so jit's stage-out waited 8-20 s even when the last checkpoint
+    was skipped (BSC 49108576, 49108594). A checkpoint whose kind has a constant
+    size is complete once it has that size and its time stamp stays put between two
+    listings, so it can be copied right away.
+
+    `state` carries the previous listing and the learned sizes between calls. A
+    size is learned when a file is copied (in the copied registry, or gone from the
+    mount after copy + delete); at least two copies of one kind, all of one size,
+    are needed.
+    """
+    flush_log = getattr(args, "flush_log", "") or ""
+    regex = re.compile(args.regex) if args.regex else None
+    stats = {
+        p: st for p, st in stat_files(args).items() if not regex or regex.fullmatch(p)
+    }
+    copied = (
+        read_copied(copied_registry(flush_log))
+        if getattr(args, "defer_delete", False)
+        else {}
+    )
+    inflight = set(read_inflight(inflight_registry(flush_log)))
+    last = state.get("last", {})
+    sizes = state.setdefault("sizes", {})
+    done = state.setdefault("done", set())
+    for p, (_, size) in last.items():
+        if p not in done and (p not in stats or p in copied):
+            done.add(p)
+            sizes.setdefault(size_key(p), []).append(stats[p][1] if p in stats else size)
+    ready = []
+    for p, st in stats.items():
+        if p in done or p in copied or p in inflight:
+            continue
+        known = sizes.get(size_key(p), [])
+        constant = len(known) >= 2 and len(set(known)) == 1
+        if constant and st[1] == known[0] and last.get(p) == st:
+            ready.append(p)
+    state["last"] = stats
+    return ready
+
+
+def stage_out_all_nodes(args: argparse.Namespace, items: list[str]) -> None:
+    """Final stage-out copied by every app node at once, not by the FTIO node alone.
+
+    GekkoFS stripes each file over all daemons, so any node can read any file, and
+    the one node's link was the limit (LAMMPS 124+1: 1.8 TB through one node). The
+    files are split over all tasks; each task runs `cp -L` on its share.
+    """
+    flush_log = getattr(args, "flush_log", "")
+    files = []
+    for item in items:
+        files += [
+            f for f in preloaded_call(args, f"find {item} -type f").splitlines() if f
+        ]
+    if not files:
+        return
+    ntasks = args.all_nodes * args.tasks_per_node
+    batch = max(1, math.ceil(len(files) / ntasks))
+    by_dir: dict[str, list[str]] = {}
+    for f in files:
+        dst = f.replace(args.gkfs_mntdir, args.stage_out_path, 1)
+        by_dir.setdefault(os.path.dirname(dst), []).append(f)
+    # One line per cp call: target directory, then the sources. Every node reads it,
+    # so it sits next to the hosts file on the shared FS, not in the node-local
+    # flush-log dir (/dev/shm on the FTIO node).
+    file_list = os.path.join(os.path.dirname(args.host_file), "stage_out_all_nodes.txt")
+    with open(file_list, "w") as fh:
+        for target, srcs in by_dir.items():
+            os.makedirs(target, exist_ok=True)
+            for i in range(0, len(srcs), batch):
+                fh.write(f"{target} {' '.join(srcs[i : i + batch])}\n")
+    call = (
+        f"srun {args.srun_nodes} --disable-status -N {args.all_nodes} "
+        f"--ntasks-per-node={args.tasks_per_node} --overcommit --overlap --oversubscribe "
+        f"--mem=0 bash -c 'awk -v r=$SLURM_PROCID -v n=$SLURM_NTASKS "
+        f'"(NR-1)%n==r" {file_list} | while read d s; do '
+        f"LIBGKFS_HOSTS_FILE={args.host_file} LD_PRELOAD={args.ld_preload} "
+        f"cp -L $s -t $d; done'"
+    )
+    TRIGGER_LOGGER.info(
+        f"Copying {len(files)} file(s) from {args.all_nodes} nodes x "
+        f"{args.tasks_per_node} tasks"
+    )
+    start = time.time()
+    subprocess.run(call, shell=True, check=True)
+    copy_time = time.time() - start
+    if flush_log:
+        shutil.copy(file_list, os.path.dirname(flush_log))
+
+    # The targets are on the PFS: plain os.path checks, no GekkoFS client call.
+    missing = [
+        f
+        for f in files
+        if not os.path.isfile(f.replace(args.gkfs_mntdir, args.stage_out_path, 1))
+    ]
+    if missing:
+        raise RuntimeError(
+            f"all-node stage-out incomplete: {len(missing)} of {len(files)} file(s) "
+            f"missing, e.g. {missing[:3]} — sources left in place"
+        )
+    delete_time = 0.0
+    if not _keeps_source(args, "post_app"):
+        start = time.time()
+        for item in items:
+            preloaded_call(args, f"find {item} -type f -delete")
+        delete_time = time.time() - start
+    TRIGGER_LOGGER.info(
+        f"Done {len(files)} file(s) from all nodes: copy {copy_time:.3f} s, "
+        + (f"delete {delete_time:.3f} s" if delete_time else "source kept")
+    )
+    for item in items:
+        _write_flush_log(
+            flush_log,
+            item,
+            item.replace(args.gkfs_mntdir, args.stage_out_path, 1),
+            "post_app",
+            copy_time,
+            delete_time,
+        )
 
 
 def flush_using_tar(
@@ -253,27 +569,44 @@ def flush_using_cp(
 
     # Step 3: Submit tasks to the executor ((only move the files if they are not
     # already in progress
+    # futures map to the indices of the items they carry: one per item, or a
+    # whole batch with --flush_batch.
     futures: dict = {}
     num_workers = args.parallel_move_threads
+    registry = _registry_of(args, triggered_by)
     executor = ProcessPoolExecutor(max_workers=num_workers)
     try:
+        todo = []
         for idx, item in enumerate(items_to_submit):
             # check that the item is not in progress and not  not in the ignored list
             if not files_in_progress.in_progress(
                 item
             ) and not files_in_progress.is_ignored(args, item):
                 files_in_progress.put(item)
-                futures[executor.submit(move_item, args, item, period, triggered_by)] = (
-                    idx
-                )
+                # Register at submission, not when the worker starts: jit reads the
+                # registry the moment the app ends, and a queued item is as much
+                # FTIO's as one being copied. move_item removes it when done.
+                _update_inflight(registry, [item], add=True)
+                todo.append(idx)
                 if args.debug:
                     TRIGGER_LOGGER.debug(f"Moving {item}")
             else:
                 if args.debug:
                     TRIGGER_LOGGER.debug(f"Already moving {item}")
+        for chunk in _batches(args, items_to_submit, todo, num_workers):
+            if len(chunk) == 1:
+                fut = executor.submit(
+                    move_item, args, items_to_submit[chunk[0]], period, triggered_by
+                )
+            else:
+                batch = [items_to_submit[i] for i in chunk]
+                fut = executor.submit(move_batch, args, batch, triggered_by)
+            futures[fut] = chunk
 
+        n_items = sum(len(c) for c in futures.values())
         TRIGGER_LOGGER.info(
-            f"Submitted {len(futures)} futures using {num_workers} workers"
+            f"Submitted {n_items} item(s) in {len(futures)} futures using "
+            f"{num_workers} workers"
         )
         if args.debug:
             TRIGGER_LOGGER.debug(f"Files in progress: {files_in_progress}")
@@ -286,19 +619,21 @@ def flush_using_cp(
         failed = 0
         try:
             for future in as_completed(futures, timeout=flush_timeout):
+                chunk = [items_to_submit[i] for i in futures[future]]
                 try:
                     future.result()
-                    files_in_progress.mark_done(items_to_submit[futures[future]])
                 except Exception as e:
-                    index = futures[future]
-                    failed += 1
-                    TRIGGER_LOGGER.error(f"{items_to_submit[index]} had an error: {e}")
-                    files_in_progress.mark_done(items_to_submit[index])
+                    failed += len(chunk)
+                    TRIGGER_LOGGER.error(f"{', '.join(chunk)} had an error: {e}")
+                for item in chunk:
+                    files_in_progress.mark_done(item)
                 remaining = len(files_in_progress)
                 if remaining:
                     TRIGGER_LOGGER.info(f"{remaining} item(s) still in the queue")
         except TimeoutError:
-            stuck = [items_to_submit[futures[f]] for f in futures if not f.done()]
+            stuck = [
+                items_to_submit[i] for f in futures if not f.done() for i in futures[f]
+            ]
             failed += len(stuck)
             TRIGGER_LOGGER.critical(
                 f"STAGE-OUT TIMEOUT: {len(stuck)} item(s) still not done after "
@@ -311,20 +646,31 @@ def flush_using_cp(
         # wait=False: a wedged worker process must not block jit from moving on.
         # It's abandoned, not killed -- SLURM reclaims it when the job ends.
         executor.shutdown(wait=False, cancel_futures=True)
+        # A cancelled item never reached move_item, so nothing else unregisters it.
+        cancelled = [
+            items_to_submit[i] for f in futures if f.cancelled() for i in futures[f]
+        ]
+        _update_inflight(registry, cancelled, add=False)
 
     # A flush where every item failed still returns a time, so the run looks
     # like a fast stage-out instead of a broken one. Say so loudly.
     if failed:
         TRIGGER_LOGGER.error(
-            f"STAGE-OUT INCOMPLETE: {failed}/{len(futures)} item(s) failed to copy "
+            f"STAGE-OUT INCOMPLETE: {failed}/{n_items} item(s) failed to copy "
             f"— the reported {triggered_by} time is not a valid measurement"
         )
 
     if futures:
-        _record_flush_outcome(failed, len(futures))
+        _record_flush_outcome(failed, n_items)
 
 
-def get_items_to_submit(files: list, args: argparse.Namespace, mode: str = "files"):
+def get_items_to_submit(
+    files: list,
+    args: argparse.Namespace,
+    mode: str = "files",
+    collapse_root: bool = True,
+    exclude: list[str] | None = None,
+):
     """
     Determine which items (files or folders) should be submitted based on
     regex filtering and the submission mode.
@@ -346,10 +692,18 @@ def get_items_to_submit(files: list, args: argparse.Namespace, mode: str = "file
             - debug (bool): Whether to print debug information.
         mode (str, optional): Submission mode. If it contains "folder", directory-level
             grouping and filtering logic is applied.
+        collapse_root (bool, optional): Allow the mount root itself to become the
+            flush unit. Runtime flushes must pass False: the app keeps writing into
+            the root, so its newest file is always younger than the mtime threshold
+            and every flush of it is skipped. Only the post-app flush may take it.
+        exclude (list[str], optional): Items FTIO is still copying. Nothing at or
+            under them is submitted, and a folder holding one is never collapsed,
+            so the post-app pass neither copies nor deletes them.
 
     Returns:
         list[str]: List of items (file paths or folder paths) to be submitted.
     """
+    excluded = [os.path.normpath(e) for e in (exclude or [])]
     regex = None
     # Compile the regex pattern if provided
     if args.regex:
@@ -372,10 +726,12 @@ def get_items_to_submit(files: list, args: argparse.Namespace, mode: str = "file
         if regex:
             for file_path in files:
                 match = regex.match(file_path)
-                if not match:
+                if not match or _is_excluded(file_path, excluded):
                     continue
                 unit = match.group(0)
                 if len(unit) < len(file_path) and file_path[len(unit)] == "/":
+                    if any(_is_excluded(e, [os.path.normpath(unit)]) for e in excluded):
+                        continue
                     if unit not in dir_units:
                         dir_units.append(unit)
                         if args.debug:
@@ -395,6 +751,7 @@ def get_items_to_submit(files: list, args: argparse.Namespace, mode: str = "file
             folder_to_all_files.setdefault(folder, []).append(file_path)
 
         items_to_submit: list[str] = list(dir_units)
+        mount_root = os.path.normpath(getattr(args, "gkfs_mntdir", "") or "/")
 
         for folder, all_files_in_folder in folder_to_all_files.items():
             matching_files_in_folder = [
@@ -402,7 +759,9 @@ def get_items_to_submit(files: list, args: argparse.Namespace, mode: str = "file
             ]
             # If all files in the folder match, submit the folder
             if matching_files_in_folder:
-                if set(all_files_in_folder) == set(matching_files_in_folder):
+                if set(all_files_in_folder) == set(matching_files_in_folder) and (
+                    collapse_root or os.path.normpath(folder) != mount_root
+                ):
                     items_to_submit.append(folder)
                     if args.debug:
                         TRIGGER_LOGGER.debug(f"Will move folder: {folder}")
@@ -414,7 +773,7 @@ def get_items_to_submit(files: list, args: argparse.Namespace, mode: str = "file
                         )
         items_to_submit = drop_nested_items(items_to_submit)
     else:
-        items_to_submit = files
+        items_to_submit = [f for f in files if not _is_excluded(f, excluded)]
 
     return items_to_submit
 
@@ -490,6 +849,134 @@ def newest_mtime(args: argparse.Namespace, item: str) -> float:
     return stamp if stamp > 0 else time.time()
 
 
+def _batches(
+    args: argparse.Namespace, items: list[str], todo: list[int], workers: int
+) -> list[list[int]]:
+    """Group item indices into copy batches for --flush_batch.
+
+    Every GekkoFS client call starts a new process that sets up the client again
+    (~2 s on MN5), and the per-item path makes about five of them per file. For
+    many large per-rank checkpoint files that start-up, not bandwidth, limited
+    the flush (HACC-IO 8/node: 35-70 MB/s per copy, 632 of 1280 files out
+    during the run). A batch shares three calls (stat, cp, rm) among up to
+    --flush_batch files of one directory. Without the flag every item is its
+    own batch, i.e. the per-item path.
+
+    Batches are spread so all workers get work: at most ceil(n / workers) items
+    each. Only files in the same directory share a batch (one cp target).
+    """
+    size = int(getattr(args, "flush_batch", 0) or 0)
+    if size <= 1:
+        return [[i] for i in todo]
+    by_dir: dict[str, list[int]] = {}
+    for i in todo:
+        by_dir.setdefault(os.path.dirname(items[i]), []).append(i)
+    size = max(1, min(size, math.ceil(len(todo) / max(1, workers))))
+    return [
+        idx[k : k + size] for idx in by_dir.values() for k in range(0, len(idx), size)
+    ]
+
+
+def move_batch(
+    args: argparse.Namespace, items: list[str], triggered_by: str = "ftio"
+) -> None:
+    """Stage out several regular files of one directory with one cp and one rm.
+
+    Same rules as move_item for each file: skip files already staged and
+    unchanged, keep the source with --defer_delete, never unlink a file whose
+    copy is not verified. Only for flush units that are files (regex ending in
+    a file name), not AMReX-style checkpoint directories: `cp -L` without -r
+    refuses a directory, which fails the batch loudly instead of copying half.
+    """
+    registry = _registry_of(args, triggered_by)
+    try:
+        _move_batch(args, items, triggered_by)
+    finally:
+        _update_inflight(registry, items, add=False)
+
+
+def _move_batch(args: argparse.Namespace, items: list[str], triggered_by: str) -> None:
+    flush_log = getattr(args, "flush_log", "")
+    keep = bool(getattr(args, "defer_delete", False)) and triggered_by == "ftio"
+    copied = copied_registry(flush_log or "") if keep else ""
+    done = read_copied(copied) if keep else {}
+
+    # One stat for the whole batch. ctime as well as mtime: GekkoFS reports
+    # mtime 0 (see newest_mtime).
+    out = preloaded_call(
+        args, f"find {' '.join(items)} -maxdepth 0 -type f -printf '%T@ %C@ %s %p\\n'"
+    )
+    stamp, size = {}, {}
+    for line in out.splitlines():
+        parts = line.split(" ", 3)
+        if len(parts) == 4:
+            stamp[parts[3]] = max(float(parts[0]), float(parts[1]))
+            size[parts[3]] = int(parts[2])
+    missing = [i for i in items if i not in stamp]
+    if missing:
+        raise RuntimeError(f"not regular files in the mount: {missing}")
+
+    todo = []
+    for item in items:
+        if files_in_progress.already_flushed(item, stamp[item]) or (
+            keep and stamp[item] <= done.get(item, float("-inf"))
+        ):
+            TRIGGER_LOGGER.info(f"Skipping {item}: already staged and unchanged since")
+            continue
+        todo.append(item)
+    if not todo:
+        return
+
+    dst_parent = os.path.dirname(todo[0].replace(args.gkfs_mntdir, args.stage_out_path))
+    os.makedirs(dst_parent, exist_ok=True)
+    TRIGGER_LOGGER.info(f"Copying {len(todo)} file(s) to {dst_parent}")
+    start = time.time()
+    preloaded_call(args, f"cp -L {' '.join(todo)} {dst_parent}")
+    copy_time = time.time() - start
+
+    # The targets are on the PFS, so plain os.stat verifies them without a
+    # GekkoFS client call.
+    short = [
+        i
+        for i in todo
+        if not os.path.isfile(d := os.path.join(dst_parent, os.path.basename(i)))
+        or os.path.getsize(d) < size[i]
+    ]
+    if short:
+        raise RuntimeError(f"copy incomplete for {short} — sources left in place")
+
+    delete_time = 0.0
+    kept = _keeps_source(args, triggered_by)
+    if not kept:
+        start = time.time()
+        preloaded_call(args, f"rm -f {' '.join(todo)}")
+        delete_time = time.time() - start
+    TRIGGER_LOGGER.info(
+        f"Done {len(todo)} file(s): copy {copy_time:.3f} s, "
+        + ("delete deferred" if kept else f"delete {delete_time:.3f} s")
+    )
+    for item in todo:
+        dst = os.path.join(dst_parent, os.path.basename(item))
+        _write_flush_log(flush_log, item, dst, triggered_by, copy_time, delete_time)
+        if keep:
+            _record_copied(copied, item, stamp[item])
+        files_in_progress.mark_flushed(item, stamp[item])
+
+
+@contextlib.contextmanager
+def _warn_if_slow(step: str, item: str, limit: float = 2.0):
+    """Log a step of a worker's bookkeeping that took longer than `limit` seconds.
+
+    Workers sometimes log "Done" and then finish their future a minute later,
+    which blocks every flush slot (LAMMPS 64+1, BSC 48759689). This names the step.
+    """
+    start = time.time()
+    yield
+    took = time.time() - start
+    if took > limit:
+        TRIGGER_LOGGER.warning(f"{item}: {step} took {took:.1f} s (pid {os.getpid()})")
+
+
 def move_item(
     args: argparse.Namespace,
     item: str,
@@ -505,6 +992,33 @@ def move_item(
         period (float): Expected I/O period used to derive mtime threshold.
         triggered_by (str): Who initiated the flush — "ftio" or "post_app".
     """
+    # Workers sometimes block until the app ends (LAMMPS, BSC 48759689): dump
+    # the stack to stderr if this item is still running after 45 s.
+    faulthandler.dump_traceback_later(45)
+    try:
+        # A queued item whose turn comes after the app ended goes back to jit:
+        # jit waits (up to 120 s) for everything in the in-flight registry, and
+        # its own final pass copies the item anyway. Nek 48871819 had 3590 items
+        # queued at app end, so jit sat out the full 120 s.
+        flag = getattr(args, "app_start_file", None)
+        if triggered_by == "ftio" and flag and not os.path.isfile(flag):
+            TRIGGER_LOGGER.info(f"App ended before {item} was copied; left to jit")
+            return
+        _move_item(args, item, period, triggered_by)
+    finally:
+        faulthandler.cancel_dump_traceback_later()
+        # Also on failure: a failed copy is no longer in flight, and leaving it
+        # registered would keep jit from ever staging it out.
+        with _warn_if_slow("inflight registry update", item):
+            _update_inflight(_registry_of(args, triggered_by), [item], add=False)
+
+
+def _move_item(
+    args: argparse.Namespace,
+    item: str,
+    period: float = 0,
+    triggered_by: str = "ftio",
+) -> None:
     fast = False  # fast copy still has an error with the preload
 
     # threshold = period / 2  # the IO took half the time
@@ -523,6 +1037,15 @@ def move_item(
         files_in_progress.mark_done(item)
         return
 
+    # Flush workers are processes, so with --defer_delete the record of what is
+    # already on the target lives in the copied registry, not in memory.
+    keep = bool(getattr(args, "defer_delete", False)) and triggered_by == "ftio"
+    copied = copied_registry(getattr(args, "flush_log", "") or "") if keep else ""
+    if keep and item_time <= read_copied(copied).get(item, float("-inf")):
+        TRIGGER_LOGGER.info(f"Skipping {item}: already copied (kept) and unchanged since")
+        files_in_progress.mark_done(item)
+        return
+
     if args.ignore_mtime or modification_time >= threshold:
         dst = item.replace(args.gkfs_mntdir, args.stage_out_path)
         TRIGGER_LOGGER.info(
@@ -534,8 +1057,14 @@ def move_item(
             # Todo: add mode for folder. However this currenlty not used
             fast_chunk_copy_file(args, item, threads=4)
         else:
-            copy_file_and_unlink(args, item, triggered_by)
-        files_in_progress.mark_flushed(item, item_time)
+            copy_file_and_unlink(
+                args, item, triggered_by, keep=_keeps_source(args, triggered_by)
+            )
+        if keep:
+            with _warn_if_slow("copied registry update", item):
+                _record_copied(copied, item, item_time)
+        with _warn_if_slow("mark_flushed", item):
+            files_in_progress.mark_flushed(item, item_time)
     else:
         TRIGGER_LOGGER.warning(
             f"Skipping {item}: too new (last modified {modification_time:.3f} s ago < threshold {threshold} s)"
@@ -602,8 +1131,39 @@ def _orphaned_children(args: argparse.Namespace, item: str) -> list[str]:
     return [p[len(item) + 1 :] for p in files]
 
 
+def _copy_tree_parallel(
+    args: argparse.Namespace, item: str, dst: str, threads: int
+) -> None:
+    """Copy every file under `item` to the same relative path under `dst`.
+
+    Every `cp` goes through preloaded_call itself. The earlier one-liner
+    `cd <mount> && find . | xargs cp --parents` never worked: preloaded_call
+    puts LD_PRELOAD in front of the first command only, so the `cd` builtin ran
+    in an un-intercepted shell, failed, and every whole-mount stage-out from
+    2026-09-29 burned its retries and left the data behind (LAMMPS/S3D-IO
+    "STAGE-OUT INCOMPLETE", ~16 s each).
+    """
+    raw = preloaded_call(args, f"find {item} -type f -printf '%P\\n'")
+    by_dir: dict[str, list[str]] = {}
+    for rel in filter(None, raw.splitlines()):
+        by_dir.setdefault(os.path.dirname(rel), []).append(rel)
+    n_files = sum(len(v) for v in by_dir.values())
+    # Batched, not one fork per file: each fork re-initialises the GekkoFS client.
+    batch = max(1, math.ceil(n_files / threads))
+    cmds = []
+    for sub, rels in by_dir.items():
+        target = os.path.join(dst, sub)
+        os.makedirs(target, exist_ok=True)
+        for i in range(0, len(rels), batch):
+            srcs = " ".join(f"{item}/{r}" for r in rels[i : i + batch])
+            cmds.append(f"cp -L {srcs} -t {target}")
+    with ThreadPoolExecutor(max_workers=threads) as pool:
+        for future in [pool.submit(preloaded_call, args, c) for c in cmds]:
+            future.result()
+
+
 def copy_file_and_unlink(
-    args: argparse.Namespace, item: str, triggered_by: str = "ftio"
+    args: argparse.Namespace, item: str, triggered_by: str = "ftio", keep: bool = False
 ) -> None:
     """
     Copies a file or folder to the stage-out path and removes it from the source.
@@ -612,6 +1172,7 @@ def copy_file_and_unlink(
         args (argparse.Namespace): Parsed command line arguments.
         item (str): Name of the file or folder to copy and remove.
         triggered_by (str): Who initiated the flush — "ftio" or "post_app".
+        keep (bool): Copy only and leave the source in place (--defer_delete).
     """
     flush_log = getattr(args, "flush_log", "")
     # Preserve intermediate directories: copy into the parent of the intended
@@ -647,42 +1208,106 @@ def copy_file_and_unlink(
     #   -delete               0.72 s  (no fork at all)
     # `rm -f {} +` remains the fallback: -f tolerates a path a concurrent flush
     # has already removed, and it covers a find without -delete.
-    cp_cmd = f"cp -rL {src} {dst if whole_mount else dst_parent}"
+    if whole_mount:
+        # A single serial `cp -rL` here was the entire stage-out cost once
+        # every real correctness bug was fixed (S3D-IO 96+1/124+1,
+        # 2026-09-29): the folder-collapse optimisation intentionally
+        # bundles many/most-matching files into ONE flush unit (this is
+        # correct and expected -- see get_items_to_submit, other apps like
+        # nek rely on it), but that made this one `cp` the sole worker
+        # regardless of `--parallel_move_threads`, since the executor only
+        # ever sees one item to hand out. 165-264s against a ~29-53s app
+        # time at 96-124 nodes, vs pfs's ~40s. Parallelize the copy itself
+        # instead of changing what gets collapsed: walk the mount's files
+        # and hand them to `xargs -P` so multiple `cp` processes actually
+        # run concurrently, batched (not one fork per file -- the existing
+        # per-file-fork cost measured elsewhere in this file, 34s for 54
+        # files, applies here too).
+        threads = max(1, int(getattr(args, "parallel_move_threads", 0) or 1))
+
+        def copy() -> None:
+            _copy_tree_parallel(args, item, dst, threads)
+
+    else:
+        cp_cmd = f"cp -rL {src} {dst_parent}"
+
+        def copy() -> None:
+            preloaded_call(args, cp_cmd)
+
     remove_cmd = f"find {item} -type f -delete"
     fallback_remove_cmd = f"find {item} -type f -exec rm -f {{}} +"
 
     TRIGGER_LOGGER.info(f"Copying {item} to {dst}")
     n_src = _count_files(args, item)
     start = time.time()
-    try:
-        preloaded_call(args, cp_cmd)
-    except Exception as e:
-        # A renamed directory keeps its children under the pre-rename name, so
-        # `cp` reads the listing and then cannot stat a single entry. The data
-        # is intact; reach it through the old prefix. Verified on gkfs: after
-        # `mv d.temp d`, `cat d/f` is ENOENT while `cat d.temp/f` still works.
-        rel = _orphaned_children(args, item)
-        if not rel:
-            raise
-        TRIGGER_LOGGER.warning(
-            f"{item} lost its children to a rename ({e}); "
-            f"copying {len(rel)} file(s) from {item}.temp"
-        )
-        src = f"{item}.temp"
-        n_src = len(rel)
-        for r in rel:
-            os.makedirs(os.path.dirname(f"{dst}/{r}"), exist_ok=True)
-        # ponytail: one shell per flush unit, so the command grows with the file
-        # count. Chunk it if a checkpoint ever gets near ARG_MAX.
+    # Retry the whole attempt (bare name, then the .temp fallback) a few times
+    # before giving up. Found 2026-09-24 (Castro job 46252936): 100% of 55
+    # checkpoints failed ENOENT on BOTH the bare name AND the .temp fallback,
+    # within ~4s of the rename being detected -- too fast to be the documented
+    # "readdir lists children under the pre-rename name" staleness case
+    # _orphaned_children was built for (that predicts .temp keeps working, and
+    # here it does not either). Looks like GekkoFS is dropping metadata for
+    # these entries outright under Castro's write pattern (many small
+    # Level_0/SD_0_* files from 64 concurrent ranks), not just answering with a
+    # stale name -- unverified mechanism, but a short backoff is cheap to try
+    # before concluding this needs a GekkoFS-side fix (upstream bug list).
+    copy_attempts = int(os.getenv("GLASS_COPY_RETRIES", "3"))
+    copy_retry_delay = float(os.getenv("GLASS_COPY_RETRY_DELAY", "3"))
+    last_exc: Exception | None = None
+    for attempt in range(1, copy_attempts + 1):
         try:
-            preloaded_call(args, "; ".join(f"cp -L {src}/{r} {dst}/{r}" for r in rel))
-        except Exception:
-            _log_mount_names_once(args)
-            raise
-        # `find` cannot reach these either -- the old directory entry is gone
-        # from the namespace even though its children still resolve by path.
-        remove_cmd = " ".join(["rm", "-f", *(f"{src}/{r}" for r in rel)])
-        fallback_remove_cmd = remove_cmd
+            copy()
+            last_exc = None
+            break
+        except Exception as e:
+            last_exc = e
+            # A renamed directory keeps its children under the pre-rename name, so
+            # `cp` reads the listing and then cannot stat a single entry. The data
+            # is intact; reach it through the old prefix. Verified on gkfs: after
+            # `mv d.temp d`, `cat d/f` is ENOENT while `cat d.temp/f` still works.
+            rel = _orphaned_children(args, item)
+            if not rel:
+                if attempt < copy_attempts:
+                    TRIGGER_LOGGER.warning(
+                        f"{item}: attempt {attempt}/{copy_attempts} found no "
+                        f"children at all ({e}); retrying in {copy_retry_delay}s"
+                    )
+                    time.sleep(copy_retry_delay)
+                    continue
+                raise
+            TRIGGER_LOGGER.warning(
+                f"{item} lost its children to a rename ({e}); "
+                f"copying {len(rel)} file(s) from {item}.temp "
+                f"(attempt {attempt}/{copy_attempts})"
+            )
+            src = f"{item}.temp"
+            n_src = len(rel)
+            for r in rel:
+                os.makedirs(os.path.dirname(f"{dst}/{r}"), exist_ok=True)
+            # ponytail: one shell per flush unit, so the command grows with the
+            # file count. Chunk it if a checkpoint ever gets near ARG_MAX.
+            try:
+                preloaded_call(args, "; ".join(f"cp -L {src}/{r} {dst}/{r}" for r in rel))
+                last_exc = None
+                # `find` cannot reach these either -- the old directory entry is
+                # gone from the namespace even though its children still
+                # resolve by path.
+                remove_cmd = " ".join(["rm", "-f", *(f"{src}/{r}" for r in rel)])
+                fallback_remove_cmd = remove_cmd
+                break
+            except Exception as e2:
+                last_exc = e2
+                if attempt < copy_attempts:
+                    TRIGGER_LOGGER.warning(
+                        f"{item}: .temp fallback also failed on attempt "
+                        f"{attempt}/{copy_attempts} ({e2}); retrying in "
+                        f"{copy_retry_delay}s"
+                    )
+                    time.sleep(copy_retry_delay)
+                    continue
+                _log_mount_names_once(args)
+    if last_exc is not None:
+        raise last_exc
     copy_time = time.time() - start
     TRIGGER_LOGGER.info(f"Finished copying {item} ({copy_time:.3f} s)")
 
@@ -694,6 +1319,11 @@ def copy_file_and_unlink(
             f"copy of {item} is incomplete: {n_dst} of {n_src} file(s) reached "
             f"{dst} — source left in place"
         )
+
+    if keep:
+        TRIGGER_LOGGER.info(f"Done {item}: copy {copy_time:.3f} s, delete deferred")
+        _write_flush_log(flush_log, item, dst, triggered_by, copy_time, 0.0)
+        return
 
     start = time.time()
     TRIGGER_LOGGER.info(f"Removing {item} from source")
@@ -950,12 +1580,13 @@ def fast_chunk_copy_file(
     copy_metadata(src, dst, args.ld_preload)
 
 
-def jit_move(settings: JitSettings) -> None:
+def jit_move(settings: JitSettings, exclude: list[str] | None = None) -> None:
     """
     Moves files based on JitSettings configuration.
 
     Args:
         settings (JitSettings): JIT settings for file staging.
+        exclude (list[str], optional): Items FTIO is still copying; left untouched.
     """
     # Prepare argument list based on JitSettings
     args = [
@@ -979,6 +1610,9 @@ def jit_move(settings: JitSettings) -> None:
     if settings.parallel_move_threads > 0:
         args += ["--parallel_move_threads", f"{str(settings.parallel_move_threads)}"]
 
+    if settings.flush_batch > 0:
+        args += ["--flush_batch", str(settings.flush_batch)]
+
     if settings.debug_lvl > 0:
         args += ["--debug"]
 
@@ -987,6 +1621,19 @@ def jit_move(settings: JitSettings) -> None:
 
     if settings.flush_log:
         args += ["--flush_log", str(settings.flush_log)]
+
+    if settings.stage_out_keep:
+        args += ["--keep_source"]
+
+    if settings.stage_out_all_nodes:
+        args += [
+            "--all_nodes",
+            str(settings.app_nodes),
+            "--srun_nodes",
+            f"--jobid={settings.job_id} {settings.app_nodes_command}",
+            "--tasks_per_node",
+            str(settings.stage_out_tasks_per_node),
+        ]
 
     # Define CLI parser
     parser = argparse.ArgumentParser(
@@ -1028,6 +1675,12 @@ def jit_move(settings: JitSettings) -> None:
     )
     parser.add_argument("--ignore_mtime", action="store_true", default=True)
     parser.add_argument("--parallel_move_threads", type=int, default=1)
+    parser.add_argument(
+        "--flush_batch",
+        type=int,
+        default=0,
+        help="Copy up to this many files of one directory per cp call (0: one each).",
+    )
     parser.add_argument(
         "--debug",
         dest="debug",
@@ -1083,8 +1736,26 @@ def jit_move(settings: JitSettings) -> None:
         help="Path to the flush log file.",
     )
 
+    parser.add_argument(
+        "--keep_source",
+        action="store_true",
+        default=False,
+        help="Final stage-out copies only; the burst buffer goes away with the job.",
+    )
+    parser.add_argument(
+        "--all_nodes",
+        type=int,
+        default=0,
+        help="Copy the final stage-out from this many app nodes at once (0: FTIO node).",
+    )
+    parser.add_argument(
+        "--srun_nodes", type=str, default="", help="srun job and node list options."
+    )
+    parser.add_argument("--tasks_per_node", type=int, default=4)
+
     # Parse and call mover
     parsed_args = parser.parse_args(args)
+    parsed_args.exclude = list(exclude or [])
 
     if not settings.dry_run:
         move_files_os(parsed_args, triggered_by="post_app")

@@ -20,6 +20,7 @@ import os
 import re
 import signal
 import subprocess
+import threading
 import time
 from datetime import datetime
 
@@ -351,7 +352,20 @@ def monitor_log_file(file: str, src: str = "") -> multiprocessing.Process:
     """
     monitor_process = multiprocessing.Process(target=print_file, args=(file, src))
     monitor_process.daemon = True
-    monitor_process.start()
+    # Fork with default handlers: print_file resets them too, but a pre-app call
+    # that ends in milliseconds (Nek5000's echo) is terminated before the child
+    # gets there, and the inherited handler then ran exit_routine in the child.
+    # signal.signal only works in the main thread; other threads keep the old path.
+    saved = {}
+    if threading.current_thread() is threading.main_thread():
+        sigs = (signal.SIGINT, signal.SIGTERM, getattr(signal, "SIGHUP", None))
+        saved = {s: signal.getsignal(s) for s in sigs if s is not None}
+        reset_signal_handlers_to_default()
+    try:
+        monitor_process.start()
+    finally:
+        for s, handler in saved.items():
+            signal.signal(s, handler)
 
     return monitor_process
 

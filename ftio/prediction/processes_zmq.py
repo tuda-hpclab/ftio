@@ -63,6 +63,7 @@ def predictor_with_processes_zmq(
     debounce = getattr(tmp_args, "debounce", False)
     max_predictions = getattr(tmp_args, "max_predictions", 0)
     pattern = getattr(tmp_args, "zmq_socket", "push-pull")
+    max_batch_window = getattr(tmp_args, "max_batch_window", 0.0)
 
     # incoming socket type from --zmq_socket; the reply socket stays PUSH
     socket_in = setup_socket(addr, port_in, recv_socket_type(pattern))
@@ -92,7 +93,9 @@ def predictor_with_processes_zmq(
                     sent = len(shared_resources.data)
 
                 # get messages
-                msgs, ranks, recv_time = receive_messages(socket_in, poller)
+                msgs, ranks, recv_time = receive_messages(
+                    socket_in, poller, max_batch_window
+                )
 
                 if not msgs:
                     CONSOLE.print("[red]No messages[/]")
@@ -179,7 +182,7 @@ def setup_socket(addr: str, port: str, socket_type=zmq.PULL, bind: bool = True):
     return socket
 
 
-def receive_messages(socket, poller):
+def receive_messages(socket, poller, max_batch_s: float = 0.0):
     """Polls for and receives messages from the socket, returning a list of messages and count.
 
     Also returns the wall-clock time actually spent receiving messages
@@ -197,10 +200,18 @@ def receive_messages(socket, poller):
     was inflated by a guaranteed ~1000ms of dead time whenever nothing more
     arrived (the common case) -- it was measuring the poll timeout, not
     receive latency.
+
+    max_batch_s > 0 closes the batch that many seconds after its first message
+    even if messages keep arriving. Without it, senders that flush at least
+    once per second (or many staggered ranks) never leave a 1s gap, so the
+    batch -- and with it every prediction -- is held until the app stops
+    writing. Messages left on the socket start the next batch. 0 (default)
+    keeps the unbounded behaviour.
     """
     msgs = []
     ranks = 0
     start = time.time()
+    first = None
     socks = dict(poller.poll(1000))
     recv_time = time.time() - start
 
@@ -208,7 +219,12 @@ def receive_messages(socket, poller):
         if socks.get(socket) == zmq.POLLIN:
             msgs.append(socket.recv(zmq.NOBLOCK))
             ranks += 1
-            recv_time = time.time() - start
+            now = time.time()
+            recv_time = now - start
+            if first is None:
+                first = now
+            if max_batch_s > 0 and now - first >= max_batch_s:
+                break
         socks = dict(poller.poll(1000))
 
     return msgs, ranks, recv_time

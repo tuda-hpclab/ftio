@@ -231,3 +231,30 @@ def test_ingest_app_bandwidth_serial_equals_fanout():
         _assert_same_function(b1, t1, b, t)
         assert total_bytes == bytes1  # summed across servers, order-independent
         assert np.isclose(t_flush, flush1)
+
+
+def test_single_message_is_resampled():
+    """One message per batch (LAMMPS) takes the resample path too, so the app
+    history stays on the --freq grid instead of keeping every request boundary."""
+    from ftio.api.gekkoFs.ftio_gekko import ingest_app_bandwidth
+
+    # 200 back-to-back 1 MB writes over 2 s, flushed at t=3 s (all times in us)
+    starts = [i * 10_000 for i in range(200)]
+    fields = [
+        3_000_000,
+        "host",
+        7,
+        starts,
+        [s + 10_000 for s in starts],
+        [1_000_000] * 200,
+        200,
+        200_000_000,
+    ]
+    msg = b"".join(msgpack.packb(f) for f in fields)
+    b, t, total_bytes, t_flush, _ = ingest_app_bandwidth(
+        [msg], "write", 4, "process-resample", 10.0
+    )
+    assert total_bytes == 200_000_000 and np.isclose(t_flush, 3.0)
+    assert len(t) <= 23  # 2 s at 10 Hz plus one zero sample per side
+    assert np.allclose(np.diff(t), 0.1)
+    assert np.allclose(max(b), 1e8)  # 1 MB per 10 ms

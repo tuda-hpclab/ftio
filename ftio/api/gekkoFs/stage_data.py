@@ -17,14 +17,15 @@ import argparse
 import os
 import sys
 import time
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from multiprocessing import Queue
+from threading import Thread
 
 import numpy as np
 
 from ftio.api.gekkoFs.gekko_helper import preloaded_call
 from ftio.api.gekkoFs.jit.logger import Logger
-from ftio.api.gekkoFs.posix_control import move_files_os
+from ftio.api.gekkoFs.posix_control import flush_using_cp, move_files_os, ready_by_size
 from ftio.freq.helper import MyConsole
 from ftio.parse.args import parse_args
 
@@ -83,6 +84,13 @@ def stage_files(args: argparse.Namespace, latest_prediction: dict) -> None:
         args (Namespace): Parsed command line arguments.
         latest_prediction (dict): Result from FTIO containing prediction details.
     """
+    # jit removes the flag the moment the app ends and stages the rest out itself.
+    # A trigger scheduled before that ("trigger in N s") must not start a new
+    # flush now: jit only leaves alone what was already in flight at app end.
+    flag = getattr(args, "app_start_file", None)
+    if flag and not os.path.isfile(flag):
+        trigger_print("Application has ended; jit stages the rest, skipping trigger")
+        return
     period = 1 / latest_prediction["freq"] if latest_prediction["freq"] > 0 else 0
     text = f"frequency: {latest_prediction['freq']}\nperiod: {period} \nconfidence: {latest_prediction['conf']}\nprobability: {latest_prediction['probability']}"
     trigger_print(text)
@@ -128,11 +136,48 @@ def trigger_flush(sync_trigger: Queue, args: argparse.Namespace) -> None:
         args (Namespace): Parsed command line arguments.
     """
     if "flush" in args.strategy:
+        if getattr(args, "eager_size", False):
+            # a thread: flush_using_cp starts a process pool, which a daemon process cannot
+            Thread(target=eager_size_loop, args=(args,), daemon=True).start()
         strategy_avoid_interference(sync_trigger, args)
     elif "job_end" in args.strategy or "buffer_size" in args.strategy:
         pass
     else:
         raise ValueError("Unknown strategy")
+
+
+def _flush_ready(args: argparse.Namespace, items: list[str]) -> None:
+    try:
+        flush_using_cp(args, items, 0, "ftio")
+    except Exception as e:
+        TRIGGER_LOGGER.error(f"size-ready flush failed: {e}")
+
+
+def eager_size_loop(args: argparse.Namespace) -> None:
+    """Copy each checkpoint as soon as it has its kind's constant size and stopped
+    changing, next to FTIO's timed triggers (see posix_control.ready_by_size).
+
+    Lists the mount every --eager_poll seconds while the app runs.
+    """
+    state: dict = {}
+    flag = getattr(args, "app_start_file", None)
+    # own copy: the timed triggers in this process keep their args
+    args = argparse.Namespace(**vars(args))
+    # as move_files_os: copies go through the syscall client, not the libc one
+    args.ld_preload = (args.ld_preload or "").replace("libc_", "")
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        while True:
+            start = time.time()
+            if not flag or os.path.isfile(flag):
+                try:
+                    ready = ready_by_size(args, state)
+                except Exception as e:
+                    TRIGGER_LOGGER.error(f"size-ready listing failed: {e}")
+                    ready = []
+                if ready:
+                    trigger_print(f"Size reached and stable, copying now: {ready}")
+                    executor.submit(_flush_ready, args, ready)
+            time.sleep(max(0.0, args.eager_poll - (time.time() - start)))
 
 
 def strategy_job_end(sync_trigger: Queue, args: argparse.Namespace) -> None:
@@ -220,6 +265,7 @@ def strategy_avoid_interference(sync_trigger: Queue, args: argparse.Namespace) -
             try:
                 if not sync_trigger.empty():
                     latest_prediction = sync_trigger.get()
+                    latest_prediction["freq"] *= getattr(args, "freq_scale", 1.0)
                     t = time.time() - latest_prediction["t_wait"]  # time waiting so far
                     # CONSOLE.print(f"[bold green][Trigger] queue wait time = {t:.3f} s[/]\n")
                     if not np.isnan(latest_prediction["freq"]):
@@ -422,11 +468,48 @@ def parse_args_data_stager(
         default="/lustre/project/nhr-admire/tarraf/stage-out",
     )
     parser.add_argument(
+        "--defer_delete",
+        dest="defer_delete",
+        action="store_true",
+        help="FTIO's flushes copy but keep the source; it is not unlinked during the run",
+        default=False,
+    )
+    parser.add_argument(
         "--parallel_move_threads",
         dest="parallel_move_threads",
         type=int,
         help="If set, flushes files in parallel",
         default=1,
+    )
+    parser.add_argument(
+        "--flush_batch",
+        dest="flush_batch",
+        type=int,
+        help="Copy up to this many files of one directory per cp call (0: one each)",
+        default=0,
+    )
+    parser.add_argument(
+        "--eager_size",
+        dest="eager_size",
+        action="store_true",
+        help="Also copy a checkpoint as soon as it has the constant size of the earlier "
+        "ones and stopped changing, without waiting for FTIO's trigger",
+        default=False,
+    )
+    parser.add_argument(
+        "--eager_poll",
+        dest="eager_poll",
+        type=float,
+        help="Seconds between mount listings for --eager_size",
+        default=1.0,
+    )
+    parser.add_argument(
+        "--freq_scale",
+        dest="freq_scale",
+        type=float,
+        help="Multiply FTIO's predicted frequency by this before timing a flush "
+        "(a deliberately wrong prediction for the misprediction study; 1: off)",
+        default=1.0,
     )
     parser.add_argument(
         "--debug",

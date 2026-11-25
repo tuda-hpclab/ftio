@@ -13,6 +13,7 @@ For more information, see the LICENSE file in the project root:
 https://github.com/tuda-parallel/FTIO/blob/main/LICENSE
 """
 
+import faulthandler
 import os
 import sys
 import time
@@ -55,6 +56,8 @@ from ftio.prediction.shared_resources import SharedResources
 
 # T_S = time.time()
 CONSOLE = MyConsole()
+# seconds a prediction may run before its stack is dumped to stderr
+STALL_DUMP_S = 45
 CONSOLE.set(True)
 
 
@@ -75,6 +78,11 @@ def main(args: list[str] = sys.argv[1:]) -> None:
         idx = ftio_args.index("--max-predictions")
         if idx + 1 < len(ftio_args):
             max_predictions = int(ftio_args[idx + 1])
+    max_batch_window = 0.0
+    if "--max-batch-window" in ftio_args:
+        idx = ftio_args.index("--max-batch-window")
+        if idx + 1 < len(ftio_args):
+            max_batch_window = float(ftio_args[idx + 1])
 
     ftio_args.extend(["-e", "no"])
     if "-zmq" not in ftio_args:
@@ -106,7 +114,9 @@ def main(args: list[str] = sys.argv[1:]) -> None:
                 procs = join_procs(procs, False)
 
                 # get all messages
-                msgs, ranks, recv_time = receive_messages(socket, poller)
+                msgs, ranks, recv_time = receive_messages(
+                    socket, poller, max_batch_window
+                )
                 if msgs:
                     msgs = unbatch_messages(msgs)
                     ranks = len(msgs)
@@ -192,6 +202,10 @@ def prediction_zmq_process(
         msg: zmq message
     """
     t_prediction = time.time()
+    # Some predictions block until the app ends (LAMMPS 2+1, BSC 48814032:
+    # RESPONSE_MS 103 s on an idle node). Dump this process's stack to
+    # ftio.err if it is still running after STALL_DUMP_S, to see where.
+    faulthandler.dump_traceback_later(STALL_DUMP_S)
     console = Console()
     console.print(f"[purple][PREDICTOR] (#{shared_resources.count.value}):[/]  Started")
 
@@ -202,12 +216,17 @@ def prediction_zmq_process(
     prediction, parsed_args, t_flush = run(
         msg, args, shared_resources.b_app, shared_resources.t_app
     )
+    t_run = time.time()
     shared_resources.t_flush.append(t_flush)
 
-    # plot
-    plot_bar_with_rich(
-        shared_resources.t_app, shared_resources.b_app, width_percentage=0.8
-    )
+    # Terminal bar plot of the whole app history; it copies t_app/b_app out of the
+    # Manager every prediction (2.1 s per prediction at LAMMPS 124+1), so it follows
+    # the plot switch `-e no`.
+    if parsed_args.engine != "no":
+        plot_bar_with_rich(
+            shared_resources.t_app, shared_resources.b_app, width_percentage=0.8
+        )
+    t_plot = time.time()
 
     # get data
     freq, conf = get_dominant_and_conf(prediction)  # just get a single dominant value
@@ -260,8 +279,24 @@ def prediction_zmq_process(
         }
     )
 
+    # RESPONSE_MS: wall time from this process starting (right after the message
+    # batch was drained -- see LATENCY in receive_messages) to the trigger decision
+    # being queued. LATENCY already isolates socket-drain time; this isolates what
+    # happens after -- prediction + analysis + trigger hand-off -- so a slow
+    # response can be told apart from a slow receive when either grows with rank
+    # density or node count.
+    response_time = time.time() - t_prediction
+    console.print(f"[magenta]RESPONSE_MS response_ms={response_time * 1000:.3f}[/]")
+    # Split of RESPONSE_MS: run() (ingest, DFT, bandwidth dump), the terminal bar
+    # plot over the whole app history, and the rest (probability, hand-off).
+    console.print(
+        f"[magenta]RESPONSE_STEPS run_ms={(t_run - t_prediction) * 1000:.3f} "
+        f"plot_ms={(t_plot - t_run) * 1000:.3f} "
+        f"rest_ms={(time.time() - t_plot) * 1000:.3f}[/]"
+    )
     console.print(f"[purple][PREDICTOR] (#{shared_resources.count.value}):[/] Ended")
     shared_resources.count.value += 1  # proc-safe, as manager already handles this
+    faulthandler.cancel_dump_traceback_later()
 
 
 if __name__ == "__main__":

@@ -1,8 +1,8 @@
 """Tests for the bandwidth.json artifact in the JIT log dir.
 
 FTIO's dump_json writes bandwidth.json into the predictor's cwd, and the
-predictor cds into the run's log dir first (see the predictor call in
-setup_core), so the trace lands in the log dir directly -- no copy-after. A run
+predictor cds into the run's node-local state dir first (see the predictor call
+in setup_core); save_ftio_state copies the trace into the log dir. A run
 in which FTIO captured no I/O produces no file, and must not inherit an earlier
 run's trace.
 
@@ -23,6 +23,7 @@ from ftio.api.gekkoFs.jit.setup_helper import (
     bandwidth_path,
     clear_bandwidth,
     save_bandwidth,
+    save_ftio_state,
 )
 
 
@@ -30,12 +31,24 @@ def _settings(tmp_path, exclude_ftio: bool = False) -> SimpleNamespace:
     # The nested per-app layout: logs/<app>/nodes_<n>/rep_<rep>/<mode>
     log_dir = tmp_path / "logs" / "lammps" / "nodes_9" / "rep_1" / "glass"
     log_dir.mkdir(parents=True)
-    return SimpleNamespace(log_dir=str(log_dir), exclude_ftio=exclude_ftio)
+    state_dir = tmp_path / "shm" / "ftio_state"
+    state_dir.mkdir(parents=True)
+    return SimpleNamespace(
+        log_dir=str(log_dir), ftio_state_dir=str(state_dir), exclude_ftio=exclude_ftio
+    )
 
 
-def test_bandwidth_lives_in_the_log_dir(tmp_path):
+def test_bandwidth_lands_in_the_log_dir_after_save_ftio_state(tmp_path):
     settings = _settings(tmp_path)
-    assert bandwidth_path(settings) == os.path.join(settings.log_dir, "bandwidth.json")
+    assert bandwidth_path(settings) == os.path.join(
+        settings.ftio_state_dir, "bandwidth.json"
+    )
+    Path(bandwidth_path(settings)).write_text('{"b": [3], "t": [2]}')
+    save_ftio_state(settings)
+    with open(os.path.join(settings.log_dir, "bandwidth.json")) as f:
+        assert f.read() == '{"b": [3], "t": [2]}'
+    assert not os.path.exists(settings.ftio_state_dir)
+    save_ftio_state(settings)  # a second call (jit's finally) is a no-op
 
 
 def test_clear_removes_a_trace_left_by_an_earlier_run(tmp_path):
@@ -57,7 +70,7 @@ def test_clear_keeps_the_trace_when_ftio_is_excluded(tmp_path):
 
 
 def test_save_keeps_the_trace_the_predictor_wrote(tmp_path):
-    # The predictor already wrote it into the log dir; save_bandwidth just
+    # The predictor already wrote it into the state dir; save_bandwidth just
     # confirms it and must leave it untouched (no copy onto itself).
     settings = _settings(tmp_path)
     Path(bandwidth_path(settings)).write_text('{"b": [2], "t": [1]}')

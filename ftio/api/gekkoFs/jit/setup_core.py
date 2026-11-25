@@ -13,6 +13,7 @@ For more information, see the LICENSE file in the project root:
 https://github.com/tuda-parallel/FTIO/blob/main/LICENSE
 """
 
+import contextlib
 import math
 import os
 import re
@@ -20,6 +21,7 @@ import signal
 
 # import multiprocessing
 import subprocess
+import threading
 import time
 
 from ftio.api.gekkoFs.jit.execute_and_wait import (
@@ -55,7 +57,16 @@ from ftio.api.gekkoFs.jit.setup_helper import (
     shut_down,
 )
 from ftio.api.gekkoFs.jit.setup_init import init_gekko
-from ftio.api.gekkoFs.posix_control import format_size, jit_move
+from ftio.api.gekkoFs.posix_control import (
+    copied_registry,
+    format_size,
+    inflight_registry,
+    jit_move,
+    read_copied,
+    read_inflight,
+    reset_copied,
+    reset_inflight,
+)
 
 _MAX_RETRIES = 3
 
@@ -161,7 +172,17 @@ def start_gekko_daemon(settings: JitSettings) -> None:
         # daemon to actually know FTIO's address, so pass both through
         # explicitly when relay mode is requested.
         if not settings.exclude_ftio and os.environ.get("GKFS_METRICS_AGGREGATOR"):
+            # daemon.cpp's start_metrics_relay() only starts the relay thread
+            # if ALL THREE of ENABLE_METRICS/METRICS_AGGREGATOR/METRICS_IP_PORT
+            # are set on the daemon's own environment -- GKFS_ENABLE_METRICS
+            # was missing here (it was only ever passed to the client, further
+            # below), so the daemon's guard silently failed and the relay
+            # thread never started: clients connected fine to the local relay
+            # socket (gekko_client.log confirms this), but nothing was bound
+            # on the other end to drain and forward it to FTIO. Root-caused
+            # 2026-09-14 from jobs 45284739/45284742 (zero FTIO-side metrics).
             debug_flag += (
+                f",GKFS_ENABLE_METRICS=on"
                 f",GKFS_METRICS_IP_PORT={settings.address_ftio}:{settings.port_ftio}"
                 f",GKFS_METRICS_AGGREGATOR=on"
             )
@@ -171,7 +192,7 @@ def start_gekko_daemon(settings: JitSettings) -> None:
             call = (
                 f" {settings.gkfs_daemon} "
                 f"-r {settings.gkfs_rootdir} -m {settings.gkfs_mntdir} "
-                f"-H {settings.gkfs_hostfile}  -c --clean-rootdir -l ib0 -P {settings.gkfs_daemon_protocol}"
+                f"-H {settings.gkfs_hostfile}  -c --clean-rootdir -l ib0 -P {settings.gkfs_daemon_protocol} {settings.gkfs_daemon_args}"
             )
             call = mpiexec_call(
                 settings,
@@ -184,7 +205,7 @@ def start_gekko_daemon(settings: JitSettings) -> None:
                 f"srun {debug_flag} --jobid={settings.job_id} {settings.app_nodes_command} --disable-status -N {settings.app_nodes} "
                 f"--ntasks={settings.app_nodes} --cpus-per-task={settings.procs_daemon} --ntasks-per-node=1 --overcommit --overlap "
                 f"--oversubscribe --mem=0 {settings.task_set_0} {settings.gkfs_daemon} -r {settings.gkfs_rootdir} -m {settings.gkfs_mntdir} "
-                f"-H {settings.gkfs_hostfile}  -c --clean-rootdir -l ib0 -P {settings.gkfs_daemon_protocol}"
+                f"-H {settings.gkfs_hostfile}  -c --clean-rootdir -l ib0 -P {settings.gkfs_daemon_protocol} {settings.gkfs_daemon_args}"
             )
         if not settings.exclude_proxy:
             call += " -p ofi+verbs -L ib0"
@@ -282,7 +303,7 @@ def start_fuse(settings: JitSettings) -> None:
                     f"-x LIBGKFS_OFI_INTERFACE=ib0 "
                     f"-x GKFS_METRICS_IP_PORT={settings.address_ftio}:{settings.port_ftio} "
                     f"-x GKFS_ENABLE_METRICS=on "
-                    f"-x LIBGKFS_METRICS_FLUSH_INTERVAL=5 "
+                    f"-x LIBGKFS_METRICS_FLUSH_INTERVAL={settings.metrics_flush_interval} "
                     f"{call}"
                 ),
                 settings.app_nodes,
@@ -294,7 +315,7 @@ def start_fuse(settings: JitSettings) -> None:
                 f"--export=ALL,LIBGKFS_HOSTS_FILE={settings.gkfs_hostfile},"
                 f"LIBGKFS_OFI_INTERFACE=ib0,"
                 f"GKFS_METRICS_IP_PORT={settings.address_ftio}:{settings.port_ftio},"
-                f"GKFS_ENABLE_METRICS=on,LIBGKFS_METRICS_FLUSH_INTERVAL=5 "
+                f"GKFS_ENABLE_METRICS=on,LIBGKFS_METRICS_FLUSH_INTERVAL={settings.metrics_flush_interval} "
                 f"--ntasks={settings.app_nodes} --cpus-per-task={settings.procs_daemon} --ntasks-per-node=1 --overcommit --overlap "
                 f"--oversubscribe --mem=0 {settings.task_set_0} "
                 f"{settings.gkfs_fuse}"
@@ -555,6 +576,18 @@ def start_ftio(settings: JitSettings) -> None:
                     f"--parallel_move_threads {settings.parallel_move_threads} "
                 )
 
+            if settings.defer_delete:
+                ftio_data_staget_args += "--defer_delete "
+
+            if settings.flush_batch > 0:
+                ftio_data_staget_args += f"--flush_batch {settings.flush_batch} "
+
+            if settings.freq_scale != 1:
+                ftio_data_staget_args += f"--freq_scale {settings.freq_scale} "
+
+            if settings.eager_size:
+                ftio_data_staget_args += "--eager_size "
+
             if settings.debug_lvl > 0:
                 ftio_data_staget_args += "--debug "
 
@@ -588,6 +621,10 @@ def start_ftio(settings: JitSettings) -> None:
 
         if settings.flush_log:
             ftio_data_staget_args += f" --flush_log {settings.flush_log}"
+            # Entries a killed FTIO left behind would make stage_out wait on
+            # copies that are no longer running.
+            reset_inflight(inflight_registry(settings.flush_log))
+            reset_copied(copied_registry(settings.flush_log))
 
         if settings.cluster:
             jit_print(
@@ -596,18 +633,17 @@ def start_ftio(settings: JitSettings) -> None:
             jit_print(
                 f"[cyan]FTIO is listening node is {settings.address_ftio}:{settings.port_ftio} [/]"
             )
-            # cd into the run's log dir so FTIO's dump_json writes bandwidth.json
-            # straight there (its cwd), instead of into a shared RES_DIR to be
-            # copied afterwards -- see save_bandwidth.
+            # cd into the node-local state dir so FTIO's dump_json writes
+            # bandwidth.json there (its cwd); save_ftio_state copies it to the log dir.
             call = (
-                f"cd {settings.log_dir} && "
+                f"cd {settings.ftio_state_dir} && "
                 f"srun --jobid={settings.job_id} {settings.ftio_node_command} "
                 f"--disable-status -N 1 --ntasks=1 --cpus-per-task={settings.procs_ftio} "
                 f"--ntasks-per-node=1 --overcommit --overlap --oversubscribe --mem=0 "
                 f"{settings.ftio_bin_location}/predictor_jit {ftio_data_staget_args} --  --zmq_address {settings.address_ftio} --zmq_port {settings.port_ftio} {settings.ftio_args} "
             )
         else:
-            call = f"cd {settings.log_dir} && {settings.ftio_bin_location}/predictor_jit {ftio_data_staget_args} --  --zmq_address {settings.address_ftio} --zmq_port {settings.port_ftio} {settings.ftio_args} "
+            call = f"cd {settings.ftio_state_dir} && {settings.ftio_bin_location}/predictor_jit {ftio_data_staget_args} --  --zmq_address {settings.address_ftio} --zmq_port {settings.port_ftio} {settings.ftio_args} "
 
         jit_print("[cyan]Starting FTIO[/]")
 
@@ -681,6 +717,23 @@ def stage_in(settings: JitSettings, runtime: JitTime) -> None:
                 )
                 > 0
             ):
+                # The placeholder "test" file above only exists to make this
+                # emptiness check pass -- it must not ride into the mount with
+                # the real stage-in content below. For apps with otherwise-empty
+                # stage-in (e.g. S3D-IO, files=[] in prepare_run_dir), it was the
+                # ONLY thing copied in, sitting alone in the mount root for the
+                # whole run. Found 2026-09-29: at high node counts GekkoFS
+                # sometimes loses this file's metadata (visible in readdir, ENOENT
+                # on every stat/cp) -- and because the flush regex collapses to a
+                # whole-mount copy when everything matches, one ghost file took
+                # down the ENTIRE stage-out for S3D-IO at 96+1/124+1 (repeated
+                # failed .temp-fallback retries burned the full ~360s drain
+                # before giving up). Root cause is GekkoFS-side (same class of
+                # bug as the Castro rename-metadata-loss issue), but removing our
+                # own unnecessary placeholder before it ever reaches the mount
+                # sidesteps it entirely -- it was never needed by any app.
+                if os.path.exists(test_file):
+                    os.remove(test_file)
                 # Copy the directory *contents* with `/.`, not the `/*` glob: when
                 # stage-in holds no real inputs (e.g. DLIO generates its dataset
                 # straight into the mount) the shell leaves `/*` unexpanded and cp
@@ -763,7 +816,7 @@ def stage_in(settings: JitSettings, runtime: JitTime) -> None:
 
 #! Stage out
 #!##############################
-def hostfile_is_sane(settings: JitSettings) -> bool:
+def hostfile_is_sane(settings: JitSettings, timeout: int = 180) -> bool:
     """Check the GekkoFS hostfile lists exactly the daemons we just started.
 
     The daemon **appends** to the hostfile (`ios::out | ios::app`) and only
@@ -781,23 +834,43 @@ def hostfile_is_sane(settings: JitSettings) -> bool:
     coin-flip per path, so it looks random: measured 4 of 6 operations failing
     with one stale line next to one live one.
 
+    The same append also means the file exists as soon as the *first* daemon
+    registers and only reaches one line per daemon once the slowest one is up.
+    A client started in between loads a partial host list and hashes paths onto
+    the wrong daemons, so every rank on that node fails (WarpX `chk000000`
+    ENOENT, DLIO EBUSY at 32+1 and up). Hence wait for the full count here.
+
     Args:
         settings (JitSettings): The JIT settings.
+        timeout (int): Seconds to wait for every daemon to register.
 
     Returns:
         bool: True when the hostfile holds exactly one entry per daemon node.
     """
     if settings.dry_run:
         return True
-    try:
-        with open(settings.gkfs_hostfile) as f:
-            lines = [ln.strip() for ln in f if ln.strip()]
-    except OSError as e:
-        jit_print(f"[bold red]Cannot read the hostfile: {e}[/]")
-        return False
 
     expected = max(1, settings.app_nodes) if settings.cluster else 1
-    if len(lines) <= expected:
+    deadline = time.time() + timeout
+    while True:
+        try:
+            with open(settings.gkfs_hostfile) as f:
+                lines = [ln.strip() for ln in f if ln.strip()]
+        except OSError as e:
+            jit_print(f"[bold red]Cannot read the hostfile: {e}[/]")
+            return False
+        if len(lines) >= expected or time.time() >= deadline:
+            break
+        time.sleep(0.2)
+
+    if len(lines) < expected:
+        jit_print(
+            f"[bold red]Only {len(lines)} of {expected} GekkoFS daemon(s) registered "
+            f"in the hostfile after {timeout} s.[/]"
+        )
+        return False
+    if len(lines) == expected:
+        jit_print(f"All {expected} GekkoFS daemon(s) registered in the hostfile.")
         return True
 
     jit_print(
@@ -903,6 +976,70 @@ def wait_for_flush_to_settle(
     )
 
 
+def _drain_ftio_then_shut_down(
+    settings: JitSettings, timeout: float = 120.0, poll: float = 2.0
+) -> None:
+    """Wait until FTIO's in-flight registry is empty, then shut FTIO down.
+
+    Same timeout/poll as wait_for_flush_to_settle: a copy that never finishes
+    (wedged RPC) must not hold the stage-out forever.
+    """
+    registry = inflight_registry(settings.flush_log)
+    deadline = time.time() + timeout
+    while read_inflight(registry) and time.time() < deadline:
+        time.sleep(poll)
+    left = read_inflight(registry)
+    if left:
+        jit_print(
+            f"[yellow]Timed out waiting for {len(left)} FTIO copies; shutting FTIO down"
+        )
+    jit_print("[cyan]FTIO's in-flight copies are done; shutting FTIO down")
+    shut_down(settings, "FTIO", settings.ftio_pid)
+    _flush_log_event(settings.flush_log, "FTIO-SHUTDOWN", f"{len(left)} still in flight")
+
+
+def _stage_out_alongside_ftio(settings: JitSettings) -> None:
+    """Stage out next to FTIO's in-flight copies without touching them.
+
+    jit_move starts at once on everything FTIO is not copying, while a thread
+    waits for FTIO's copies and then shuts it down. A second jit_move pass picks
+    up anything those copies left behind (a failed or abandoned one).
+    """
+    registry = inflight_registry(settings.flush_log)
+    if not registry:
+        # No flush log, so no registry to coordinate on: the old sequential path.
+        wait_for_flush_to_settle(settings)
+        shut_down(settings, "FTIO", settings.ftio_pid)
+        jit_move(settings)
+        return
+
+    in_flight = read_inflight(registry)
+    for item in in_flight:
+        _flush_log_event(settings.flush_log, "SKIP-INFLIGHT", item)
+    waiter = threading.Thread(
+        target=_drain_ftio_then_shut_down, args=(settings,), daemon=True
+    )
+    waiter.start()
+    jit_move(settings, exclude=in_flight + _kept_copies(settings))
+    waiter.join()
+    if in_flight:
+        # FTIO's last copies are done now; with --defer_delete they are kept in
+        # the mount, so read the copied registry again before the second pass.
+        jit_move(settings, exclude=_kept_copies(settings) or None)
+
+
+def _kept_copies(settings: JitSettings) -> list[str]:
+    """Items FTIO already copied and kept in the mount (--defer_delete only).
+
+    Excluding them keeps the final stage-out from copying them a second time.
+    It assumes the app does not rewrite an item after FTIO copied it: the item
+    was older than the flush mtime threshold when it was copied.
+    """
+    if not getattr(settings, "defer_delete", False):
+        return []
+    return list(read_copied(copied_registry(settings.flush_log)))
+
+
 def stage_out(settings: JitSettings, runtime: JitTime) -> None:
     """Stages data out to the specified path.
 
@@ -927,11 +1064,15 @@ def stage_out(settings: JitSettings, runtime: JitTime) -> None:
             #     f"cp -r  {settings.gkfs_mntdir} {settings.stage_out_path} || echo 'nothing to stage out'",
             #     exclude=["ftio"],
             # )
-            # FTIO is already down: start_application waits for the flush to settle
-            # and shuts it down on this same path. Timing only jit_move keeps this
-            # comparable with the gekko run, which has no FTIO to tear down.
-            start = time.time()
-            jit_move(settings)
+            if settings.exclude_ftio:
+                start = time.time()
+                jit_move(settings)
+            else:
+                # Stage-out = app end until ALL data is on the target, whether FTIO
+                # or jit_move copies it. Timing only jit_move (as before) left out
+                # FTIO's last in-flight copies, up to ~38 s per run.
+                start = settings.app_end_time or time.time()
+                _stage_out_alongside_ftio(settings)
             elapsed_time(settings, runtime, "Stage out", time.time() - start)
         else:
             if not settings.dry_run:
@@ -1023,7 +1164,7 @@ def start_application(settings: JitSettings, runtime: JitTime):
         additional_arguments = ""
         if settings.use_mpirun:
             if not settings.exclude_ftio:
-                additional_arguments += f"-x GKFS_METRICS_IP_PORT={settings.address_ftio}:{settings.port_ftio} -x GKFS_ENABLE_METRICS=on -x LIBGKFS_METRICS_FLUSH_INTERVAL=5 "
+                additional_arguments += f"-x GKFS_METRICS_IP_PORT={settings.address_ftio}:{settings.port_ftio} -x GKFS_ENABLE_METRICS=on -x LIBGKFS_METRICS_FLUSH_INTERVAL={settings.metrics_flush_interval} "
             if not settings.exclude_proxy:
                 additional_arguments += (
                     f"-x LIBGKFS_PROXY_PID_FILE={settings.gkfs_proxyfile} "
@@ -1094,7 +1235,7 @@ def start_application(settings: JitSettings, runtime: JitTime):
                     gkfs_env += (
                         f"GKFS_ENABLE_METRICS=on "
                         f"GKFS_METRICS_IP_PORT={settings.address_ftio}:{settings.port_ftio} "
-                        f"LIBGKFS_METRICS_FLUSH_INTERVAL=5 "
+                        f"LIBGKFS_METRICS_FLUSH_INTERVAL={settings.metrics_flush_interval} "
                     )
                 if not settings.exclude_daemon:
                     log_modules = "all" if settings.debug_lvl > 1 else "errors"
@@ -1127,7 +1268,7 @@ def start_application(settings: JitSettings, runtime: JitTime):
             else:
                 # Legacy / FUSE mode: pass GekkoFS vars via srun --export
                 if not settings.exclude_ftio:
-                    additional_arguments += f"GKFS_ENABLE_METRICS=on,GKFS_METRICS_IP_PORT={settings.address_ftio}:{settings.port_ftio},LIBGKFS_METRICS_FLUSH_INTERVAL=5,"
+                    additional_arguments += f"GKFS_ENABLE_METRICS=on,GKFS_METRICS_IP_PORT={settings.address_ftio}:{settings.port_ftio},LIBGKFS_METRICS_FLUSH_INTERVAL={settings.metrics_flush_interval},"
                 if not settings.exclude_daemon:
                     log_modules = "all" if settings.debug_lvl > 1 else "errors"
                     additional_arguments += (
@@ -1189,6 +1330,22 @@ def start_application(settings: JitSettings, runtime: JitTime):
 
     # elapsed = execute_block_and_log(call, settings.app_log_dir)
     check(settings)
+    if settings.launch_warmup and settings.cluster and not settings.use_mpirun:
+        # The first job step in an allocation sometimes waits 140-300 s before the
+        # app starts (6-10 % of first legs, 2-3 % of later ones, any leg type).
+        # Read the binary on every node and start the same task layout once.
+        warm = (
+            f"srun --jobid={settings.job_id} {settings.app_nodes_command} "
+            f"--disable-status -N {settings.app_nodes} "
+            f"--ntasks={settings.app_nodes * settings.procs_app} "
+            f"--ntasks-per-node={settings.procs_app} --overcommit --overlap "
+            f"--oversubscribe --mem=0 cat {app_call} > /dev/null"
+        )
+        t_warm = time.time()
+        subprocess.run(warm, shell=True, check=False)
+        jit_print(
+            f"[cyan]Launch warm-up took {time.time() - t_warm:.1f} s (not timed)[/]"
+        )
     _flush_log_event(settings.flush_log, "APP-START", name)
     for attempt in range(_MAX_RETRIES):
         if attempt > 0:
@@ -1226,8 +1383,15 @@ def start_application(settings: JitSettings, runtime: JitTime):
         real_time = extract_accurate_time(settings, real_time)
 
         if not timed_out and process.returncode == 0:
+            settings.app_end_time = time.time()
             elapsed_time(settings, runtime, "App", real_time)
             _flush_log_event(settings.flush_log, "APP-END", name)
+            # Nothing new enters the mount now. Dropping the flag makes FTIO hold
+            # further predictions and skip triggers it had already scheduled, so
+            # the only FTIO copies left are the ones in its in-flight registry.
+            if not settings.exclude_ftio and settings.app_start_file:
+                with contextlib.suppress(FileNotFoundError):
+                    os.remove(settings.app_start_file)
             break
 
         if not timed_out:
@@ -1286,13 +1450,8 @@ def start_application(settings: JitSettings, runtime: JitTime):
             elapsed_time(settings, runtime, "App", real_time)
             exit_routine(settings)
 
-    if not settings.exclude_ftio and settings.exclude_cargo:
-        # Let a flush that is mid-copy finish before FTIO dies. move_item copies
-        # then deletes, so killing it here loses no data -- but it throws the
-        # partial copy away and the post-app stage-out redoes it from scratch.
-        wait_for_flush_to_settle(settings)
-        jit_print("[cyan]Shuting down FTIO as application finished")
-        shut_down(settings, "FTIO", settings.ftio_pid)
+    # FTIO stays up here: its in-flight copies are part of the stage-out, so
+    # stage_out() waits for them (and shuts FTIO down) inside the timed section.
 
     os.chdir(original_dir)
     jit_print(f"Changing directory to {os.getcwd()}")

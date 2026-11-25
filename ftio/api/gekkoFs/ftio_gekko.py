@@ -12,6 +12,7 @@ https://github.com/tuda-parallel/FTIO/blob/main/LICENSE
 # import os
 import argparse
 import glob
+import time
 
 import numpy as np
 import plotly.graph_objects as go
@@ -143,17 +144,27 @@ def ingest_app_bandwidth(
     t_flush is the max. Returns (b, t, total_bytes, t_flush, ext).
     """
     n = resolve_workers(n_workers) if n_workers > 1 else 1
-    if n == 1 or len(files_or_msgs) <= 1:
-        return _parse_overlap_chunk((files_or_msgs, io_type))
-
-    chunks = partition(files_or_msgs, n)
-
     # process-resample: each worker returns a small fixed-length resampled
     # vector on a shared grid, so nothing large crosses the process boundary.
     # _peek_horizon only reads the flush_t header of *packed* messages; for file
     # inputs it yields 0 and the grid would collapse to a single point, silently
     # returning an empty series. Fall back to the exact path in that case.
     horizon = _peek_horizon(files_or_msgs) if backend == "process-resample" else 0.0
+    if backend == "process-resample" and horizon > 0.0 and len(files_or_msgs) == 1:
+        # One message per batch (LAMMPS) must be resampled too: the exact path keeps
+        # every request boundary, and the app history the predictor copies and
+        # dumps each round grew to 473k samples at LAMMPS 124+1 (2.7 s per round).
+        grid = np.arange(0.0, horizon + 1.0 / resample_hz, 1.0 / resample_hz)
+        rb, total_bytes, t_flush, ext = _parse_overlap_resample_chunk(
+            (files_or_msgs, io_type, grid)
+        )
+        b, t = _trim_grid_padding(rb, grid)
+        return b, t, total_bytes, t_flush, ext
+    if n == 1 or len(files_or_msgs) <= 1:
+        return _parse_overlap_chunk((files_or_msgs, io_type))
+
+    chunks = partition(files_or_msgs, n)
+
     if backend == "process-resample" and horizon > 0.0:
         from multiprocessing import Pool
 
@@ -217,9 +228,13 @@ def run(
     n_workers = getattr(args, "ingest_workers", 1)
     backend = getattr(args, "ingest_backend", "process-resample")
     resample_hz = getattr(args, "freq", 100.0) or 100.0
+    t_ingest = time.time()
     b, t, total_bytes, t_flush, ext = ingest_app_bandwidth(
         files_or_msgs, args.mode[0], n_workers, backend, resample_hz
     )
+    # FTIO scalability: RESPONSE_MS grows with the I/O per window (LAMMPS 0.4 s at
+    # 4+1 to 2.9 s at 124+1) while DFT and friends stay < 50 ms; time the parts.
+    print(f"INGEST msgs={ranks} ingest_ms={(time.time() - t_ingest) * 1000:.3f}")
     data_rank["total_bytes"] = total_bytes
     data_rank["t_flush"] = t_flush
 
@@ -294,7 +309,9 @@ def run(
     display_prediction(args, prediction)
 
     analysis_figures.show()
+    t_join = time.time()
     process.join()
+    print(f"DUMP_WAIT samples={len(b)} wait_ms={(time.time() - t_join) * 1000:.3f}")
 
     return prediction, args, data_rank["t_flush"]
 

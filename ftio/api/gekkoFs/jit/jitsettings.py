@@ -11,6 +11,7 @@ For more information, see the LICENSE file in the project root:
 https://github.com/tuda-parallel/FTIO/blob/main/LICENSE
 """
 
+import hashlib
 import os
 import re
 import shutil
@@ -34,7 +35,11 @@ class JitSettings:
         self.app = ""
 
         # flushing strategies:
-        self.strategy = "flush"  # options are "flush", "job_end", and "buffer_size"
+        # GLASS_STRATEGY=job_end keeps metrics + FTIO but never flushes mid-run, which
+        # isolates the cost of the metrics messages from the cost of the flushes
+        self.strategy = os.getenv(
+            "GLASS_STRATEGY", "flush"
+        )  # flush, job_end, buffer_size
         self.job_time = 0  # time in seconds required for strategy "job_end"
         self.buffer_size = 0  # Size in bytes required for strategy "buffer_size"
         self.flush_call = "cp"  # decide if compress (tar) or copy (cp)
@@ -52,7 +57,20 @@ class JitSettings:
         # the node-local-disk path, on IOR at 9 and 19 nodes. --use_mem is
         # now a no-op (already False); kept for explicitness on the command
         # line rather than removed.
-        self.node_local = False
+        #
+        # 2026-09-23: --use_mem's own help text still says "GekkoFS uses
+        # nodelocal space (default) or memory (if this flag is passed)" --
+        # that stopped being true when the default below was flipped to
+        # False (memory) after 43710099, and setup_helper.py's handler
+        # (`if parsed_args.use_mem: settings.node_local = False`) is a
+        # no-op either way the flag is used. There is currently no CLI path
+        # back to node-local-disk mode (`/scratch/tmp` on BSC, real
+        # node-local SSD, not RAM) at all. JIT_NODE_LOCAL=1 restores it
+        # without touching --use_mem's now-misleading behavior or any other
+        # app's default -- e.g. for DLIO's large-checkpoint /dev/shm-fills-up
+        # problem (job 46323800, 2026-09-22), where the SSD path has real
+        # disk capacity instead of RAM-backed tmpfs.
+        self.node_local = os.getenv("JIT_NODE_LOCAL", "") not in ("", "0")
         self.env_var = {}
         self.log_speed = 0.1  # how fast to read the log
 
@@ -66,6 +84,26 @@ class JitSettings:
         self.cluster = False
         self.ignore_mtime = False
         self.parallel_move_threads = 32  # Can be slower if many files are moved
+        self.defer_delete = False  # --defer_delete: FTIO copies, keeps the source
+        # STAGE_OUT_KEEP=1: the final stage-out copies only, no delete (the burst
+        # buffer goes away with the job). STAGE_OUT_ALL_NODES=1: every app node
+        # copies a share of the files, STAGE_OUT_TASKS_PER_NODE tasks per node.
+        self.stage_out_keep = os.getenv("STAGE_OUT_KEEP", "0") == "1"
+        self.stage_out_all_nodes = os.getenv("STAGE_OUT_ALL_NODES", "0") == "1"
+        self.stage_out_tasks_per_node = int(os.getenv("STAGE_OUT_TASKS_PER_NODE", "4"))
+        # LAUNCH_WARMUP=1: an untimed srun with the app's node list and task layout
+        # before the app, so a slow first job step in the allocation is not timed.
+        self.launch_warmup = os.getenv("LAUNCH_WARMUP", "0") == "1"
+        # GLASS_FLUSH_BATCH=K: FTIO copies up to K files of one directory per cp
+        # call instead of one process per file (see posix_control._batches).
+        self.flush_batch = int(os.getenv("GLASS_FLUSH_BATCH", "0"))
+        # GLASS_FREQ_SCALE=s: the trigger uses s x FTIO's predicted frequency, a
+        # deliberately wrong prediction (0.5: period twice too long) for the
+        # misprediction study (SC26 R4). 1 leaves the prediction untouched.
+        self.freq_scale = float(os.getenv("GLASS_FREQ_SCALE", "1"))
+        # GLASS_EAGER_SIZE=1: also copy a checkpoint once it has the constant size of
+        # the earlier ones and stopped changing (stage_data.eager_size_loop).
+        self.eager_size = os.getenv("GLASS_EAGER_SIZE", "0") == "1"
         self.lock_generator = False
         self.lock_consumer = False
         self.handle_new_prediction = "cancel"
@@ -104,6 +142,9 @@ class JitSettings:
         self.app_err = ""
         self.app_start_file = ""
         self.flush_log = ""
+        self.ftio_state_dir = ""
+        # time.time() when the app returned; the GLASS stage-out timer starts here
+        self.app_end_time = 0.0
 
         # exclude flags
         ################
@@ -137,9 +178,29 @@ class JitSettings:
         # at all, while the merged result recovers it and lifts confidence past the
         # 0.5 flush threshold sooner (scratchpad/periodic_check.py).
         self.ftio_args = "-m write -v --freq 10 --ingest-workers 4 -au "
+        # Additive, opt-in escape hatch to append extra raw FTIO flags (e.g.
+        # "--transformation astft" or "-w adwin") without touching the base
+        # string above or the sbatch script's leg-dispatch logic -- unset
+        # (the default) leaves every existing run byte-for-byte unchanged.
+        extra_ftio_args = os.getenv("FTIO_EXTRA_ARGS", "")
+        if extra_ftio_args:
+            self.ftio_args += f" {extra_ftio_args}"
+        # Seconds between the GekkoFS client's metric pushes to FTIO. FTIO only
+        # sees new data at this cadence, so an app phase of a few seconds (S3D-IO
+        # at small N) ends before FTIO's first prediction. Default 5 = every run
+        # so far.
+        self.metrics_flush_interval = int(os.getenv("METRICS_FLUSH_INTERVAL", "5"))
+        # At a short interval the ranks' pushes leave no 1 s gap, so FTIO's
+        # receive loop never closes a batch until the app stops writing. Cap
+        # the batch at one interval -- only when the interval was set
+        # explicitly, so default runs keep the unbounded batch.
+        if os.getenv("METRICS_FLUSH_INTERVAL"):
+            self.ftio_args += f" --max-batch-window {self.metrics_flush_interval}"
         self.gkfs_daemon_protocol = (
             "ofi+verbs"  # "ofi+verbs" #"ofi+sockets"  or "ofi+verbs"
         )
+        # Extra gkfs_daemon flags, e.g. "--auto-sm" (intra-node IPC via shared memory)
+        self.gkfs_daemon_args = os.getenv("GKFS_DAEMON_ARGS", "")
         self.skip_confirm = False
         self.use_mpirun = False
         self.preload_via_export = (
@@ -216,6 +277,15 @@ class JitSettings:
             self.gkfs_intercept = self.gkfs_intercept.replace(
                 "_intercept.so", "_libc_intercept.so"
             )
+        # GKFS_SI_PRELOAD=<patched libsyscall_intercept.so.0>: the stock
+        # intercept_wrapper restores ymm0-7 with vmovups and no vzeroupper, so the
+        # upper YMM state stays dirty and every legacy-SSE instruction of the app
+        # takes an SSE/AVX mix assist (MILC compute 44 -> 74 s, BSC 48744154).
+        # The client's RPATH pins the stock library, so LD_LIBRARY_PATH does not
+        # help; preloading the patched one first makes the soname resolve to it.
+        si_preload = os.getenv("GKFS_SI_PRELOAD")
+        if si_preload and self.gkfs_use_syscall:
+            self.gkfs_intercept = f"{si_preload}:{self.gkfs_intercept}"
 
     def update_app_nodes(self):
         def _substitute(call: str) -> str:
@@ -255,7 +325,13 @@ class JitSettings:
 
     def update_geko_files(self):
         if not self.exclude_daemon:
-            self.gkfs_hostfile = self.gkfs_hostfile.replace(".txt", f"_{self.job_id}.txt")
+            # next to mpi_hostfile in the job dir, not in $HOME: the daemons
+            # create <hostfile>.ready beside it, and a job killed at its limit
+            # never gets to clean that up
+            name = os.path.basename(self.gkfs_hostfile).replace(
+                ".txt", f"_{self.job_id}.txt"
+            )
+            self.gkfs_hostfile = os.path.join(self.dir or self.home, name)
         if not self.exclude_proxy:
             self.gkfs_proxyfile = self.gkfs_proxyfile.replace(
                 ".pid", f"_{self.job_id}.pid"
@@ -346,8 +422,15 @@ class JitSettings:
         self.ftio_err = os.path.join(self.log_dir, "ftio.err")
         self.app_log = os.path.join(self.log_dir, "app.log")
         self.app_err = os.path.join(self.log_dir, "app.err")
-        self.app_start_file = os.path.join(self.log_dir, "app_start.flag")
-        self.flush_log = os.path.join(self.log_dir, "flush.log")
+        # FTIO's run-time files (app start flag, flush log with its registries and
+        # locks, bandwidth.json) stay on the node-local /dev/shm of the jit node, where
+        # FTIO runs too. In the log dir on GPFS, flock and file creation waited up to
+        # 82 s while the app ran (LAMMPS 2+1, BSC 48864899), which stalled the flush
+        # workers and the predictions. save_ftio_state copies them to the log dir.
+        tag = hashlib.md5(self.log_dir.encode()).hexdigest()[:12]
+        self.ftio_state_dir = f"/dev/shm/{os.getenv('USER', 'jit')}_ftio_state_{tag}"
+        self.app_start_file = os.path.join(self.ftio_state_dir, "app_start.flag")
+        self.flush_log = os.path.join(self.ftio_state_dir, "flush.log")
 
     def to_dict(self):  # -> dict[str, Any]:
         # Define a list of attribute names to be promoted to top-level keys
@@ -468,11 +551,113 @@ class JitSettings:
             self.app_call = "./HACC_ASYNC_IO"
             # installed in $HOME, but run from scratch -- see prepare_run_dir
             self.run_dir = self.prepare_run_dir(f"{self.home}/HACC-IO", ["HACC_ASYNC_IO"])
-            self.app_flags = "1000000 test_run/mpi"
+            # 38 B per particle -> 1 M particles = 38 MB per rank and checkpoint.
+            self.app_flags = f"{os.getenv('HACC_PARTICLES', '1000000')} test_run/mpi"
+        #  ├─ E3SM-IO
+        elif "e3sm" in self.app:
+            # E3SM's history output through PnetCDF, replayed from a production
+            # decomposition map (F case = atmosphere, 512 procs). Per file: -r
+            # records, each after -t s of emulated compute. E3SM_FILES (read by
+            # our patched e3sm_io) rotates the output into e3sm.<k>_h{0,1}.nc,
+            # one file pair per checkpoint, so GLASS can flush finished files.
+            # E3SM_STRATEGY=blob packs each rank's data into one contiguous block
+            # in a per-node subfile <file>.<NNNN>; canonical issues ~54 M tiny
+            # noncontiguous requests per F-case file. E3SM_SCALE multiplies the
+            # data volume (-e: last dimension times n).
+            self.app_call = "./e3sm_io"
+            self.run_dir = self.prepare_run_dir(f"{self.home}/E3SM-IO/src", ["e3sm_io"])
+            e3sm_map = os.getenv(
+                "E3SM_MAP", f"{self.home}/E3SM-IO/datasets/f_case_48602x72_512p.nc"
+            )
+            self.app_flags = (
+                f"-k -y 1 -r {os.getenv('E3SM_RECS', '1')} "
+                f"-x {os.getenv('E3SM_STRATEGY', 'canonical')} "
+                f"-e {os.getenv('E3SM_SCALE', '1')} "
+                f"-t {os.getenv('E3SM_COMPUTE_S', '30')} -o test_run/e3sm.nc {e3sm_map}"
+            )
         # ├─ NEK5000 --> change gkfs_daemon_protocol to socket
         elif "nek" in self.app:
-            self.app_call = "./nek5000"
-            self.run_dir = "/home/tarrafah/nhr-gekko/shared/run_gkfs_marc"
+            # turbChannel from NekExamples, scaled to a 32^3 box with genbox
+            # (32768 elements, lx1=8, lpmin=112 -> at least 2 nodes at 56/node).
+            # Every dump is one chan0.f<N> written by all ranks through MPI-IO,
+            # the N->1 pattern of the GekkoFS paper's Nek5000 run (3.8x). The
+            # mesh and par are read from the session dir, which on the GekkoFS
+            # legs is the mount, so both are staged in from run_dir/input.
+            self.nek_case = "chan"
+            # NEK_DIR=chan64: the same case on a 64^3 box (lpmin=896, >= 16+1).
+            nek_dir = f"{self.home}/nek/{os.getenv('NEK_DIR', self.nek_case)}"
+            self.run_dir = self.prepare_run_dir(nek_dir, ["nek5000"])
+            self.app_call = f"{self.run_dir}/nek5000"
+            self.app_flags = ""
+            self.prepare_nek_input(
+                nek_dir,
+                int(os.getenv("NEK_STEPS", "100")),
+                int(os.getenv("NEK_EVERY", "10")),
+            )
+        #  ├─ NAS BT-IO
+        elif "btio" in self.app:
+            # NPB 3.4.3 BT with SUBTYPE=simple: every rank writes its cells of
+            # the solution with independent MPI_File_write_at, the 18x case of
+            # the GekkoFS paper. Our simple_mpiio.f90 puts each dump in its own
+            # file, <BTIO_DIR>/btio.simple.out.<n>, so a finished dump can be
+            # flushed; the run reads all of them back to verify the solution.
+            btio_class = os.getenv("BTIO_CLASS", "D")
+            binary = f"bt.{btio_class}.x.mpi_io_simple"
+            self.run_dir = self.prepare_run_dir(f"{self.home}/NPB3.4-MPI/bin", [binary])
+            outdir = self.gkfs_mntdir if not self.exclude_daemon else self.run_dir
+            self.app_call = f"env BTIO_DIR={outdir} {self.run_dir}/{binary}"
+            self.app_flags = ""
+            self.prepare_btio_input(
+                btio_class,
+                int(os.getenv("BTIO_STEPS", "0")),
+                int(os.getenv("BTIO_EVERY", "5")),
+            )
+        #  ├─ VPIC-IO (h5bench_write, particle dumps of the VPIC plasma code)
+        elif "vpic" in self.app:
+            # h5bench's VPIC-IO kernel: every rank writes VPIC_PARTICLES particles
+            # (8 float variables, 32 B each) per dump, VPIC_STEPS dumps with
+            # VPIC_COMPUTE_S seconds of emulated compute between them. Stock
+            # h5bench puts all dumps in one file; our patch (H5BENCH_FILE_PER_TS=1)
+            # writes dump i to <outdir>/vpic.h5.<i>, one file per dump as VPIC does.
+            self.run_dir = self.prepare_run_dir(
+                f"{self.home}/h5bench/build", ["h5bench_write"]
+            )
+            outdir = self.gkfs_mntdir if not self.exclude_daemon else self.run_dir
+            self.app_call = f"env H5BENCH_FILE_PER_TS=1 {self.run_dir}/h5bench_write"
+            self.app_flags = f"{self.run_dir}/vpic.cfg {outdir}/vpic.h5"
+            self.prepare_vpic_input(
+                os.getenv("VPIC_PARTICLES", "1M"),
+                int(os.getenv("VPIC_STEPS", "20")),
+                int(os.getenv("VPIC_COMPUTE_S", "15")),
+            )
+        #  ├─ MILC (lattice QCD, pure gauge su3_ora)
+        elif "milc" in self.app:
+            # MILC_SAVES parameter sets, each MILC_TRAJ trajectories and then a
+            # save_parallel of the gauge field: every rank seeks and writes its
+            # sites into one shared file <outdir>/cfg.<k> (+ a small .info).
+            # 288 B per site in single precision: MILC_L=64 -> 4.8 GB a config.
+            # MILC_NX overrides the x extent (96/124 nodes, see prepare_milc_input).
+            self.run_dir = self.prepare_run_dir(
+                f"{self.home}/milc_qcd/pure_gauge", ["su3_ora"]
+            )
+            outdir = self.gkfs_mntdir if not self.exclude_daemon else self.run_dir
+            self.app_call = f"{self.run_dir}/su3_ora"
+            self.app_flags = f"{self.run_dir}/milc.in"
+            self.prepare_milc_input(
+                outdir,
+                int(os.getenv("MILC_L", "64")),
+                int(os.getenv("MILC_SAVES", "10")),
+                int(os.getenv("MILC_TRAJ", "20")),
+                int(os.getenv("MILC_NX", "0")),
+                skip_last=os.getenv("SKIP_LAST_CKPT", "0") == "1",
+            )
+        #  ├─ NAS kernels without I/O (CG, MG): overhead controls
+        elif "npb" in self.app:
+            # No checkpoints at all, so FTIO sees nothing and GLASS must cost
+            # nothing: any GLASS-vs-PFS gap here is pure harness overhead.
+            binary = f"{os.getenv('NPB_KERNEL', 'mg')}.{os.getenv('NPB_CLASS', 'D')}.x"
+            self.run_dir = self.prepare_run_dir(f"{self.home}/NPB3.4-MPI/bin", [binary])
+            self.app_call = f"{self.run_dir}/{binary}"
             self.app_flags = ""
         #  ├─ Wacom++ --> change wacom.json if needed
         elif "wacom" in self.app:
@@ -519,22 +704,57 @@ class JitSettings:
             # structural fix. Tracked as the second LAMMPS config variant.
             lammps_mp = os.getenv("LAMMPS_MP", "0")
             lammps_nf = os.getenv("LAMMPS_NF", str(self.nodes - 1))
-            self.app_flags = self.resolve_app_flags(
-                f"-in {self.run_dir}/in.ckpt -v ckptdir {ckptdir} "
-                f"-v x {n} -v y {n} -v z {n} "
-                f"-v mp {lammps_mp} -v nf {lammps_nf} "
-                # 54 phases: nsteps = phases*every + tail = 818 = ~100 s at 8 compute
-                # nodes (0.12 s/step measured in 43420026). Per-rank work is fixed
-                # by the weak scaling, so wall time stays flat as nodes grow, but
-                # the restart does not: drop phases for very large node counts or
-                # the sweep will outrun stage-out (a past run hit 6.9 TB).
-                # LAMMPS_EVERY/LAMMPS_PHASES let a single submission probe further
-                # without moving the default every concurrently-queued job reads.
-                f"-v every {os.getenv('LAMMPS_EVERY', '8')} "
-                f"-v nb {os.getenv('LAMMPS_EVERY', '8')} "
-                f"-v phases {os.getenv('LAMMPS_PHASES', '30')} -v tail 8",
-                ckptdir,
-            )
+            # LAMMPS_IRREGULAR=1: R4 rebuttal ("never evaluates sensitivity to
+            # irregular workloads") -- swaps the fixed-period deck for
+            # in.ckpt_irregular, which draws each checkpoint gap uniformly from
+            # [lo, hi] instead of a constant 'every'. Separate deck, not a flag
+            # on in.ckpt, because LAMMPS's `restart N` command only supports a
+            # fixed integer period -- the irregular timing needs a loop of
+            # run/write_restart pairs instead. LAMMPS_LO/LAMMPS_HI default to a
+            # mean of 8 to match LAMMPS_EVERY's default, so total steps/volume
+            # stay comparable to the periodic baseline and only the timing
+            # differs. Built 2026-09-24, NOT YET smoke-tested on BSC -- do not
+            # promote to a full sweep before a short single-node dry run confirms
+            # the deck parses and the flush regex still matches its filenames
+            # (same `ckpt.restart.*` convention as in.ckpt, so it should, but
+            # unverified).
+            if os.getenv("LAMMPS_IRREGULAR", "") not in ("", "0"):
+                self.app_flags = self.resolve_app_flags(
+                    f"-in {self.run_dir}/in.ckpt_irregular -v ckptdir {ckptdir} "
+                    f"-v x {n} -v y {n} -v z {n} "
+                    f"-v mp {lammps_mp} -v nf {lammps_nf} "
+                    f"-v lo {os.getenv('LAMMPS_LO', '3')} "
+                    f"-v hi {os.getenv('LAMMPS_HI', '13')} "
+                    f"-v nb {os.getenv('LAMMPS_NB', '4')} "
+                    f"-v seed {os.getenv('LAMMPS_SEED', '12345')} "
+                    f"-v phases {os.getenv('LAMMPS_PHASES', '60')} -v tail 8",
+                    ckptdir,
+                )
+            else:
+                self.app_flags = self.resolve_app_flags(
+                    f"-in {self.run_dir}/in.ckpt -v ckptdir {ckptdir} "
+                    f"-v x {n} -v y {n} -v z {n} "
+                    f"-v mp {lammps_mp} -v nf {lammps_nf} "
+                    # 60 phases: nsteps = phases*every + tail = 488 = ~60 s at 8
+                    # compute nodes. Raised 30 -> 60 (2026-09-09, sweep
+                    # 45532561-69): at 30 the app finished in ~30-45 s and glass
+                    # lost pfs by 0.72-0.88x across 8-33+1; doubling the run
+                    # closed that (glass now wins pfs from 16+1 up, beats gekko
+                    # at every N). Per-rank work is fixed by the weak scaling so
+                    # wall time stays flat as nodes grow, but the restart does
+                    # not: drop phases for very large node counts or the sweep
+                    # will outrun stage-out (a past run hit 6.9 TB).
+                    # LAMMPS_EVERY/LAMMPS_PHASES let a single submission probe
+                    # further without moving the default.
+                    # LAMMPS_NB: neighbor-rebuild cadence, an exact divisor of
+                    # 'every' (in.ckpt). Defaults to 'every'; a long 'every'
+                    # (120, job 48138435) needs a short nb or atoms move too far
+                    # between rebuilds ("ERROR: Lost atoms").
+                    f"-v every {os.getenv('LAMMPS_EVERY', '8')} "
+                    f"-v nb {os.getenv('LAMMPS_NB', os.getenv('LAMMPS_EVERY', '8'))} "
+                    f"-v phases {os.getenv('LAMMPS_PHASES', '60')} -v tail 8",
+                    ckptdir,
+                )
         #  ├─ DLIO
         elif "dlio" in self.app:
             self.app_call = "dlio_benchmark"
@@ -630,12 +850,35 @@ class JitSettings:
             # has been redone under it (see [[one-scaling-rule-per-app]]).
             if os.getenv("WRF_WEAK_SCALE_GRID") == "1":
                 ranks = (self.nodes - 1) * self.procs_app
-                e_we, e_sn, dx, dy, dt = self.weak_scale_wrf_grid(ranks)
+                e_we, e_sn, dx, dy, dt, nproc_x, nproc_y = self.weak_scale_wrf_grid(ranks)
+                # nproc_x/nproc_y must NOT be in the namelist yet when ideal.exe
+                # runs below: ideal.exe is invoked directly (no srun -n), i.e. as
+                # a single serial task, so it needs WRF's default auto
+                # decomposition (-1/-1, which resolves to 1x1 for a 1-task run).
+                # Writing the explicit ranks-sized nproc_x*nproc_y here made
+                # ideal.exe abort ("check comm_start, nest_pes_x, nest_pes_y ...")
+                # because 12*8=96 != the 1 actual MPI task it was launched with
+                # (jobs 45787185/45787186, 2026-09-12). The explicit decomposition
+                # is still needed for wrf.exe's real parallel launch afterward
+                # (see weak_scale_wrf_grid for why auto breaks at >64 ranks) --
+                # inserted via sed in pre_app_call below, after ideal.exe exits,
+                # so it only reaches the namelist wrf.exe reads.
                 self.set_wrf_domain(e_we, e_sn, dx, dy, dt)
                 # Regenerate wrfinput_d01 for the new domain (ideal.exe reads
                 # input_jet, hence its place in the copy list above).
+                # ideal.exe SIGABRTs (returncode -11) on the generated namelist
+                # above ~232x458 and teardown wipes run_dir before it can be
+                # inspected -- copy the namelist + any rsl.error.* out to $HOME
+                # first so the crash can be diagnosed offline.
+                keep = f"{self.home}/wrf_weakgrid_{self.job_id}"
                 self.pre_app_call = (
-                    f"cd {self.run_dir} && ulimit -s unlimited && ./ideal.exe"
+                    f"cd {self.run_dir} && mkdir -p {keep} && "
+                    f"cp namelist.input {keep}/ && ulimit -s unlimited && "
+                    f"(./ideal.exe; rc=$?; cp -f rsl.* {keep}/ 2>/dev/null; "
+                    f"[ $rc -eq 0 ] && "
+                    f'sed -i "/e_sn/a nproc_x                             = {nproc_x}," namelist.input && '
+                    f'sed -i "/nproc_x/a nproc_y                             = {nproc_y}," namelist.input; '
+                    f"exit $rc)"
                 )
         #  ├─ Castro (AMReX)
         elif "castro" in self.app:
@@ -663,10 +906,20 @@ class JitSettings:
             # weakens gekko < pfs. Leave unset to keep AMReX's default.
             nfiles = os.getenv("CASTRO_CHECKPOINT_NFILES", "")
             nfiles_flag = f"amr.checkpoint_nfiles={nfiles} " if nfiles else ""
+            # CASTRO_ASYNC_OUT=1: AMReX writes each checkpoint straight into its
+            # final chk dir instead of <chk>.temp + rename. GekkoFS loses a dir's
+            # children on rename, so without this every flush finds nothing to
+            # copy (11-01 runs: "lost its children to a rename"). nfiles >= ranks
+            # keeps one file per rank, so no MPI_THREAD_MULTIPLE is needed.
+            async_flag = (
+                "amrex.async_out=1 amrex.async_out_nfiles=1000000 "
+                if os.getenv("CASTRO_ASYNC_OUT") == "1"
+                else ""
+            )
             self.app_flags = self.resolve_app_flags(
                 f"inputs.3d.sph max_step=1440 amr.check_int=24 amr.plot_int=-1 "
                 f"amr.max_level=0 castro.fixed_dt=4e-6 castro.init_shrink=1.0 "
-                f"{nfiles_flag}"
+                f"{nfiles_flag}{async_flag}"
                 f"amr.check_file={ckptdir}/sedov_3d_sph_chk amr.n_cell = 160 160 160",
                 ckptdir,
             )
@@ -674,6 +927,14 @@ class JitSettings:
         elif "warpx" in self.app:
             # AMReX checkpoint directories (chk<step>/...) into the mount,
             # write-only. Size = n_cell (weak-scaled), period = intervals.
+            # Force FUSE: the syscall interceptor's flat namespace can't walk
+            # AMReX's nested chk<step>/Level_0/ tree with `cp -r` (job 45077746
+            # staged 0 bytes, hung to the wall) and the gekko leg died on a UCX
+            # ibv_reg_mr failure under the seccomp hooks. FUSE's real POSIX
+            # namespace fixes both (45153231 / 45244939). Set WARPX_NO_FUSE=1 to
+            # opt back out for a syscall comparison.
+            if os.getenv("WARPX_NO_FUSE", "") in ("", "0"):
+                self.fuse = True
             self.app_call = f"{self.home}/WarpX/build/bin/warpx.3d"
             self.run_dir = self.prepare_run_dir(f"{self.home}/WarpX/glass", ["inputs"])
             ckptdir = self.gkfs_mntdir if not self.exclude_daemon else self.run_dir
@@ -686,23 +947,76 @@ class JitSettings:
             # confirmed full win (44696014) -- anchor every node count to it instead
             # of hand-picking a size per node count.
             cells_per_rank = int(os.getenv("WARPX_CELLS_PER_RANK", "64000"))
-            n_cell = self.weak_scale_cells(
-                (self.nodes - 1) * self.procs_app, cells_per_rank
-            )
+            ranks = (self.nodes - 1) * self.procs_app
+            n_cell = self.weak_scale_cells(ranks, cells_per_rank)
             # WARPX_INTERVALS=800 -> ~5 checkpoints over max_step=3200, ~24 s
             # apart at 9N. The old value (50 -> a checkpoint every ~1.5 s) was
             # calibrated while the checkpoint was a silent no-op (chk never
             # registered); once it actually wrote, the flush fell behind and
             # the run aborted (job 45134159). Checkpoint period must exceed the
             # flush drain time -- same rule as DLIO_COMPUTE_TIME.
-            intervals = int(os.getenv("WARPX_INTERVALS", "800"))
+            #
+            # A fixed 800 stopped being enough at 124+1 (2026-09-14, job
+            # 45852469): n_cell weak-scales (bigger checkpoint at higher N),
+            # so copy time grows with node count while the wall-clock gap
+            # between checkpoints (intervals steps x time/step) did not. At
+            # 96+1 (job 45852468, 768 ranks) the last checkpoint's copy
+            # (25.9s) still just barely finished inside the ~24.5s gap
+            # (app_time/4) -- the last point where intervals=800 holds. At
+            # 124+1 (992 ranks) copy time grew to 39.3s against a ~26.9s gap,
+            # missing it -- the last 2 of 5 checkpoints fell through into the
+            # end-of-run catch-up drain instead of an incremental flush
+            # (stage_out jumped 0.47s -> 45.7s, and glass lost to both gekko
+            # and pfs for the first time in this app's sweep). Scale the gap
+            # for N beyond that point only, so the already-validated 8+1-96+1
+            # range (intervals=800 there) is untouched: linear in ranks (copy
+            # time should track total checkpoint bytes, which weak-scale
+            # linearly with ranks by construction -- n_cell is the cube root),
+            # plus a 1.3x safety margin because the observed 96+1->124+1 copy
+            # time growth (1.52x) already ran ahead of the raw rank ratio
+            # (1.29x), so a same-ratio scale-up alone would likely still miss.
+            # NOT re-verified below 124+1 under this formula -- promoting the
+            # weak-grid-style "one setting across the sweep" rule to table 1
+            # needs a fresh check at every node count, not just the one that
+            # was broken.
+            base_ranks_for_intervals = (
+                768  # ranks at 96+1, the last point intervals=800 held
+            )
+            safety_margin = 1.3
+            default_intervals = (
+                800
+                if ranks <= base_ranks_for_intervals
+                else round(800 * safety_margin * ranks / base_ranks_for_intervals)
+            )
+            intervals = int(os.getenv("WARPX_INTERVALS", str(default_intervals)))
             max_step = int(os.getenv("WARPX_MAX_STEP", "3200"))
             # Declare the checkpoint diagnostic in the deck (command-line
             # quoting mangles it) and drop the stock diag1 plotfile so the
             # checkpoint is the only I/O.
             self.set_warpx_checkpoint(ckptdir, intervals)
+            # Gate A lever, untested until now (2026-09-25): the opposite
+            # direction from the old "raise checkpoint_nfiles to split into
+            # many units" plan (that was Gate-B reasoning -- more/smaller
+            # flush units -- and conflicts with the already-tested "WarpX 32
+            # checkpoints vs 5 -> worse" Gate-A result; also the flush regex
+            # matches the whole chk<step> directory as one unit regardless of
+            # internal file count, so it wouldn't even change flush
+            # granularity). Gate A needs genuine Lustre write CONTENTION, and
+            # WRF's single-shared-file restart (confirmed via flush.log) still
+            # fails Gate A despite looking collective -- likely because it
+            # funnels through a gather-then-serial-write pattern, not true
+            # concurrent multi-rank MPI-IO. AMReX's VisMF, when nfiles is LOW
+            # relative to rank count, funnels many ranks' data through few
+            # actual files via genuine collective MPI-IO coordination (unlike
+            # WRF's classic-netCDF gather). Setting nfiles=1 forces maximum
+            # collective contention -- the closest analog to QMC's winning
+            # topology this session has found for WarpX. WARPX_CHECKPOINT_NFILES
+            # unset = AMReX's own default (no behavior change).
+            nfiles = os.getenv("WARPX_CHECKPOINT_NFILES", "")
+            nfiles_flag = f"amr.checkpoint_nfiles={nfiles} " if nfiles else ""
             self.app_flags = self.resolve_app_flags(
                 f"inputs max_step={max_step} "
+                f"{nfiles_flag}"
                 f"chk.file_prefix={ckptdir}/chk amr.n_cell = "
                 f"{n_cell} {n_cell} {n_cell}",
                 ckptdir,
@@ -730,14 +1044,38 @@ class JitSettings:
             self.cpus_per_task_app = 2
             # glass.xml's <walkers> is PER RANK. Node memory for the walker
             # buffers is per_rank * omp_threads * 73808 B * ranks_per_node, so at
-            # PROCS=8 / 2 threads the safe ceiling is ~32k walkers/rank. Pin the
-            # aggregate instead (QMC_TOTAL_WALKERS, default 2M = ~4x the historical
-            # baseline, well under the ~7M that ran clean at 16+1): the per-section
-            # config.h5 checkpoint -- what GLASS's incremental flush has to beat
-            # gekko's end drain on -- stays a fixed large size at every node count,
-            # and bumping the env var is the golden-goal lever for a wider margin.
+            # PROCS=8 / 2 threads the safe ceiling is ~32k walkers/rank (enforced
+            # inside set_qmc_walkers via per_rank_cap). Pin the aggregate instead
+            # (QMC_TOTAL_WALKERS): the per-section config.h5 checkpoint -- what
+            # GLASS's incremental flush has to beat gekko's end drain on -- stays
+            # a fixed large size at every node count.
+            #
+            # 2026-09-25/28: promoted default 2M -> 8M after a full 8-point sweep
+            # at each candidate. 8M: 7 wins / 1 loss (124+1 loses to gekko by a
+            # hair, still crushes pfs 7.1x). 16M: 5 wins / 3 losses -- tested and
+            # NOT adopted, worse win-rate. 8M costs ~20-25% more wall-clock than
+            # the old 2M-era canonical row at every N from 8+1 up (e.g. 124+1:
+            # 386.3s vs 324.9s) but wins more consistently and by a much wider
+            # pfs margin -- Ahmad confirmed the tradeoff is worth it. Old default
+            # (2M) still available via QMC_TOTAL_WALKERS=2000000 if ever needed.
             ranks = (self.nodes - 1) * self.procs_app
-            self.set_qmc_walkers(int(os.getenv("QMC_TOTAL_WALKERS", "2000000")), ranks)
+            self.set_qmc_walkers(int(os.getenv("QMC_TOTAL_WALKERS", "8000000")), ranks)
+            # QMC_STEPS: compute per <qmc> section, i.e. the gap between two
+            # config.h5 checkpoints. At the deck's steps=1 the gap is only
+            # 0.44-0.77x the flush time (2026-10-27 workload-fit table), so FTIO
+            # has no idle window to flush in. More steps lengthen the gap
+            # without changing the checkpoint size. Unset keeps the deck as is.
+            if os.getenv("QMC_STEPS"):
+                self.set_qmc_steps(int(os.environ["QMC_STEPS"]))
+            # QMC_SECTIONS: number of <qmc> sections = resident config.h5 files.
+            # At 30 the gekko end drain is one 32-thread wave (11-22 s at every
+            # N, 2026-10-28), too little for GLASS to hide. Unset keeps the deck.
+            if os.getenv("QMC_SECTIONS"):
+                self.set_qmc_sections(int(os.environ["QMC_SECTIONS"]))
+            # SKIP_LAST_CKPT=1: the last section writes no config.h5. The app ends
+            # right after it, so no compute phase is left to flush it in.
+            if os.getenv("SKIP_LAST_CKPT", "0") == "1":
+                self.skip_last_qmc_checkpoint()
         else:
             self.app_call = ""
             self.run_dir = ""
@@ -763,6 +1101,22 @@ class JitSettings:
             # _checkpoint() raises if fewer checkpoints exist than it wants to
             # read back, and driver apps must only ever write.
             no_read = "++workload.checkpoint.num_checkpoints_read=0 " if ckpt_only else ""
+            # Checkpoint-only mode never auto-derives num_checkpoints_write:
+            # config.py defaults it to -1 and _checkpoint_write() runs only when
+            # it is > 0 (main.py:262), so the compute->checkpoint square wave
+            # happens only if we pass it. The llama_* workloads ship 10;
+            # resnet50_my_a100_pytorch ships nothing, so job 45534106 wrote ~3
+            # checkpoints and FTIO locked no period (P(periodic)=0, glass silently
+            # ran as gekko-mode). DLIO_NUM_CHECKPOINTS sets it -- default 20 in
+            # ckpt-only mode gives FTIO plenty of cycles to lock on; pair it with
+            # DLIO_COMPUTE_TIME (below, defaulted to 50 s here) so each checkpoint
+            # fully drains before the next lands.
+            n_ckpt = os.getenv("DLIO_NUM_CHECKPOINTS", "20" if ckpt_only else "")
+            n_ckpt_flag = (
+                f"++workload.checkpoint.num_checkpoints_write={n_ckpt} "
+                if n_ckpt not in ("", "0")
+                else ""
+            )
             # Length of the compute phase between checkpoints, in seconds --
             # _checkpoint_write() passes it straight to framework.compute()
             # (main.py). GLASS can only hide stage-out behind compute if the gap
@@ -772,7 +1126,7 @@ class JitSettings:
             # lands, so it degenerates into a post-app stage-out and the flush
             # only steals daemon bandwidth from the app. Leave unset to keep the
             # workload's own value.
-            compute_time = os.getenv("DLIO_COMPUTE_TIME", "")
+            compute_time = os.getenv("DLIO_COMPUTE_TIME", "50" if ckpt_only else "")
             gap = (
                 f"++workload.checkpoint.time_between_checkpoints={compute_time} "
                 if compute_time
@@ -794,6 +1148,26 @@ class JitSettings:
             scale = (
                 f"++workload.model.transformer.hidden_size={hidden} "
                 f"++workload.model.transformer.ffn_hidden_size={ffn_hidden} "
+            )
+            # Gate A lever, untested until now: read base_checkpointing.py
+            # directly (2026-09-24). At zero_stage=0, save_checkpoint()'s gate
+            # (`rank_to_checkpoint == my_rank`) makes rank_to_checkpoint 0 for
+            # every non-model-parallel rank -- so with model_parallelism=1
+            # (our default), ONLY RANK 0 EVER WRITES, model state AND
+            # optimizer state both. A true single-writer/N->1 checkpoint, not
+            # a smaller shard count -- structurally different from
+            # zero_stage=1 (optimizer state sharded across data-parallel
+            # ranks, confirmed via flush.log job 43408430:
+            # model_states-N.pb-1_temp per rank) and zero_stage=3 (already
+            # tested, no effect on Gate A, job 46435305). Neither prior test
+            # ever tried genuine single-writer topology. DLIO_ZERO_STAGE
+            # overrides it; unset keeps the workload yaml's own value (no
+            # behavior change by default).
+            zero_stage_override = os.getenv("DLIO_ZERO_STAGE", "")
+            zero_stage_flag = (
+                f"++workload.parallelism.zero_stage={zero_stage_override} "
+                if zero_stage_override
+                else ""
             )
             # resnet50_v100_new_small.yaml's num_files_train=25 is the same
             # flat-constant-regardless-of-node-count problem the hidden_size
@@ -818,8 +1192,10 @@ class JitSettings:
                     f"++workload.workflow.train={train} "
                     f"++workload.workflow.checkpoint=True "
                     f"{no_read}"
+                    f"{n_ckpt_flag}"
                     f"{gap}"
                     f"{scale}"
+                    f"{zero_stage_flag}"
                     f"{files_scale}"
                     f"++workload.dataset.data_folder={self.run_dir}/data "
                     f"++workload.checkpoint.checkpoint_folder={self.run_dir}/checkpoints "
@@ -851,8 +1227,10 @@ class JitSettings:
                     f"++workload.workflow.train={train} "
                     f"++workload.workflow.checkpoint=True "
                     f"{no_read}"
+                    f"{n_ckpt_flag}"
                     f"{gap}"
                     f"{scale}"
+                    f"{zero_stage_flag}"
                     f"{files_scale}"
                     f"++workload.dataset.data_folder={self.gkfs_mntdir}/data "
                     f"++workload.checkpoint.checkpoint_folder={self.gkfs_mntdir}/checkpoints "
@@ -895,11 +1273,14 @@ class JitSettings:
                 self.post_app_call = ""
         # ├─ Nek5000
         elif "nek" in self.app:
+            # Nek reads <case>.re2/.par from, and writes <case>0.f<N> to, the
+            # directory on SESSION.NAME's second line (its trailing / matters).
+            case = getattr(self, "nek_case", "turbPipe")
             if self.exclude_daemon:
-                self.pre_app_call = f"echo -e 'turbPipe\\n{self.run_dir}/input' > {self.run_dir}/SESSION.NAME"
+                self.pre_app_call = f"echo -e '{case}\\n{self.run_dir}/input/' > {self.run_dir}/SESSION.NAME"
                 self.post_app_call = f"rm {self.run_dir}/input/*.f* || echo true"
             else:
-                self.pre_app_call = f"echo -e 'turbPipe\\n{self.gkfs_mntdir}' > {self.run_dir}/SESSION.NAME"
+                self.pre_app_call = f"echo -e '{case}\\n{self.gkfs_mntdir}/' > {self.run_dir}/SESSION.NAME"
                 self.post_app_call = ""
         # ├─ Wacom++
         elif "wacom" in self.app:
@@ -941,6 +1322,14 @@ class JitSettings:
                 # prepare_run_dir only copies the binary; the output subdir
                 # (test_run/mpi, relative to run_dir) needs creating on scratch.
                 self.pre_app_call = f"mkdir -p {self.run_dir}/test_run/mpi"
+        #  ├─ E3SM-IO
+        elif "e3sm" in self.app:
+            self.post_app_call = ""
+            if not self.exclude_daemon:
+                self.pre_app_call = ""
+                self.app_flags = self.app_flags.replace("test_run", f"{self.gkfs_mntdir}")
+            else:
+                self.pre_app_call = f"mkdir -p {self.run_dir}/test_run"
         # ├─ wrf
         elif "wrf" in self.app:
             # Deliberately empty by default. The old body ran WRF *inside* the
@@ -1434,23 +1823,72 @@ class JitSettings:
         of running more ranks -- a real cost of weak-scaling this deck, not a
         bug to chase out.
 
+        e_sn is capped at MAX_E_SN (2026-09-11): WRF's stock em_b_wave idealized
+        case hardcodes a 64x80 jet-sounding lookup table (module_initialize_ideal.F,
+        `nz_jet=64, ny_jet=80`) and indexes its 2nd dimension directly by the
+        model's south-north grid index with no bounds check. Any e_sn > 80 reads
+        past the table; small overruns silently return garbage (wrong physics,
+        no crash), large ones (e.g. e_sn=648, the 32+1 point) walk far enough to
+        hit unmapped memory and SIGSEGV in calc_jet_sounding. Root-caused via gdb
+        (job 45731615) -- confirmed NOT a GekkoFS issue, ideal.exe never touches
+        the mount. Fixing the table itself would mean patching third-party WRF
+        Fortran source, which repo policy reserves for an explicit exception;
+        capping e_sn here instead keeps every WRF weak-grid run inside the
+        table's valid range. Since base_e_sn (324) already exceeds the cap, e_sn
+        is now effectively constant at MAX_E_SN across the whole sweep -- only
+        e_we still weak-scales. Historical data taken before this cap (any run
+        with e_sn > 80, which is every prior weak-grid point including the
+        base/16+1 "clean" ones) used an uncapped domain and should be treated as
+        a superseded config, not silently compared against post-cap runs.
+
         Args:
             ranks (int): Total application ranks (WRF runs PROCS=1, so nodes).
             base_ranks (int): Rank count the base_* values were calibrated at.
             base_e_we (int): e_we at base_ranks.
-            base_e_sn (int): e_sn at base_ranks.
+            base_e_sn (int): e_sn at base_ranks (pre-cap history; see above).
             base_dx (float): dx=dy (m) at base_ranks.
             base_dt (float): time_step (s) at base_ranks.
 
+        Also returns an explicit nproc_x/nproc_y MPI decomposition (2026-09-12):
+        with e_sn now capped at a constant 80 (see above) while e_we keeps
+        growing, WRF's own auto-decomposition (nproc_x=nproc_y=-1) starts
+        assigning more than 8 processes along the south-north axis once total
+        ranks exceeds ~64 -- e.g. a 96-rank job picks something like an 8x12
+        split, giving each rank only 80/12=6.7 south-north grid points. That's
+        below WRF's minimum per-patch size and wrf.exe is killed within ~2s of
+        starting (job 45780469, 96+1; 45780470, 124+1, both weak-grid,
+        2026-09-12 -- confirmed NOT a timeout, "real 1.7s" before the SLURM
+        step gets signal-killed, no rsl.error survives teardown to quote
+        directly, but the timing/pattern match a decomposition-triggered
+        MPI_Abort exactly, and this only appears once ranks exceeds the point
+        where auto-decomposition would need >8 south-north processes for a
+        fixed 80-wide domain). Fix: pick nproc_y as the largest divisor of
+        ranks that keeps e_sn/nproc_y >= MIN_PATCH, and nproc_x = ranks /
+        nproc_y -- e.g. 96 ranks -> nproc_y=8 (patch 10), nproc_x=12 (patch
+        47); 124 ranks -> nproc_y=4 (patch 20), nproc_x=31 (patch 21). Falls
+        back to nproc_y=1 (all-x decomposition) if no divisor fits, which is
+        always safe since e_we scales with ranks and e_sn does not.
+
         Returns:
-            tuple[int, int, float, float, float]: (e_we, e_sn, dx, dy, time_step).
+            tuple[int, int, float, float, float, int, int]: (e_we, e_sn, dx,
+                dy, time_step, nproc_x, nproc_y).
         """
-        factor = (max(1, ranks) / base_ranks) ** 0.5
+        MAX_E_SN = 80  # WRF em_b_wave jet-sounding table width (ny_jet), hard cap
+        MIN_PATCH = 10  # WRF's minimum MPI-patch size per horizontal dimension
+        eff_ranks = max(1, ranks)
+        factor = (eff_ranks / base_ranks) ** 0.5
         e_we = max(base_e_we, round(base_e_we * factor))
-        e_sn = max(base_e_sn, round(base_e_sn * factor))
+        e_sn = min(MAX_E_SN, max(base_e_sn, round(base_e_sn * factor)))
         dx = base_dx / factor
         dt = base_dt / factor
-        return e_we, e_sn, dx, dx, dt
+        max_nproc_y = max(1, e_sn // MIN_PATCH)
+        nproc_y = 1
+        for d in range(min(max_nproc_y, eff_ranks), 0, -1):
+            if eff_ranks % d == 0:
+                nproc_y = d
+                break
+        nproc_x = eff_ranks // nproc_y
+        return e_we, e_sn, dx, dx, dt, nproc_x, nproc_y
 
     def prepare_run_dir(self, deck_dir: str, files: list[str] | None = None) -> str:
         """Copy an app's deck to scratch and return that as the run directory.
@@ -1540,7 +1978,14 @@ class JitSettings:
             console.print(f"[yellow]Could not set rst_outname in {namelist}: {e}[/]")
 
     def set_wrf_domain(
-        self, e_we: int, e_sn: int, dx: float, dy: float, time_step: float
+        self,
+        e_we: int,
+        e_sn: int,
+        dx: float,
+        dy: float,
+        time_step: float,
+        nproc_x: int | None = None,
+        nproc_y: int | None = None,
     ) -> None:
         """Rewrite the &domains grid fields so ideal.exe regenerates a matching wrfinput_d01.
 
@@ -1549,12 +1994,23 @@ class JitSettings:
         in the domain size at ideal.exe-run time, so the namelist must be
         correct *before* the ideal.exe pre_app_call runs, not after.
 
+        nproc_x/nproc_y (2026-09-12) override WRF's default auto-decomposition
+        (-1/-1), which starts producing MPI patches narrower than WRF's
+        minimum once e_sn is capped at 80 and rank counts climb past ~64 --
+        see weak_scale_wrf_grid for why. em_b_wave_glass's namelist.input has
+        no existing nproc_x/nproc_y lines, so these are INSERTED (right after
+        e_sn) rather than replaced in place.
+
         Args:
             e_we (int): East-west grid points.
             e_sn (int): South-north grid points.
             dx (float): Grid spacing in x (m).
             dy (float): Grid spacing in y (m).
             time_step (float): Integration step (s).
+            nproc_x (int | None): Explicit east-west MPI decomposition, or
+                None to leave WRF's default (-1, auto) in place.
+            nproc_y (int | None): Explicit south-north MPI decomposition, or
+                None to leave WRF's default (-1, auto) in place.
         """
         namelist = os.path.join(self.run_dir, "namelist.input")
         dt = round(time_step)
@@ -1565,13 +2021,34 @@ class JitSettings:
             "dy": f" dy                                  = {round(dy)},",
             "time_step": f" time_step                           = {dt},",
         }
+        if nproc_x is not None:
+            replacements["nproc_x"] = f" nproc_x                             = {nproc_x},"
+        if nproc_y is not None:
+            replacements["nproc_y"] = f" nproc_y                             = {nproc_y},"
         try:
             with open(namelist) as f:
                 lines = f.read().splitlines()
             rewritten = []
+            seen = set()
             for line in lines:
                 key = line.lstrip().split(None, 1)[0] if line.strip() else ""
-                rewritten.append(replacements.get(key, line))
+                if key in replacements:
+                    seen.add(key)
+                    rewritten.append(replacements[key])
+                else:
+                    rewritten.append(line)
+            missing = [
+                k for k in ("nproc_x", "nproc_y") if k in replacements and k not in seen
+            ]
+            if missing:
+                insert_at = len(rewritten)
+                for i, line in enumerate(rewritten):
+                    if line.lstrip().split(None, 1)[:1] == ["e_sn"]:
+                        insert_at = i + 1
+                        break
+                for k in missing:
+                    rewritten.insert(insert_at, replacements[k])
+                    insert_at += 1
             if rewritten != lines:
                 with open(namelist, "w") as f:
                     f.write("\n".join(rewritten) + "\n")
@@ -1691,6 +2168,190 @@ class JitSettings:
         except OSError as e:
             console.print(f"[yellow]Could not set QMC walkers in {xml}: {e}[/]")
 
+    def set_qmc_steps(self, steps: int) -> None:
+        """Rewrite every <qmc> section's steps in glass.xml to ``steps``.
+
+        Each section writes one config.h5 at its end, so the steps set the
+        compute time between two checkpoints while the checkpoint size (set
+        by the walkers) stays the same.
+
+        Args:
+            steps (int): VMC steps per block in every section.
+        """
+        xml = os.path.join(self.run_dir, "glass.xml")
+        try:
+            with open(xml) as f:
+                text = f.read()
+            rewritten = re.sub(
+                r'(<parameter name="steps"\s*>\s*)\d+(\s*</parameter>)',
+                rf"\g<1>{max(1, steps)}\g<2>",
+                text,
+            )
+            if rewritten != text:
+                with open(xml, "w") as f:
+                    f.write(rewritten)
+        except OSError as e:
+            console.print(f"[yellow]Could not set QMC steps in {xml}: {e}[/]")
+
+    def set_qmc_sections(self, sections: int) -> None:
+        """Resize glass.xml to ``sections`` <qmc> sections.
+
+        Each section writes its own config.h5, so the section count is the
+        number of checkpoint files left on GekkoFS at the end. The first
+        section (the one with the warm-up) is kept; the second is the template
+        for every further one.
+
+        Args:
+            sections (int): Total number of <qmc> sections (at least 2).
+        """
+        xml = os.path.join(self.run_dir, "glass.xml")
+        try:
+            with open(xml) as f:
+                text = f.read()
+            found = list(re.finditer(r"[ \t]*<qmc\b.*?</qmc>\n?", text, re.S))
+            if len(found) < 2:
+                console.print(f"[yellow]Need >= 2 <qmc> sections in {xml}[/]")
+                return
+            body = found[0].group(0) + found[1].group(0) * (max(2, sections) - 1)
+            rewritten = text[: found[0].start()] + body + text[found[-1].end() :]
+            if rewritten != text:
+                with open(xml, "w") as f:
+                    f.write(rewritten)
+        except OSError as e:
+            console.print(f"[yellow]Could not set QMC sections in {xml}: {e}[/]")
+
+    def skip_last_qmc_checkpoint(self) -> None:
+        """Set checkpoint="-1" (no config.h5) on the last <qmc> section of glass.xml."""
+        xml = os.path.join(self.run_dir, "glass.xml")
+        try:
+            with open(xml) as f:
+                text = f.read()
+            last = list(re.finditer(r'<qmc\b[^>]*?checkpoint="[^"]*"', text))
+            if not last:
+                console.print(f"[yellow]No <qmc checkpoint=...> in {xml}[/]")
+                return
+            m = last[-1]
+            tag = re.sub(r'checkpoint="[^"]*"', 'checkpoint="-1"', m.group(0))
+            with open(xml, "w") as f:
+                f.write(text[: m.start()] + tag + text[m.end() :])
+        except OSError as e:
+            console.print(f"[yellow]Could not skip the last QMC checkpoint: {e}[/]")
+
+    def prepare_nek_input(self, nek_dir: str, steps: int, every: int) -> None:
+        """Copy the Nek5000 mesh, map and par into run_dir/input and set the run length.
+
+        run_dir/input is the stage-in dir on the GekkoFS legs and the session
+        dir on the PFS leg, so all three legs read the same files.
+
+        Args:
+            nek_dir (str): Where <case>.re2, <case>.ma2 (genmap) and <case>.par live.
+            steps (int): Time steps in the run (numSteps).
+            every (int): Steps between two field dumps (writeInterval).
+        """
+        case = self.nek_case
+        input_dir = os.path.join(self.run_dir, "input")
+        try:
+            os.makedirs(input_dir, exist_ok=True)
+            # this Nek5000 build has no parRSB, so it needs the genmap partition
+            for ext in ("re2", "ma2"):
+                shutil.copy2(os.path.join(nek_dir, f"{case}.{ext}"), input_dir)
+            with open(os.path.join(nek_dir, f"{case}.par")) as f:
+                text = f.read()
+            text = re.sub(r"(?m)^numSteps\s*=.*$", f"numSteps = {max(1, steps)}", text)
+            text = re.sub(
+                r"(?m)^writeInterval\s*=.*$", f"writeInterval = {max(1, every)}", text
+            )
+            with open(os.path.join(input_dir, f"{case}.par"), "w") as f:
+                f.write(text)
+        except OSError as e:
+            console.print(
+                f"[yellow]Could not prepare the Nek5000 input in {input_dir}: {e}[/]"
+            )
+
+    def prepare_btio_input(self, btio_class: str, steps: int, every: int) -> None:
+        """Write run_dir/inputbt.data for a BT-IO run.
+
+        BT reads it from its cwd; without it the class defaults apply and the
+        dump interval falls back to 5.
+
+        Args:
+            btio_class (str): NPB class the binary was built for (C or D).
+            steps (int): Time steps; 0 keeps the class default (needed to verify).
+            every (int): Steps between two dumps (wr_interval).
+        """
+        grid, niter, dt = {"C": (162, 200, "0.0001d0"), "D": (408, 250, "0.00002d0")}[
+            btio_class
+        ]
+        text = (
+            f"{steps if steps > 0 else niter}\n{dt}\n{grid} {grid} {grid}\n"
+            f"{max(1, every)} 0\n0 1000000\n"
+        )
+        try:
+            with open(os.path.join(self.run_dir, "inputbt.data"), "w") as f:
+                f.write(text)
+        except OSError as e:
+            console.print(f"[yellow]Could not write the BT-IO input: {e}[/]")
+
+    def prepare_milc_input(
+        self,
+        outdir: str,
+        lat: int,
+        saves: int,
+        traj: int,
+        nx: int = 0,
+        skip_last: bool = False,
+    ) -> None:
+        """Write run_dir/milc.in for su3_ora: `saves` sets on an L^4 lattice.
+
+        su3_ora loops over parameter sets until EOF; each set runs `traj`
+        trajectories and saves the gauge field to <outdir>/cfg.<k>, so every
+        set is one checkpoint. The first set starts fresh, the rest continue.
+
+        Args:
+            outdir (str): Directory the configurations are saved to.
+            lat (int): Lattice extent in every direction.
+            saves (int): Number of parameter sets, i.e. saved configurations.
+            traj (int): Trajectories per set (the compute between two saves).
+            nx (int): x extent if not `lat` (0). MILC splits the lattice by the
+                prime factors of the rank count, so 96 or 124 nodes need an x
+                extent divisible by 3 or 31; nx = nodes keeps 64+1's sites/rank.
+            skip_last (bool): The last set saves nothing (`forget`): the app ends
+                right after it, so no compute phase is left to flush it in.
+        """
+        nx = nx or lat
+        text = f"prompt 0\nnx {nx}\nny {lat}\nnz {lat}\nnt {lat}\niseed 8352\n"
+        for k in range(saves):
+            text += (
+                f"\nwarms 0\ntrajecs {traj}\ntraj_between_meas {traj}\nbeta 6.0\n"
+                f"steps_per_trajectory 4\nqhb_steps 4\n"
+                f"{'fresh' if k == 0 else 'continue'}\nno_gauge_fix\n"
+                + (
+                    "forget\n"
+                    if skip_last and k == saves - 1
+                    else f"save_parallel {outdir}/cfg.{k}\n"
+                )
+            )
+        with open(os.path.join(self.run_dir, "milc.in"), "w") as f:
+            f.write(text)
+
+    def prepare_vpic_input(self, particles: str, steps: int, compute_s: int) -> None:
+        """Write run_dir/vpic.cfg for h5bench_write (VPIC-IO, contiguous 1D).
+
+        Args:
+            particles (str): Particles per rank and dump, h5bench units (e.g. 1M).
+            steps (int): Number of dumps.
+            compute_s (int): Emulated compute between two dumps, in seconds.
+        """
+        text = (
+            "MEM_PATTERN=CONTIG\nFILE_PATTERN=CONTIG\n"
+            f"TIMESTEPS={steps}\nDELAYED_CLOSE_TIMESTEPS=0\n"
+            "COLLECTIVE_DATA=YES\nCOLLECTIVE_METADATA=YES\n"
+            f"EMULATED_COMPUTE_TIME_PER_TIMESTEP={compute_s} s\n"
+            f"NUM_DIMS=1\nDIM_1={particles}\nDIM_2=1\nDIM_3=1\n"
+        )
+        with open(os.path.join(self.run_dir, "vpic.cfg"), "w") as f:
+            f.write(text)
+
     def select_regexes(self) -> None:
         """Pick the flush / stage-out / stage-in patterns for the current app.
 
@@ -1700,10 +2361,21 @@ class JitSettings:
         castro/warpx/qmc with an empty flush regex -- a flush that stages
         nothing at all.
         """
+        # ├─ NAS BT-IO
+        if "mpi_io_simple" in self.app_call:
+            # one file per dump; a dump is complete once its file is closed
+            self.regex_flush_match = ".*/btio\\.simple\\.out\\.\\d+$"
+            self.regex_stage_out_match = ".*"
+            self.regex_stage_in_match = ".*"
         # ├─ Nek5000
-        if "nek" in self.app_call:
-            self.regex_flush_match = ".*/[a-zA-Z0-9]*turbPipe0\\.f\\d+"
-            self.regex_stage_out_match = ".*/[a-zA-Z0-9]*turbPipe0\\.f\\d+"  # ".*"
+        elif "nek" in self.app_call:
+            case = getattr(self, "nek_case", "turbPipe")
+            # Anchored: Open MPI's per-rank chan0.f<N>.data.<r> / .metadata.<r>
+            # temp files matched the bare prefix, so one flush
+            # queued ~3600 of them and FTIO was still busy with them at app end
+            # (BSC 48871819: GLASS stage-out 134 s vs GekkoFS 17 s).
+            self.regex_flush_match = f".*/[a-zA-Z0-9]*{case}0\\.f\\d+$"
+            self.regex_stage_out_match = f".*/[a-zA-Z0-9]*{case}0\\.f\\d+$"
             self.regex_stage_in_match = ".*"
         # ├─ Wacom++
         elif "wacom" in self.app_call:
@@ -1763,6 +2435,30 @@ class JitSettings:
             # whole tree is flushed as a single unit. The (?=/) keeps AMReX's
             # "<chk>.old.<pid>" rename artifacts from matching as a bare file
             # unit whose path no longer exists.
+            # 2026-09-22: two regex attempts here (both now REVERTED, see
+            # remember.md for the full trail) tried to make this pattern also
+            # match AMReX's transient <chk>.temp/ staging name, on the theory
+            # that the trigger only ever scans the mount during that window.
+            # Both were wrong, and the second was actively harmful: reading
+            # posix_control.py's copy_file_and_unlink()/_orphaned_children()
+            # shows GekkoFS-specific recovery machinery ALREADY EXISTS for
+            # exactly this rename, but built the other way around --
+            # `rename` re-keys only the directory entry, so after AMReX moves
+            # <chk>.temp/ to <chk>/, a readdir of <chk> lists the children but
+            # every stat on them misses (their metadata is still under the old
+            # name); the fallback expects `item` to be the FINAL name and
+            # retries with `.temp` appended. Matching `.temp` in the regex
+            # itself fed that fallback an already-`.temp`-suffixed item, so
+            # when the real rename had already happened by execute-time it
+            # tried `.temp.temp` and found nothing -- exactly the 396
+            # "had an error" / "No such file or directory" failures seen in
+            # job 46345881. Reverted to the bare pattern below, consistent
+            # with what copy_file_and_unlink() actually expects.
+            # STILL UNRESOLVED: why job 46252936 (which ran this exact bare
+            # pattern, before either regex experiment) got 0 flushes despite
+            # FTIO locking a period -- not re-diagnosed this session, needs a
+            # live look (debug-level trigger log or a manual mid-run mount
+            # listing), not another blind regex edit. See remember.md.
             self.regex_flush_match = ".*/sedov_3d_sph_chk\\d+(?=/)"
             self.regex_stage_out_match = ".*/sedov_3d_sph_chk\\d+(?=/)"
             self.regex_stage_in_match = ".*"
@@ -1779,6 +2475,32 @@ class JitSettings:
             # <mnt>/glass_heg.s<series>.config.h5, overwritten every block.
             self.regex_flush_match = ".*/glass_heg\\.s\\d+\\.config\\.h5$"
             self.regex_stage_out_match = ".*/glass_heg\\.s\\d+\\.config\\.h5$"
+            self.regex_stage_in_match = ".*"
+        # ├─ HACC-IO
+        elif "HACC" in self.app_call:
+            # One file per rank and checkpoint: <mnt>/mpi[.<loop>]-PartNNNNNNNN-of-
+            # NNNNNNNN.data (.<loop> only with HACC_STEP_FILES=1).
+            self.regex_flush_match = ".*/mpi(\\.\\d+)?-Part\\d+-of-\\d+\\.data$"
+            self.regex_stage_out_match = ".*/mpi(\\.\\d+)?-Part\\d+-of-\\d+\\.data$"
+            self.regex_stage_in_match = ".*"
+        # ├─ VPIC-IO
+        elif "h5bench_write" in self.app_call:
+            # One file per dump: <mnt>/vpic.h5.<i>; vpic.h5 itself stays empty.
+            self.regex_flush_match = ".*/vpic\\.h5\\.\\d+$"
+            self.regex_stage_out_match = ".*"
+            self.regex_stage_in_match = ".*"
+        # ├─ MILC
+        elif "su3_ora" in self.app_call:
+            # One shared file per saved configuration: <mnt>/cfg.<k> + cfg.<k>.info.
+            self.regex_flush_match = ".*/cfg\\.\\d+(\\.info)?$"
+            self.regex_stage_out_match = ".*/cfg\\.\\d+(\\.info)?$"
+            self.regex_stage_in_match = ".*"
+        # ├─ E3SM-IO
+        elif "e3sm_io" in self.app_call:
+            # One history file pair per checkpoint: <mnt>/e3sm.<k>_h0.nc, _h1.nc,
+            # with blob one subfile per node: <mnt>/e3sm.<k>_h0.nc.<NNNN>.
+            self.regex_flush_match = ".*/e3sm\\.\\d+_h[01]\\.nc(\\.\\d{4})?$"
+            self.regex_stage_out_match = ".*/e3sm\\.\\d+_h[01]\\.nc(\\.\\d{4})?$"
             self.regex_stage_in_match = ".*"
         # └─ Other
         else:

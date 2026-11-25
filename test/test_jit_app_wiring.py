@@ -38,6 +38,7 @@ APP_PATTERNS = {
     "warpx": (r".*/chk\d+(?=/)", f"{MNT}/chk000010/WarpXHeader"),
     "qmcpack": (r".*/glass_heg\.s\d+\.config\.h5$", f"{MNT}/glass_heg.s000.config.h5"),
     "wrf": (r".*/wrfrst_d\d+_.*$", f"{MNT}/wrfrst_d01_0001-01-01_01:00:00"),
+    "btio": (r".*/btio\.simple\.out\.\d+$", f"{MNT}/btio.simple.out.0007"),
 }
 
 
@@ -138,6 +139,98 @@ def test_point_qmcpack_output_at_is_idempotent(tmp_path):
 
 def test_point_qmcpack_output_at_survives_a_missing_input(tmp_path):
     JitSettings.point_qmcpack_output_at(_settings(tmp_path / "nope"), MNT)
+
+
+def test_set_qmc_steps_rewrites_every_section_and_leaves_walkers_alone(tmp_path):
+    section = (
+        '<qmc method="vmc">\n'
+        '  <parameter name="walkers"   >  15625  </parameter>\n'
+        '  <parameter name="steps"     >    1    </parameter>\n'
+        '  <parameter name="subSteps"  >    1    </parameter>\n'
+        '  <parameter name="warmupSteps">   3    </parameter>\n'
+        "</qmc>\n"
+    )
+    xml = tmp_path / "glass.xml"
+    xml.write_text(section * 3)
+    JitSettings.set_qmc_steps(_settings(tmp_path), 40)
+    out = xml.read_text()
+    assert out.count(">    40    </parameter>") == 3
+    # subSteps / warmupSteps / walkers must not be touched
+    assert out.count('"subSteps"  >    1    <') == 3
+    assert out.count('"warmupSteps">   3    <') == 3
+    assert out.count(">  15625  <") == 3
+
+
+def test_set_qmc_steps_survives_a_missing_input(tmp_path):
+    JitSettings.set_qmc_steps(_settings(tmp_path / "nope"), 40)
+
+
+def _qmc_deck(n: int) -> str:
+    first = '   <qmc method="vmc">\n  <parameter name="warmupSteps">3</parameter>\n   </qmc>\n'
+    rest = '   <qmc method="vmc">\n  <parameter name="warmupSteps">0</parameter>\n   </qmc>\n'
+    return "<simulation>\n<project/>\n\n" + first + rest * (n - 1) + "</simulation>\n"
+
+
+def test_set_qmc_sections_grows_and_shrinks_the_deck(tmp_path):
+    xml = tmp_path / "glass.xml"
+    for start, want in ((30, 120), (30, 4)):
+        xml.write_text(_qmc_deck(start))
+        JitSettings.set_qmc_sections(_settings(tmp_path), want)
+        out = xml.read_text()
+        assert out.count("<qmc ") == want
+        # only the first section keeps the warm-up
+        assert out.count(">3</parameter>") == 1
+        assert out.startswith("<simulation>\n<project/>\n\n   <qmc")
+        assert out.endswith("   </qmc>\n</simulation>\n")
+
+
+def test_set_qmc_sections_survives_a_missing_input(tmp_path):
+    JitSettings.set_qmc_sections(_settings(tmp_path / "nope"), 120)
+
+
+def test_prepare_nek_input_stages_mesh_and_sets_run_length(tmp_path):
+    deck = tmp_path / "deck"
+    deck.mkdir()
+    (deck / "chan.re2").write_bytes(b"mesh")
+    (deck / "chan.ma2").write_bytes(b"map")
+    (deck / "chan.par").write_text(
+        "[GENERAL]\nstopAt = numSteps\nnumSteps = 20\n\nwriteControl = timeStep\n"
+        "writeInterval = 5\nuserParam02 = 20\n"
+    )
+    run = tmp_path / "run"
+    s = _settings(run)
+    s.nek_case = "chan"
+    JitSettings.prepare_nek_input(s, str(deck), 120, 12)
+    assert (run / "input" / "chan.re2").read_bytes() == b"mesh"
+    assert (run / "input" / "chan.ma2").read_bytes() == b"map"
+    par = (run / "input" / "chan.par").read_text()
+    assert "numSteps = 120\n" in par and "writeInterval = 12\n" in par
+    assert "userParam02 = 20" in par
+    # the deck itself stays untouched
+    assert "numSteps = 20" in (deck / "chan.par").read_text()
+
+
+def test_prepare_nek_input_survives_a_missing_deck(tmp_path):
+    s = _settings(tmp_path / "run")
+    s.nek_case = "chan"
+    JitSettings.prepare_nek_input(s, str(tmp_path / "nope"), 120, 12)
+
+
+def test_prepare_btio_input_sets_class_grid_and_dump_interval(tmp_path):
+    JitSettings.prepare_btio_input(_settings(tmp_path), "D", 0, 10)
+    lines = (tmp_path / "inputbt.data").read_text().splitlines()
+    assert lines[:4] == ["250", "0.00002d0", "408 408 408", "10 0"]
+
+
+def test_prepare_btio_input_overrides_the_step_count(tmp_path):
+    JitSettings.prepare_btio_input(_settings(tmp_path), "C", 40, 5)
+    lines = (tmp_path / "inputbt.data").read_text().splitlines()
+    assert lines[0] == "40" and lines[2] == "162 162 162"
+
+
+def test_btio_regex_skips_the_input_deck():
+    btio = re.compile(APP_PATTERNS["btio"][0])
+    assert not btio.match(f"{MNT}/inputbt.data")
 
 
 # ── --app-flags must actually override (it used to be ignored) ───────────────
@@ -310,3 +403,340 @@ def test_pre_call_srun_wraps_non_mpi_list_items_onto_an_app_node():
         "non-mpi pre_app_call list items must also go through flaged_call "
         "so they land on an app node instead of running bare"
     )
+
+
+# ── LAMMPS checkpoint-phase default ────────────────────────────────────────
+
+
+def test_lammps_defaults_to_60_checkpoint_phases():
+    """At 30 phases the weak-scaled LAMMPS run finished in ~30-45 s and glass
+    lost pfs by 0.72-0.88x across 8-33+1 (too little run for the fixed ~8 s
+    staging overhead to amortise). The full 2/4/8/16/32/64/96+1 resweep at 60
+    (jobs 45532561-69, 2026-09-09) closed that: glass wins pfs from 16+1 up and
+    beats gekko at every N. The default is what every concurrently-queued job
+    reads, so it must be 60, still overridable via LAMMPS_PHASES for probes.
+    """
+    src = inspect.getsource(JitSettings.set_variables)
+    lammps_idx = src.index('elif "lammps" in self.app:')
+    lammps_block = src[lammps_idx:]
+    lammps_block = lammps_block[: lammps_block.index("#  ├─ DLIO")]
+    assert "os.getenv('LAMMPS_PHASES', '60')" in lammps_block, (
+        "LAMMPS default checkpoint phases must be 60 (30 was a structural "
+        "small-N pfs loss)"
+    )
+
+
+def test_metrics_flush_interval_is_one_setting_defaulting_to_5_s():
+    """FTIO sees new data only once per client metrics push, so the interval is
+    an opt-in knob (METRICS_FLUSH_INTERVAL) for short app phases like S3D-IO.
+    Every launch path must read the setting, and the default must stay 5 s so
+    runs that don't set it are unchanged.
+    """
+    from ftio.api.gekkoFs.jit import jitsettings, setup_core
+
+    assert 'os.getenv("METRICS_FLUSH_INTERVAL", "5")' in inspect.getsource(jitsettings)
+    core = inspect.getsource(setup_core)
+    assert "LIBGKFS_METRICS_FLUSH_INTERVAL=5" not in core
+    assert (
+        core.count("LIBGKFS_METRICS_FLUSH_INTERVAL={settings.metrics_flush_interval}")
+        == 5
+    )
+    # an explicit interval also caps FTIO's ZMQ batch at that interval; the
+    # default run must not get the flag
+    js = inspect.getsource(jitsettings)
+    assert 'if os.getenv("METRICS_FLUSH_INTERVAL"):' in js
+    assert "--max-batch-window {self.metrics_flush_interval}" in js
+
+
+def test_gkfs_daemon_args_reach_both_cluster_launch_paths():
+    """GKFS_DAEMON_ARGS (e.g. --auto-sm) is appended to the srun and mpirun daemon
+    calls; unset, the daemon command is unchanged."""
+    from ftio.api.gekkoFs.jit import jitsettings, setup_core
+
+    assert 'os.getenv("GKFS_DAEMON_ARGS", "")' in inspect.getsource(jitsettings)
+    core = inspect.getsource(setup_core)
+    assert (
+        core.count(
+            "-l ib0 -P {settings.gkfs_daemon_protocol} {settings.gkfs_daemon_args}"
+        )
+        == 2
+    )
+
+
+def test_hacc_flush_regex_matches_per_rank_checkpoints_only():
+    """HACC-IO writes <mnt>/mpi[.<loop>]-PartNNNNNNNN-of-NNNNNNNN.data per rank;
+    the flush regex must take both namings and nothing else in the mount."""
+    s = SimpleNamespace(app_call="./HACC_ASYNC_IO")
+    JitSettings.select_regexes(s)
+    for path in (
+        "/dev/shm/mnt/mpi-Part00000000-of-00000002.data",
+        "/dev/shm/mnt/mpi.12-Part00004607-of-00004608.data",
+    ):
+        assert re.match(s.regex_flush_match, path)
+        assert re.match(s.regex_stage_out_match, path)
+    assert not re.match(s.regex_flush_match, "/dev/shm/mnt/mpi.3-Part1.data.tmp")
+    assert not re.match(s.regex_flush_match, "/dev/shm/mnt/checkpoint_all.txt")
+
+
+def test_nek_flush_regex_skips_the_mpi_io_temp_files():
+    """Nek5000 writes <mnt>/chan0.f<N> through MPI-IO, and Open MPI leaves
+    per-rank chan0.f<N>.data.<r> / .metadata.<r> temp files next to it while it
+    writes; only the dump itself may be flushed (BSC 48871819 queued ~3600)."""
+    s = SimpleNamespace(app_call="./nek5000", nek_case="chan")
+    JitSettings.select_regexes(s)
+    assert re.match(s.regex_flush_match, "/dev/shm/mnt/chan0.f00008")
+    assert re.match(s.regex_stage_out_match, "/dev/shm/mnt/chan0.f00008")
+    for tmp in (
+        "/dev/shm/mnt/chan0.f00008.data.456",
+        "/dev/shm/mnt/chan0.f00008.metadata.4",
+    ):
+        assert not re.match(s.regex_flush_match, tmp)
+        assert not re.match(s.regex_stage_out_match, tmp)
+
+
+def test_e3sm_flush_regex_matches_rotated_history_files_only():
+    """E3SM-IO with E3SM_FILES writes one history pair per checkpoint,
+    <mnt>/e3sm.<k>_h0.nc and _h1.nc (blob: plus a per-node .<NNNN> subfile
+    suffix); the unrotated name must not match."""
+    s = SimpleNamespace(app_call="./e3sm_io")
+    JitSettings.select_regexes(s)
+    for path in (
+        "/dev/shm/mnt/e3sm.0_h0.nc",
+        "/dev/shm/mnt/e3sm.17_h1.nc",
+        "/dev/shm/mnt/e3sm.4_h0.nc.0015",
+    ):
+        assert re.match(s.regex_flush_match, path)
+        assert re.match(s.regex_stage_out_match, path)
+    assert not re.match(s.regex_flush_match, "/dev/shm/mnt/e3sm_h0.nc")
+    assert not re.match(s.regex_flush_match, "/dev/shm/mnt/e3sm.3_h0.nc.tmp")
+
+
+def test_milc_input_saves_one_config_per_set_and_regex_takes_them(tmp_path):
+    """su3_ora runs one parameter set per checkpoint: the first starts fresh,
+    the rest continue, and each set saves <outdir>/cfg.<k>; the flush regex
+    takes the configs and their .info files only."""
+    s = SimpleNamespace(run_dir=str(tmp_path))
+    JitSettings.prepare_milc_input(s, "/dev/shm/mnt", 16, 3, 5)
+    text = (tmp_path / "milc.in").read_text()
+    assert text.count("save_parallel /dev/shm/mnt/cfg.") == 3
+    assert text.count("fresh") == 1 and text.count("continue") == 2
+    assert "trajecs 5" in text and "nt 16" in text
+    s = SimpleNamespace(app_call="/scratch/run/milc/su3_ora")
+    JitSettings.select_regexes(s)
+    for path in ("/dev/shm/mnt/cfg.0", "/dev/shm/mnt/cfg.12.info"):
+        assert re.match(s.regex_flush_match, path)
+        assert re.match(s.regex_stage_out_match, path)
+    assert not re.match(s.regex_flush_match, "/dev/shm/mnt/milc.in")
+
+
+def test_vpic_input_and_regex_take_one_file_per_dump(tmp_path):
+    """h5bench_write gets a VPIC-IO config (contiguous 1D, emulated compute);
+    with H5BENCH_FILE_PER_TS=1 dump i is <mnt>/vpic.h5.<i>, and only those are
+    flushed, not the empty vpic.h5 or the config."""
+    s = SimpleNamespace(run_dir=str(tmp_path))
+    JitSettings.prepare_vpic_input(s, "2M", 12, 20)
+    lines = (tmp_path / "vpic.cfg").read_text().splitlines()
+    assert "TIMESTEPS=12" in lines and "DIM_1=2M" in lines
+    assert "EMULATED_COMPUTE_TIME_PER_TIMESTEP=20 s" in lines
+    assert "DELAYED_CLOSE_TIMESTEPS=0" in lines
+    s = SimpleNamespace(
+        app_call="env H5BENCH_FILE_PER_TS=1 /scratch/run/vpic/h5bench_write"
+    )
+    JitSettings.select_regexes(s)
+    assert re.match(s.regex_flush_match, "/dev/shm/mnt/vpic.h5.7")
+    for path in ("/dev/shm/mnt/vpic.h5", "/scratch/run/vpic/vpic.cfg"):
+        assert not re.match(s.regex_flush_match, path)
+
+
+# ── WRF weak-grid e_sn cap ──────────────────────────────────────────────────
+
+
+def test_weak_scale_wrf_grid_never_exceeds_the_jet_sounding_table():
+    """WRF's stock em_b_wave idealized case hardcodes a 64x80 jet-sounding
+    lookup table (module_initialize_ideal.F: nz_jet=64, ny_jet=80) and indexes
+    it by the model's raw south-north grid index with no bounds check. Any
+    e_sn > 80 reads past the table; e_sn=648 (the 32+1 weak-grid point)
+    SIGSEGVs in calc_jet_sounding (root-caused via gdb, job 45731615,
+    2026-09-11 -- confirmed unrelated to GekkoFS, ideal.exe never touches the
+    mount). e_sn must stay <= 80 at every rank count the sweep uses.
+    """
+    for ranks in (2, 4, 8, 16, 32, 64, 96, 124):
+        _e_we, e_sn, _dx, _dy, _dt, _nproc_x, _nproc_y = JitSettings.weak_scale_wrf_grid(
+            ranks
+        )
+        assert e_sn <= 80, (
+            f"e_sn={e_sn} at ranks={ranks} exceeds WRF's 80-column jet-sounding "
+            "table and will SIGSEGV ideal.exe"
+        )
+
+
+def test_weak_scale_wrf_grid_decomposition_keeps_patches_above_minimum():
+    """Once e_sn is capped at 80 (see above), WRF's own auto-decomposition
+    (nproc_x=nproc_y=-1) starts splitting the south-north axis across more
+    than 8 processes once total ranks exceeds ~64, giving each rank fewer
+    than 10 south-north grid points -- below WRF's minimum MPI-patch size.
+    wrf.exe was killed within ~2s of starting at 96+1/124+1 under exactly this
+    condition (jobs 45780469/45780470, 2026-09-12). nproc_x/nproc_y must
+    always multiply back to the full rank count and keep both axes' per-rank
+    patch size at or above the minimum.
+    """
+    MIN_PATCH = 10
+    for ranks in (2, 4, 8, 16, 32, 64, 96, 124):
+        e_we, e_sn, _dx, _dy, _dt, nproc_x, nproc_y = JitSettings.weak_scale_wrf_grid(
+            ranks
+        )
+        assert (
+            nproc_x * nproc_y == ranks
+        ), f"nproc_x={nproc_x} * nproc_y={nproc_y} != ranks={ranks}"
+        assert e_sn / nproc_y >= MIN_PATCH, (
+            f"ranks={ranks}: south-north patch {e_sn}/{nproc_y}="
+            f"{e_sn / nproc_y:.1f} below WRF's minimum {MIN_PATCH}"
+        )
+        assert e_we / nproc_x >= MIN_PATCH, (
+            f"ranks={ranks}: east-west patch {e_we}/{nproc_x}="
+            f"{e_we / nproc_x:.1f} below WRF's minimum {MIN_PATCH}"
+        )
+
+
+def test_glass_stage_out_times_from_app_end_and_waits_for_ftio(tmp_path, monkeypatch):
+    # The GLASS stage-out must cover FTIO's in-flight copies: from app end until
+    # both jit_move and FTIO are done. jit_move must leave the in-flight item alone.
+    import threading
+    import time
+
+    from ftio.api.gekkoFs import posix_control
+    from ftio.api.gekkoFs.jit import setup_core
+
+    settings = JitSettings()
+    settings.exclude_all = False
+    settings.exclude_cargo = True
+    settings.exclude_ftio = False
+    settings.flush_log = str(tmp_path / "flush.log")
+    settings.app_end_time = time.time() - 5  # app ended 5 s ago
+    registry = posix_control.inflight_registry(settings.flush_log)
+    posix_control._update_inflight(registry, [f"{MNT}/ckpt.restart.80"], add=True)
+
+    calls, recorded = [], {}
+    monkeypatch.setattr(setup_core, "adjust_regex", lambda *a: None)
+    monkeypatch.setattr(setup_core, "shut_down", lambda *a: calls.append("shutdown"))
+    monkeypatch.setattr(
+        setup_core, "jit_move", lambda s, exclude=None: calls.append(("move", exclude))
+    )
+    monkeypatch.setattr(
+        setup_core,
+        "elapsed_time",
+        lambda s, r, name, elapsed: recorded.setdefault(name, elapsed),
+    )
+    # FTIO finishes its copy 0.5 s after stage_out starts
+    threading.Timer(0.5, posix_control.reset_inflight, args=(registry,)).start()
+
+    setup_core.stage_out(settings, runtime=None)
+
+    assert calls[0] == ("move", [f"{MNT}/ckpt.restart.80"])
+    assert calls[1:] == ["shutdown", ("move", None)]
+    assert recorded["Stage out"] >= 5.5
+    with open(settings.flush_log) as f:
+        log = f.read()
+    assert "SKIP-INFLIGHT" in log and "FTIO-SHUTDOWN" in log
+
+
+def test_gekko_stage_out_timing_is_unchanged(tmp_path, monkeypatch):
+    import time
+
+    from ftio.api.gekkoFs.jit import setup_core
+
+    settings = JitSettings()
+    settings.exclude_all = False
+    settings.exclude_cargo = True
+    settings.exclude_ftio = True
+    settings.app_end_time = time.time() - 100  # must be ignored without FTIO
+    recorded = {}
+    monkeypatch.setattr(setup_core, "adjust_regex", lambda *a: None)
+    monkeypatch.setattr(setup_core, "jit_move", lambda s, exclude=None: None)
+    monkeypatch.setattr(
+        setup_core,
+        "elapsed_time",
+        lambda s, r, name, elapsed: recorded.setdefault(name, elapsed),
+    )
+    setup_core.stage_out(settings, runtime=None)
+    assert recorded["Stage out"] < 5
+
+
+def _hostfile_settings(path, nodes: int) -> SimpleNamespace:
+    return SimpleNamespace(
+        dry_run=False, cluster=True, app_nodes=nodes, gkfs_hostfile=path
+    )
+
+
+def test_hostfile_check_waits_until_every_daemon_has_registered(tmp_path):
+    # Each daemon appends its own line, so the file appears with one line and
+    # grows. A client started on the partial file hashes paths onto the wrong
+    # daemons (WarpX chk000000 ENOENT, DLIO EBUSY), so the check must wait.
+    import threading
+    import time
+
+    from ftio.api.gekkoFs.jit import setup_core
+
+    hosts = tmp_path / "gkfs_hosts.txt"
+    hosts.write_text("node0 ofi+verbs://a\n")
+
+    def late_daemons():
+        for i in (1, 2, 3):
+            time.sleep(0.3)
+            with open(hosts, "a") as f:
+                f.write(f"node{i} ofi+verbs://{i}\n")
+
+    t = threading.Thread(target=late_daemons)
+    start = time.time()
+    t.start()
+    assert setup_core.hostfile_is_sane(_hostfile_settings(str(hosts), 4), timeout=10)
+    t.join()
+    assert time.time() - start >= 0.8
+
+
+def test_hostfile_check_fails_when_daemons_never_register(tmp_path):
+    from ftio.api.gekkoFs.jit import setup_core
+
+    hosts = tmp_path / "gkfs_hosts.txt"
+    hosts.write_text("node0 ofi+verbs://a\nnode1 ofi+verbs://b\n")
+    assert not setup_core.hostfile_is_sane(_hostfile_settings(str(hosts), 4), timeout=1)
+
+
+def test_hostfile_check_still_rejects_a_stale_extra_line(tmp_path):
+    from ftio.api.gekkoFs.jit import setup_core
+
+    hosts = tmp_path / "gkfs_hosts.txt"
+    hosts.write_text("dead ofi+verbs://x\nnode0 ofi+verbs://a\nnode1 ofi+verbs://b\n")
+    assert not setup_core.hostfile_is_sane(_hostfile_settings(str(hosts), 2), timeout=1)
+
+
+def test_gekko_hostfile_lands_in_the_job_dir_not_home():
+    # the daemons create <hostfile>.ready next to it; in $HOME every job killed
+    # at its time limit left one behind
+    s = SimpleNamespace(
+        exclude_daemon=False,
+        exclude_proxy=True,
+        job_id=42,
+        dir="/home/u/jit/42",
+        home="/home/u",
+        gkfs_hostfile="/home/u/gkfs_hosts.txt",
+    )
+    JitSettings.update_geko_files(s)
+    assert s.gkfs_hostfile == "/home/u/jit/42/gkfs_hosts_42.txt"
+
+
+def test_skip_last_qmc_checkpoint_only_touches_the_last_section(tmp_path):
+    sec = '   <qmc method="vmc" move="pbyp" checkpoint="1">\n   </qmc>\n'
+    (tmp_path / "glass.xml").write_text("<simulation>\n" + sec * 3 + "</simulation>\n")
+    JitSettings.skip_last_qmc_checkpoint(_settings(tmp_path))
+    out = (tmp_path / "glass.xml").read_text()
+    assert out.count('checkpoint="1"') == 2
+    assert out.rfind('checkpoint="-1"') > out.rfind('checkpoint="1"')
+
+
+def test_milc_skip_last_forgets_only_the_last_save(tmp_path):
+    JitSettings.prepare_milc_input(_settings(tmp_path), "/mnt", 64, 3, 10, skip_last=True)
+    text = (tmp_path / "milc.in").read_text()
+    assert text.count("save_parallel") == 2
+    assert "cfg.2" not in text
+    assert text.rstrip().endswith("forget")

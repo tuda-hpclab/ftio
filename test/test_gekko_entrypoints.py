@@ -64,3 +64,58 @@ def test_predictor_uses_setup_socket_not_bind_socket():
     result = subprocess.run([sys.executable, "-c", check], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     assert "ok" in result.stdout
+
+
+_DRAIN = """
+import sys, threading, time
+import zmq
+import ftio.api.gekkoFs.predictor_gekko_zmq  # import order, see above
+from ftio.prediction.processes_zmq import receive_messages
+
+ctx = zmq.Context.instance()
+pull = ctx.socket(zmq.PULL)
+pull.bind("inproc://batch-window")
+push = ctx.socket(zmq.PUSH)
+push.connect("inproc://batch-window")
+poller = zmq.Poller()
+poller.register(pull, zmq.POLLIN)
+
+def send():
+    for _ in range(15):
+        push.send(b"x")
+        time.sleep(0.2)
+
+sender = threading.Thread(target=send)
+sender.start()
+start = time.time()
+msgs, _ranks, _recv = receive_messages(pull, poller, float(sys.argv[1]))
+print(len(msgs), time.time() - start)
+sender.join()
+"""
+
+
+def _drain_while_sending(max_batch_s: float) -> tuple[int, float]:
+    """Push one message every 0.2 s for 3 s and time one receive_messages call.
+
+    Fresh interpreter for the same circular-import reason as above.
+    """
+    result = subprocess.run(
+        [sys.executable, "-c", _DRAIN, str(max_batch_s)],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    n, took = result.stdout.split()
+    return int(n), float(took)
+
+
+def test_receive_messages_max_batch_window_closes_a_continuous_stream():
+    """Senders that push more often than once per second never leave the 1 s gap
+    that ends a batch, so the unbounded loop returns only when they stop (the
+    S3D-IO METRICS_FLUSH_INTERVAL=1 runs got no prediction at all). With a cap
+    the batch closes about that many seconds after its first message.
+    """
+    n, took = _drain_while_sending(0.0)
+    assert n == 15 and took >= 2.8
+    n, took = _drain_while_sending(1.0)
+    assert 4 <= n <= 7 and took < 1.6

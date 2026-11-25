@@ -46,6 +46,7 @@ from ftio.api.gekkoFs.jit.setup_helper import (  # set_env,
     parse_options,
     print_settings,
     save_bandwidth,
+    save_ftio_state,
     save_hosts_file,
     set_dir_gekko,
     snapshot_directory,
@@ -132,6 +133,7 @@ def main() -> None:
         # ------------------------------------------------------------------
         runtime.print_and_save_time(settings)
         save_bandwidth(settings)
+        save_ftio_state(settings)
         log_execution(settings)
         save_hosts_file(settings)
         snapshot_directory(settings)
@@ -145,6 +147,8 @@ def main() -> None:
         # Cleanup
         soft_kill(settings)
         hard_kill(settings)
+        # A failed run keeps its flush log too.
+        save_ftio_state(settings)
 
     if error == 0:
         console.print("[bold green]############### JIT completed ###############[/]")

@@ -35,6 +35,11 @@ def _mode_label(mode: str) -> str:
     return "pfs"
 
 
+def _stage_out(e: dict) -> float:
+    """Corrected stage-out when correct_stageout.py added one, else the raw value."""
+    return e.get("stage_out_corrected", e["stage_out"])
+
+
 def totals_by_node(json_path: str, show_reps: bool = False) -> dict:
     """Read a result.json into {compute_nodes: {label: entry_or_entries}}.
 
@@ -48,6 +53,11 @@ def totals_by_node(json_path: str, show_reps: bool = False) -> dict:
     timestamp ascending -- value is a list of
     {app,stage_in,stage_out,total,node_local} dicts, one per rep.
     """
+    # correct_stageout.py writes result_corrected.json next to the raw file; its
+    # GLASS stage-out also covers FTIO's last in-flight copies (raw left as is).
+    corrected = os.path.join(os.path.dirname(json_path), "result_corrected.json")
+    if os.path.isfile(corrected):
+        json_path = corrected
     with open(json_path) as f:
         data = json.load(f)
     rows: dict = {}
@@ -64,8 +74,8 @@ def totals_by_node(json_path: str, show_reps: bool = False) -> dict:
                     {
                         "app": e["app"],
                         "stage_in": e["stage_in"],
-                        "stage_out": e["stage_out"],
-                        "total": e["app"] + e["stage_in"] + e["stage_out"],
+                        "stage_out": _stage_out(e),
+                        "total": e["app"] + e["stage_in"] + _stage_out(e),
                         "node_local": e.get("settings", {}).get("node local"),
                     }
                     for e in sorted(entries, key=lambda e: e.get("timestamp", ""))
@@ -77,8 +87,8 @@ def totals_by_node(json_path: str, show_reps: bool = False) -> dict:
                 label: {
                     "app": e["app"],
                     "stage_in": e["stage_in"],
-                    "stage_out": e["stage_out"],
-                    "total": e["app"] + e["stage_in"] + e["stage_out"],
+                    "stage_out": _stage_out(e),
+                    "total": e["app"] + e["stage_in"] + _stage_out(e),
                 }
                 for label, e in (
                     (label, max(entries, key=lambda e: e.get("timestamp", "")))
