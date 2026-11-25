@@ -6,12 +6,12 @@ processing requests, answering pings and changing the servers address on request
 Author: Tim Dieringer
 Editor: Ahmad Tarraf
 Copyright (c) 2024-2026 TU Darmstadt, Germany
-Version: v0.0.9
+Version: v0.1.0
 Date: January 2026
 
 Licensed under the BSD 3-Clause License.
 For more information, see the LICENSE file in the project root:
-https://github.com/tuda-parallel/FTIO/blob/main/LICENSE
+https://github.com/tuda-hpclab/ftio/blob/main/LICENSE
 """
 
 import signal
